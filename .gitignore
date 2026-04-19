@@ -2,3 +2,5 @@ profiles/
 __pycache__/
 .idea/
 reports/
+scheduler.log
+scheduler_state.json
