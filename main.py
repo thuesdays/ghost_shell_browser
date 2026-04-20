@@ -164,21 +164,18 @@ def parse_ads(driver, query: str) -> list[dict]:
     """
     Извлекает ТОЛЬКО рекламные блоки со страницы результатов.
 
-    Стратегия поиска (от самой надёжной к менее):
-    1. Элементы с текстом 'Sponsored' / 'Реклама' / 'Спонсировано' / 'Спонсоване'
-       — Google обязан помечать рекламу по закону, это 100% маркер
-    2. Блоки с атрибутом data-text-ad="1" — если Google не переименует
-    3. Ссылки через googleadservices.com/aclk — классические редиректы рекламы
+    Для каждого блока собирает:
+    - google_click_url — полная ссылка Google-редиректа с tracking ID
+      (то что открывается при реальном клике)
+    - clean_url — чистый URL рекламодателя из data-rw или из adurl=...
+    - domain — очищенный домен
     """
     state = page_state(driver)
     if state != "search_results":
         logging.warning(f"  Не на странице результатов: state={state}")
         return []
 
-    # Собираем рекламные блоки через JS
-    # Ищем элементы содержащие метку "Sponsored" / "Реклама" и поднимаемся
-    # вверх по DOM пока не найдём блок с ссылкой
-    js_script = """
+    js_script = r"""
     const SPONSORED_MARKERS = [
         'Sponsored', 'Реклама', 'Спонсировано', 'Спонсоване',
         'Anuncio', 'Annonce', 'Werbung', 'Annuncio'
@@ -186,14 +183,12 @@ def parse_ads(driver, query: str) -> list[dict]:
 
     const adBlocks = new Set();
 
-    // Способ 1: ищем по тексту метки "Sponsored" / "Реклама"
+    // Способ 1: поиск по метке "Sponsored" / "Реклама"
     const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_ELEMENT);
     let node;
     while (node = walker.nextNode()) {
         const text = (node.textContent || '').trim();
-        // Текст элемента должен быть ТОЛЬКО меткой, не длиннее 20 символов
         if (text.length < 20 && SPONSORED_MARKERS.some(m => text === m || text.startsWith(m))) {
-            // Поднимаемся вверх пока не найдём блок с ссылкой вне googleadservices
             let parent = node;
             for (let i = 0; i < 8 && parent; i++) {
                 parent = parent.parentElement;
@@ -207,38 +202,57 @@ def parse_ads(driver, query: str) -> list[dict]:
         }
     }
 
-    // Способ 2: data-text-ad атрибут (дополнительно)
+    // Способ 2: data-text-ad атрибут
     document.querySelectorAll('div[data-text-ad]').forEach(el => adBlocks.add(el));
 
-    // Собираем данные из каждого блока
     const results = [];
     adBlocks.forEach(block => {
-        // Заголовок — role=heading или первый div с большим текстом
+        // Заголовок
         let title = '';
         const heading = block.querySelector('[role="heading"], h3');
         if (heading) title = heading.textContent.trim();
 
-        // Видимый URL — cite или специальный span
+        // Видимый URL (то что показывается пользователю — обычно homepage рекламодателя)
         let displayUrl = '';
         const cite = block.querySelector('cite, span.VuuXrf, span.x2VHCd, span[role="text"]');
         if (cite) displayUrl = cite.textContent.trim();
 
-        // Ссылка — ищем первую HTTP-ссылку которая не на google
-        let href = '';
-        for (const link of block.querySelectorAll('a[href]')) {
-            const h = link.href;
-            if (h && h.startsWith('http')) {
-                href = h;
-                break;
+        // Главная рекламная ссылка — обычно на заголовке (role=heading)
+        // Берём ПЕРВЫЙ <a> внутри блока что ведёт на google.com/aclk или www.googleadservices.com
+        let googleClickUrl = '';
+        let cleanFromDataRw = '';
+
+        const allLinks = block.querySelectorAll('a[href]');
+        for (const link of allLinks) {
+            const href = link.href || '';
+            // Интересны только рекламные редиректы Google
+            if (href.includes('/aclk?') || href.includes('googleadservices.com')) {
+                if (!googleClickUrl) googleClickUrl = href;
+                // data-rw на этой же ссылке — чистый URL рекламодателя
+                const rw = link.getAttribute('data-rw');
+                if (rw && !cleanFromDataRw) cleanFromDataRw = rw;
             }
         }
 
-        if (href || displayUrl) {
+        // Если не нашли рекламных редиректов — берём первую http-ссылку
+        if (!googleClickUrl) {
+            for (const link of allLinks) {
+                const href = link.href || '';
+                if (href && href.startsWith('http')) {
+                    googleClickUrl = href;
+                    const rw = link.getAttribute('data-rw');
+                    if (rw && !cleanFromDataRw) cleanFromDataRw = rw;
+                    break;
+                }
+            }
+        }
+
+        if (googleClickUrl || displayUrl) {
             results.push({
-                title: title,
-                displayUrl: displayUrl,
-                href: href,
-                html: block.outerHTML.slice(0, 500)  // для отладки
+                title:           title,
+                displayUrl:      displayUrl,
+                googleClickUrl:  googleClickUrl,
+                cleanFromDataRw: cleanFromDataRw,
             });
         }
     });
@@ -257,20 +271,30 @@ def parse_ads(driver, query: str) -> list[dict]:
     ads = []
     seen_domains = set()
 
-    for raw in raw_ads:
+    for idx, raw in enumerate(raw_ads):
         try:
-            href        = raw.get("href", "")
+            google_click_url = raw.get("googleClickUrl", "")
+            clean_from_rw = raw.get("cleanFromDataRw", "")
             display_url = raw.get("displayUrl", "")
-            title       = raw.get("title", "")
+            title = raw.get("title", "")
 
-            real_url = extract_real_url(href)
-            domain   = extract_domain(real_url) or extract_domain(display_url)
+            # Чистый URL рекламодателя
+            if clean_from_rw and clean_from_rw.startswith("http"):
+                clean_url = clean_from_rw
+            else:
+                clean_url = extract_real_url(google_click_url)
+                if not clean_url or not clean_url.startswith("http") or "google" in clean_url:
+                    clean_url = ""
+
+            domain = extract_domain(clean_url) or extract_domain(display_url)
+
+            logging.debug(f"  [блок {idx}] clean_url={clean_url!r} domain={domain!r}")
 
             if not domain:
+                logging.info(f"  ✗ [блок {idx}] пропущен: не определился домен")
                 continue
 
-            # Пропускаем внутренние домены Google (если метка "Реклама" случайно
-            # попалась рядом с ссылкой на Google Maps и т.п.)
+            # Пропускаем внутренние домены Google
             if any(g in domain for g in ("google.com", "google.ua", "googleusercontent.com")):
                 continue
 
@@ -279,23 +303,25 @@ def parse_ads(driver, query: str) -> list[dict]:
                 logging.info(f"  · [наш] {domain} — {title[:50]}")
                 continue
 
-            # Дедупликация в рамках одного запроса
+            # Дедупликация
             if domain in seen_domains:
+                logging.info(f"  ✗ [блок {idx}] пропущен: дубликат {domain}")
                 continue
             seen_domains.add(domain)
 
             ads.append({
-                "query":       query,
-                "title":       title,
+                "query": query,
+                "title": title,
                 "display_url": display_url,
-                "real_url":    real_url,
-                "domain":      domain,
-                "found_at":    datetime.now().isoformat(timespec="seconds"),
+                "clean_url": clean_url,
+                "google_click_url": google_click_url,
+                "domain": domain,
+                "found_at": datetime.now().isoformat(timespec="seconds"),
             })
             logging.info(f"  ✓ {domain} — {title[:60]}")
 
         except Exception as e:
-            logging.debug(f"  Ошибка обработки блока: {e}")
+            logging.warning(f"  ✗ [блок {idx}] исключение: {e}")
 
     return ads
 
@@ -461,22 +487,25 @@ def run_monitor():
                         competitors[domain]["queries"].append(query)
                 else:
                     competitors[domain] = {
-                        "domain":      domain,
-                        "title":       ad["title"],
+                        "domain": domain,
+                        "title": ad["title"],
                         "display_url": ad["display_url"],
-                        "real_url":    ad["real_url"],
-                        "queries":     [query],
-                        "first_seen":  ad["found_at"],
+                        "clean_url": ad["clean_url"],
+                        "google_click_url": ad["google_click_url"],
+                        "queries": [query],
+                        "first_seen": ad["found_at"],
                     }
-                url = ad["real_url"]
-                link = driver.find_element(By.CSS_SELECTOR, f"a[href='{url}']")
-                logging.info("Заходим на рекламу конкурента.")
+                href = ad["google_click_url"]
+                link = driver.find_element(By.CSS_SELECTOR, f'a[href="{href}"]')
+                logging.info(f"Заходим на рекламу конкурента: {domain}.")
                 browser.bezier_move_to(link)  # человекоподобный клик
+                time.sleep(random.uniform(15, 30))
+                driver.back()
 
             if not ads:
                 logging.info("  (реклама не найдена)")
 
-            time.sleep(random.uniform(5, 10))
+
 
 
         # ── 5. ИТОГОВЫЙ ОТЧЁТ ─────────────────────────
