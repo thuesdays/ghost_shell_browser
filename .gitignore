@@ -4,3 +4,5 @@ __pycache__/
 reports/
 scheduler.log
 scheduler_state.json
+.vscode/
+query_rate.json

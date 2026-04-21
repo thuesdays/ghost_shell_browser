@@ -1,12 +1,16 @@
 """
 main.py — Мониторинг контекстной рекламы конкурентов по брендовым запросам
 
-Что делает:
-1. Открывает Google через антидетект-браузер
-2. Ищет брендовые запросы goodmedika по очереди
-3. На странице результатов извлекает все рекламные блоки
-4. Собирает список уникальных конкурентов (не goodmedika.com.ua)
-5. Выводит итоговый отчёт со ссылками
+Стратегия:
+1. Открываем браузер (с обязательной init-навигацией в start() для активации инъекций)
+2. Идём на google.com СНАЧАЛА (тёплый сайт, проверяем сеть, решаем consent/captcha)
+3. Для каждого запроса — открываем stealth_get с прямым URL поиска с
+   параметрами &gl=ua&hl=uk — реклама появляется СРАЗУ
+4. Если рекламы нет — refresh-loop: обновляем каждые 10-15с до появления
+   (макс N попыток)
+5. Собираем domain/title/clean_url/google_click_url
+6. ВСЕ google_click_url (кроме нашего домена) — пишем в append-файл
+7. В конце — JSON + CSV отчёт
 """
 
 import os
@@ -17,29 +21,51 @@ import logging
 import json
 import requests
 from datetime import datetime
-from urllib.parse import urlparse, parse_qs, unquote
+from urllib.parse import urlparse, parse_qs, unquote, quote
 from selenium.webdriver.common.by import By
 from selenium.webdriver.common.keys import Keys
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 
-from nk_browser import NKBrowser
+from ghost_shell_browser import GhostShellBrowser
 from proxy_diagnostics import ProxyDiagnostics
+from session_quality import SessionQualityMonitor
+from tab_manager import TabManager
+from config import Config
+from stealth_improvements import QueryRateLimiter, interact_with_serp
 
 # ──────────────────────────────────────────────────────────────
-# НАСТРОЙКИ
+# КОНФИГУРАЦИЯ — загружаем из config.yaml (с fallback defaults)
 # ──────────────────────────────────────────────────────────────
 
-SEARCH_QUERIES     = ["гудмедика", "гудмедіка", "goodmedika"]
-MY_DOMAINS         = ["goodmedika.com.ua", "goodmedika.ua", "goodmedika.com"]
-TWOCAPTCHA_API_KEY = "6304d6e97726df713271b9de0ca2d653"
-PROXY              = "01kpjw4p1mrn74xw7eq1sd843q:nfoN0DTTFaoUizWj@109.236.84.23:16720"
-PROFILE_NAME       = "profile_01"
+CFG = Config.load("config.yaml")
+
+SEARCH_QUERIES     = CFG.get("search.queries")
+MY_DOMAINS         = CFG.get("search.my_domains")
+TWOCAPTCHA_API_KEY = CFG.get("captcha.twocaptcha_key", "")
+PROXY              = CFG.get("proxy.url")
+PROFILE_NAME       = CFG.get("browser.profile_name")
+IS_ROTATING_PROXY  = CFG.get("proxy.is_rotating", True)
+ROTATION_API_URL   = CFG.get("proxy.rotation_api_url")
+
+# Параметры refresh-loop для поиска рекламы
+REFRESH_MIN_SEC       = 10   # минимум между обновлениями
+REFRESH_MAX_SEC       = 15   # максимум
+REFRESH_MAX_ATTEMPTS  = 4    # максимум обновлений на один запрос
+
+# Файл куда пишутся ВСЕ google_click_url кроме нашего домена
+COMPETITOR_URLS_FILE  = "competitor_urls.txt"
+
+import sys
 
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s"
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    handlers=[logging.StreamHandler(sys.stdout)],
+    force=True,
 )
+logging.getLogger("urllib3").setLevel(logging.WARNING)
+logging.getLogger("selenium").setLevel(logging.WARNING)
 
 
 # ──────────────────────────────────────────────────────────────
@@ -57,9 +83,28 @@ def page_state(driver) -> str:
         return "consent"
     if "/search" in url and "q=" in url:
         return "search_results"
-    if url.startswith("https://www.google.") or url == "about:blank":
+    if url.startswith("https://www.google.") or url == "about:blank" or url.startswith("data:"):
         return "home"
     return "other"
+
+
+def is_offline_page(driver) -> bool:
+    """Проверка не показал ли Chrome 'Вы в режиме офлайн'"""
+    try:
+        title = (driver.title or "").lower()
+        if any(m in title for m in ("офлайн", "offline", "недоступно")):
+            return True
+        body_text = driver.execute_script(
+            "return (document.body && document.body.innerText || '').substring(0, 300).toLowerCase();"
+        )
+        markers = [
+            "підключіться до інтернету", "connect to the internet",
+            "в режимі офлайн", "you're offline", "you are offline",
+            "нет соединения", "подключитесь к интернету",
+        ]
+        return any(m in body_text for m in markers)
+    except Exception:
+        return False
 
 
 def bypass_consent(driver):
@@ -82,7 +127,7 @@ def bypass_consent(driver):
 def solve_captcha(driver) -> bool:
     if page_state(driver) != "captcha":
         return True
-    if TWOCAPTCHA_API_KEY == "ВАШ_КЛЮЧ":
+    if not TWOCAPTCHA_API_KEY or TWOCAPTCHA_API_KEY == "ВАШ_КЛЮЧ":
         logging.warning("2Captcha API ключ не задан")
         return False
     logging.info("⚠️ Капча — решаем через 2Captcha...")
@@ -122,21 +167,122 @@ def solve_captcha(driver) -> bool:
 
 
 # ──────────────────────────────────────────────────────────────
+# ПРЯМОЙ URL ПОИСКА ДЛЯ РЕКЛАМЫ
+# ──────────────────────────────────────────────────────────────
+
+def build_search_url(query: str) -> str:
+    """
+    Строит прямой URL Google-поиска — МИНИМАЛИСТИЧНЫЙ,
+    как будто юзер ввёл запрос в поле и нажал Enter.
+
+    КРИТИЧНО: не добавляем pws=0, adtest=on и другие "служебные"
+    параметры — они включают Google Ads Preview режим (страница с
+    желтым предупреждением "призначена для випробовування"), при
+    котором НАСТОЯЩАЯ реклама не показывается.
+
+    gl/hl тоже лучше не добавлять — Google сам определяет локаль
+    по IP прокси и Accept-Language. Лишние параметры выглядят
+    подозрительно (настоящие юзеры так не делают).
+    """
+    return f"https://www.google.com/search?q={quote(query)}"
+
+
+def is_ads_preview_page(driver) -> bool:
+    """
+    Детектирует страницу Google Ads Preview:
+    "Ця сторінка призначена для випробовування рекламних оголошень Google Ads"
+
+    Эта страница появляется когда URL содержит служебные параметры типа
+    pws=0 или adtest=on. Настоящей рекламы на ней нет, поэтому парсер
+    её не должен считать валидной.
+    """
+    try:
+        body_text = driver.execute_script(
+            "return (document.body && document.body.innerText || '').substring(0, 500).toLowerCase();"
+        )
+        markers = [
+            "ця сторінка призначена для випробовування",
+            "this page is for testing google ads",
+            "эта страница предназначена для тестирования",
+            "google ads preview",
+        ]
+        return any(m in body_text for m in markers)
+    except Exception:
+        return False
+
+
+def do_manual_search(browser, query: str) -> bool:
+    """
+    Fallback: вводит запрос в поле поиска вручную (как юзер).
+    Возвращает True если поиск выполнен успешно.
+    """
+    from selenium.webdriver.common.by import By
+    from selenium.webdriver.common.keys import Keys
+    from selenium.webdriver.support.ui import WebDriverWait
+    from selenium.webdriver.support import expected_conditions as EC
+
+    driver = browser.driver
+    try:
+        # Убеждаемся что мы на google.com
+        if "google.com" not in driver.current_url or "/search" in driver.current_url:
+            browser.stealth_get("https://www.google.com/")
+            time.sleep(random.uniform(2, 4))
+            bypass_consent(driver)
+
+        search_box = WebDriverWait(driver, 10).until(
+            EC.presence_of_element_located((By.NAME, "q"))
+        )
+        WebDriverWait(driver, 5).until(EC.visibility_of(search_box))
+
+        browser.bezier_move_to(search_box)
+        time.sleep(random.uniform(0.4, 0.9))
+
+        # Фокус
+        focused = driver.execute_script(
+            "return document.activeElement === arguments[0];", search_box
+        )
+        if not focused:
+            driver.execute_script("arguments[0].focus();", search_box)
+            time.sleep(0.3)
+
+        # Очистка поля
+        search_box.send_keys(Keys.CONTROL + "a")
+        search_box.send_keys(Keys.BACKSPACE)
+        time.sleep(random.uniform(0.3, 0.7))
+
+        # Печать
+        browser.human_type(search_box, query)
+        time.sleep(random.uniform(0.5, 1.2))
+
+        # Проверка что текст ввёлся
+        typed_value = driver.execute_script("return arguments[0].value;", search_box)
+        if query not in typed_value:
+            driver.execute_script(
+                "arguments[0].value = arguments[1]; "
+                "arguments[0].dispatchEvent(new Event('input', {bubbles: true}));",
+                search_box, query
+            )
+            time.sleep(0.3)
+
+        search_box.send_keys(Keys.RETURN)
+        time.sleep(random.uniform(3, 5))
+        return True
+    except Exception as e:
+        logging.error(f"  do_manual_search: {e}")
+        return False
+
+
+# ──────────────────────────────────────────────────────────────
 # ИЗВЛЕЧЕНИЕ РЕКЛАМНЫХ БЛОКОВ
 # ──────────────────────────────────────────────────────────────
 
 def extract_real_url(href: str) -> str:
-    """
-    Google оборачивает рекламные ссылки в редиректы вида
-    https://www.googleadservices.com/pagead/aclk?adurl=...&url=https%3A%2F%2Freal.com
-    Достаём реальный URL.
-    """
+    """Распарсить параметр adurl/url/q из Google-редиректа"""
     if not href:
         return ""
     try:
         parsed = urlparse(href)
         qs = parse_qs(parsed.query)
-        # Разные варианты названий параметра с реальным URL
         for key in ("adurl", "url", "q"):
             if key in qs:
                 real = unquote(qs[key][0])
@@ -148,7 +294,7 @@ def extract_real_url(href: str) -> str:
 
 
 def extract_domain(url: str) -> str:
-    """Извлекает домен из URL в чистом виде"""
+    """Извлекает домен без www."""
     if not url:
         return ""
     try:
@@ -163,12 +309,7 @@ def extract_domain(url: str) -> str:
 def parse_ads(driver, query: str) -> list[dict]:
     """
     Извлекает ТОЛЬКО рекламные блоки со страницы результатов.
-
-    Для каждого блока собирает:
-    - google_click_url — полная ссылка Google-редиректа с tracking ID
-      (то что открывается при реальном клике)
-    - clean_url — чистый URL рекламодателя из data-rw или из adurl=...
-    - domain — очищенный домен
+    Возвращает для каждой: title, display_url, clean_url, google_click_url, domain
     """
     state = page_state(driver)
     if state != "search_results":
@@ -207,41 +348,38 @@ def parse_ads(driver, query: str) -> list[dict]:
 
     const results = [];
     adBlocks.forEach(block => {
-        // Заголовок
         let title = '';
         const heading = block.querySelector('[role="heading"], h3');
         if (heading) title = heading.textContent.trim();
 
-        // Видимый URL (то что показывается пользователю — обычно homepage рекламодателя)
         let displayUrl = '';
         const cite = block.querySelector('cite, span.VuuXrf, span.x2VHCd, span[role="text"]');
         if (cite) displayUrl = cite.textContent.trim();
 
-        // Главная рекламная ссылка — обычно на заголовке (role=heading)
-        // Берём ПЕРВЫЙ <a> внутри блока что ведёт на google.com/aclk или www.googleadservices.com
         let googleClickUrl = '';
-        let cleanFromDataRw = '';
+        let cleanUrl       = '';
 
         const allLinks = block.querySelectorAll('a[href]');
+
+        // Сначала ищем ссылки через Google-редирект
         for (const link of allLinks) {
             const href = link.href || '';
-            // Интересны только рекламные редиректы Google
             if (href.includes('/aclk?') || href.includes('googleadservices.com')) {
                 if (!googleClickUrl) googleClickUrl = href;
-                // data-rw на этой же ссылке — чистый URL рекламодателя
-                const rw = link.getAttribute('data-rw');
-                if (rw && !cleanFromDataRw) cleanFromDataRw = rw;
+                for (const attr of ['data-rw', 'data-pcu', 'data-rh', 'data-agdh']) {
+                    const val = link.getAttribute(attr);
+                    if (val && val.startsWith('http') && !cleanUrl) {
+                        cleanUrl = val;
+                    }
+                }
             }
         }
 
-        // Если не нашли рекламных редиректов — берём первую http-ссылку
         if (!googleClickUrl) {
             for (const link of allLinks) {
                 const href = link.href || '';
                 if (href && href.startsWith('http')) {
                     googleClickUrl = href;
-                    const rw = link.getAttribute('data-rw');
-                    if (rw && !cleanFromDataRw) cleanFromDataRw = rw;
                     break;
                 }
             }
@@ -252,7 +390,7 @@ def parse_ads(driver, query: str) -> list[dict]:
                 title:           title,
                 displayUrl:      displayUrl,
                 googleClickUrl:  googleClickUrl,
-                cleanFromDataRw: cleanFromDataRw,
+                cleanFromDataRw: cleanUrl,
             });
         }
     });
@@ -266,64 +404,216 @@ def parse_ads(driver, query: str) -> list[dict]:
         logging.warning(f"  Ошибка JS-парсинга: {e}")
         return []
 
-    logging.info(f"  Рекламных блоков найдено: {len(raw_ads)}")
-
     ads = []
     seen_domains = set()
 
-    for idx, raw in enumerate(raw_ads):
+    for raw in raw_ads:
         try:
             google_click_url = raw.get("googleClickUrl", "")
-            clean_from_rw = raw.get("cleanFromDataRw", "")
-            display_url = raw.get("displayUrl", "")
-            title = raw.get("title", "")
+            clean_from_rw    = raw.get("cleanFromDataRw", "")
+            display_url      = raw.get("displayUrl", "")
+            title            = raw.get("title", "")
 
-            # Чистый URL рекламодателя
+            # Чистый URL в порядке приоритета
+            clean_url = ""
             if clean_from_rw and clean_from_rw.startswith("http"):
                 clean_url = clean_from_rw
-            else:
-                clean_url = extract_real_url(google_click_url)
-                if not clean_url or not clean_url.startswith("http") or "google" in clean_url:
-                    clean_url = ""
+            elif google_click_url:
+                parsed = extract_real_url(google_click_url)
+                if (parsed and parsed.startswith("http") and
+                        "google" not in (parsed.split("/")[2] if "/" in parsed[8:] else "")):
+                    clean_url = parsed
+
+            if not clean_url and display_url:
+                du = display_url.strip()
+                if du.startswith("http"):
+                    clean_url = du
+                elif "." in du and " " not in du:
+                    first = du.split("›")[0].split("·")[0].split(" ")[0].strip()
+                    if first and "." in first:
+                        clean_url = "https://" + first
 
             domain = extract_domain(clean_url) or extract_domain(display_url)
 
-            logging.debug(f"  [блок {idx}] clean_url={clean_url!r} domain={domain!r}")
-
             if not domain:
-                logging.info(f"  ✗ [блок {idx}] пропущен: не определился домен")
                 continue
 
-            # Пропускаем внутренние домены Google
+            # Фильтр: Google-внутренние
             if any(g in domain for g in ("google.com", "google.ua", "googleusercontent.com")):
                 continue
 
-            # Пропускаем наш собственный домен
+            # Фильтр: наши домены
             if any(my in domain for my in MY_DOMAINS):
                 logging.info(f"  · [наш] {domain} — {title[:50]}")
                 continue
 
-            # Дедупликация
+            # Дедупликация по домену в рамках одного запроса
             if domain in seen_domains:
-                logging.info(f"  ✗ [блок {idx}] пропущен: дубликат {domain}")
                 continue
             seen_domains.add(domain)
 
             ads.append({
-                "query": query,
-                "title": title,
-                "display_url": display_url,
-                "clean_url": clean_url,
-                "google_click_url": google_click_url,
-                "domain": domain,
-                "found_at": datetime.now().isoformat(timespec="seconds"),
+                "query":             query,
+                "title":             title,
+                "display_url":       display_url,
+                "clean_url":         clean_url,
+                "google_click_url":  google_click_url,
+                "domain":            domain,
+                "found_at":          datetime.now().isoformat(timespec="seconds"),
             })
             logging.info(f"  ✓ {domain} — {title[:60]}")
 
         except Exception as e:
-            logging.warning(f"  ✗ [блок {idx}] исключение: {e}")
+            logging.debug(f"  Ошибка обработки блока: {e}")
 
     return ads
+
+
+# ──────────────────────────────────────────────────────────────
+# ПОИСК ПО ОДНОМУ ЗАПРОСУ С REFRESH-LOOP
+# ──────────────────────────────────────────────────────────────
+
+def search_with_refresh_loop(browser, query: str, sqm, current_ip: str | None = None):
+    """
+    Поиск с refresh-loop для появления рекламы.
+
+    Стратегия:
+    1. Пробуем прямой URL (быстро)
+    2. Если Google показал Ads Preview страницу — делаем ручной ввод (надёжнее)
+    3. Парсим рекламу
+    4. Нет рекламы → refresh через 10-15с (макс N попыток)
+    """
+    driver = browser.driver
+    url = build_search_url(query)
+    logging.info(f"🌐 Прямой URL: {url}")
+
+    # Первый переход
+    try:
+        browser.stealth_get(url, referer="https://www.google.com/")
+    except Exception as e:
+        logging.error(f"  stealth_get провален: {e}")
+        return []
+
+    time.sleep(random.uniform(3, 5))
+
+    # Проверка Ads Preview — если появилось, переходим на ручной ввод
+    if is_ads_preview_page(driver):
+        logging.warning(
+            "  ⚠ Google показал Ads Preview страницу — переходим на ручной ввод"
+        )
+        if not do_manual_search(browser, query):
+            logging.error("  ручной ввод тоже провалился")
+            return []
+        time.sleep(random.uniform(2, 4))
+
+    attempt = 0
+    while True:
+        attempt += 1
+
+        # Офлайн
+        if is_offline_page(driver):
+            logging.error("  ✗ Офлайн-страница. Прокси сломался")
+            return []
+
+        bypass_consent(driver)
+
+        # Капча
+        if page_state(driver) == "captcha":
+            sqm.record("captcha", query=query, details=f"refresh_attempt_{attempt}")
+            if current_ip:
+                browser.report_rotating(current_ip, success=False, captcha=True)
+            if not solve_captcha(driver):
+                sqm.record("blocked", query=query)
+                logging.warning(f"  Капча не решена")
+                return []
+            sqm.record("captcha_solved", query=query)
+
+        # Снова проверка Ads Preview — на случай refresh
+        if is_ads_preview_page(driver):
+            logging.warning(f"  ⚠ Ads Preview на попытке {attempt} — ручной ввод")
+            if not do_manual_search(browser, query):
+                return []
+            time.sleep(random.uniform(2, 4))
+            continue
+
+        # Ждём загрузки контейнеров
+        try:
+            WebDriverWait(driver, 10).until(
+                EC.presence_of_element_located((
+                    By.CSS_SELECTOR,
+                    "#search, #rso, [data-text-ad], #center_col"
+                ))
+            )
+        except Exception:
+            pass
+        time.sleep(random.uniform(1.5, 3))
+
+        # Скролл — реклама часто подгружается при взаимодействии
+        try:
+            browser.human_scroll(1, 2)
+        except Exception:
+            pass
+        time.sleep(random.uniform(0.5, 1.5))
+
+        # Парсим рекламу
+        ads = parse_ads(driver, query)
+
+        if ads:
+            logging.info(f"  ✓ Реклама найдена на попытке {attempt}: {len(ads)} блоков")
+            return ads
+
+        # Рекламы нет
+        if attempt >= REFRESH_MAX_ATTEMPTS:
+            logging.info(f"  ✗ За {attempt} попыток реклама не появилась")
+            return []
+
+        wait_sec = random.uniform(REFRESH_MIN_SEC, REFRESH_MAX_SEC)
+        logging.info(
+            f"  🔄 Рекламы нет, попытка {attempt}/{REFRESH_MAX_ATTEMPTS} — "
+            f"обновляем через {wait_sec:.0f}с"
+        )
+        time.sleep(wait_sec)
+
+        try:
+            driver.refresh()
+        except Exception as e:
+            logging.warning(f"  refresh error: {e}")
+            if not browser.is_alive():
+                return []
+            continue
+
+        time.sleep(random.uniform(2, 4))
+
+
+# ──────────────────────────────────────────────────────────────
+# ЗАПИСЬ URL В ФАЙЛ (APPEND)
+# ──────────────────────────────────────────────────────────────
+
+def append_competitor_urls(ads: list[dict], filepath: str = COMPETITOR_URLS_FILE):
+    """
+    Дописывает все google_click_url в файл (append).
+    Фильтр наших доменов уже сделан в parse_ads — сюда приходят только чужие.
+    Формат строки: <timestamp>\t<query>\t<domain>\t<google_click_url>
+    """
+    if not ads:
+        return
+
+    os.makedirs(os.path.dirname(filepath) or ".", exist_ok=True)
+
+    with open(filepath, "a", encoding="utf-8") as f:
+        for ad in ads:
+            google_url = ad.get("google_click_url", "")
+            if not google_url:
+                continue
+            line = "\t".join([
+                ad["found_at"],
+                ad["query"],
+                ad["domain"],
+                google_url,
+            ])
+            f.write(line + "\n")
+
+    logging.info(f"  📝 Записано в {filepath}: {len(ads)} URL")
 
 
 # ──────────────────────────────────────────────────────────────
@@ -331,23 +621,35 @@ def parse_ads(driver, query: str) -> list[dict]:
 # ──────────────────────────────────────────────────────────────
 
 def run_monitor():
-    # Глобальный словарь всех найденных конкурентов: domain → {data}
     competitors: dict[str, dict] = {}
 
-    with NKBrowser(
-        profile_name    = PROFILE_NAME,
-        proxy_str       = PROXY,
-        device_template = "office_laptop",
-        auto_session    = True,
+    with GhostShellBrowser(
+        profile_name      = PROFILE_NAME,
+        proxy_str         = PROXY,
+        device_template   = CFG.get("browser.device_template"),
+        auto_session      = CFG.get("browser.auto_session", True),
+        is_rotating_proxy = IS_ROTATING_PROXY,
+        rotation_api_url  = ROTATION_API_URL,
+        enrich_on_create  = CFG.get("browser.enrich_on_create", True),
     ) as browser:
 
         driver = browser.driver
         browser.setup_profile_logging()
 
+        # ── Мониторинг профиля ───────────────────────
+        sqm = SessionQualityMonitor(browser.user_data_path)
+        should_abort, reason = sqm.should_abort()
+        if should_abort:
+            logging.error(f"⛔ Профиль деградировал: {reason}")
+            logging.error(f"   Удали nk_session/ и fingerprint.json в {browser.user_data_path}")
+            return
+
         # ── 1. Проверки ──────────────────────────────
         browser.health_check(verbose=True)
 
-        diag   = ProxyDiagnostics(driver)
+        # Диагностика прокси — ВАЖНО делать ПОСЛЕ init nav в start()
+        # (чтобы браузер уже был инициализирован)
+        diag = ProxyDiagnostics(driver, proxy_url=PROXY)
         report = diag.full_check(expected_timezone="Europe/Kyiv")
         diag.print_report(report)
 
@@ -355,155 +657,137 @@ def run_monitor():
             logging.error("✗ WebRTC УТЕЧКА — останавливаемся")
             return
 
+        # ── 2. Блокировка трекеров ───────────────────
         browser.enable_request_blocking()
 
-        # ── 2. Прогрев только если профиль новый ─────
-        fp_exists = os.path.exists(os.path.join(browser.user_data_path, "fingerprint.json"))
-        session_exists = os.path.exists(browser.session_dir)
+        # ── 3. Идём на google.com СНАЧАЛА ─────────
+        # Это тёплый сайт (cookies уже есть), проверяем что сеть работает,
+        # решаем consent если нужно
+        logging.info("🏠 Идём на google.com для инициализации сессии...")
+        browser.stealth_get("https://www.google.com/")
+        time.sleep(random.uniform(3, 5))
 
-        if not session_exists:
-            logging.info("📥 Новый профиль — прогреваем один раз")
-            browser.warmup_profile(depth="medium")
-        else:
-            logging.info("✓ Сессия восстановлена — прогрев пропущен")
+        if is_offline_page(driver):
+            logging.error("✗ Google показал офлайн — прокси проблема, выходим")
+            return
 
-        # ── 3. Идём на Google ───────────────────────
-        browser.stealth_get("https://www.google.com")
-        time.sleep(random.uniform(3, 6))
         bypass_consent(driver)
+        if page_state(driver) == "captcha":
+            if not solve_captcha(driver):
+                logging.warning("Капча на входе не решена")
 
-        if not solve_captcha(driver):
-            logging.warning("Капча на входе не решена")
+        # ── 4. Прогрев ТОЛЬКО для нового профиля ─────
+        if not os.path.exists(browser.session_dir):
+            logging.info("📥 Новый профиль — гибридный прогрев")
+            browser.warmup_profile(depth="hybrid")
+        else:
+            logging.info("✓ Сессия восстановлена — быстрый прогрев через cookies")
+            browser.warmup_profile(depth="fast")
 
-        # ── 4. ЦИКЛ ПОИСКА И СБОРА РЕКЛАМЫ ─────────
+        # ── 5. Фоновые вкладки (как у живого юзера) ──
+        tabs = TabManager(browser)
+        if CFG.get("behavior.open_background_tabs", True):
+            bg_range = CFG.get("behavior.bg_tabs_count", [2, 4])
+            tabs.open_background_tabs(count=random.randint(bg_range[0], bg_range[1]))
+
+        # ── 6. Фиксируем IP для rotating-прокси ──────
+        current_ip = None
+        if IS_ROTATING_PROXY:
+            current_ip = browser.check_and_rotate_if_burned()
+            if current_ip:
+                logging.info(f"🌐 Работаем с IP: {current_ip}")
+
+        # Rate limiter для избежания частых запросов
+        rate_limiter = QueryRateLimiter()
+
+        # ── 7. ЦИКЛ ПОИСКА ───────────────────────────
         for i, query in enumerate(SEARCH_QUERIES):
             if not browser.is_alive():
                 logging.error("Окно закрыто — выходим")
                 break
 
+            # Проверка rate limit ПЕРЕД запросом
+            rate_limiter.wait_if_needed()
+
             logging.info("")
-            logging.info(f"{'='*60}")
+            logging.info("=" * 60)
             logging.info(f"🔎 Запрос {i+1}/{len(SEARCH_QUERIES)}: {query}")
-            logging.info(f"{'='*60}")
+            logging.info("=" * 60)
 
-            # Возвращаемся на главную для чистого поиска
-            if i > 0:
-                try:
-                    driver.get("https://www.google.com")
-                    time.sleep(random.uniform(2, 4))
-                    bypass_consent(driver)
-                except Exception:
-                    if not browser.is_alive():
-                        break
-                    continue
+            search_started = time.time()
+            rate_limiter.record_query(query, ip=current_ip)
 
-            # Проверяем не подсунули ли капчу
-            bypass_consent(driver)
-            if page_state(driver) == "captcha":
-                if not solve_captcha(driver):
-                    logging.warning(f"Запрос '{query}' пропущен (капча)")
-                    time.sleep(random.uniform(30, 60))
-                    continue
+            # Поиск с refresh-loop
+            ads = search_with_refresh_loop(browser, query, sqm, current_ip=current_ip)
 
-            # Вводим запрос
-            def do_search():
-                search_box = WebDriverWait(driver, 10).until(
-                    EC.presence_of_element_located((By.NAME, "q"))
-                )
-                WebDriverWait(driver, 5).until(EC.visibility_of(search_box))
+            duration = time.time() - search_started
 
-                # Клик на поле
-                browser.bezier_move_to(search_box)
-                time.sleep(random.uniform(0.4, 0.9))
-
-                # Подстраховка — проверяем что поле в фокусе
-                focused = driver.execute_script(
-                    "return document.activeElement === arguments[0];",
-                    search_box
-                )
-                if not focused:
-                    logging.warning("  Поле не в фокусе — делаем focus через JS")
-                    driver.execute_script("arguments[0].focus();", search_box)
-                    time.sleep(0.3)
-
-                # Очищаем поле
-                search_box.send_keys(Keys.CONTROL + "a")
-                search_box.send_keys(Keys.BACKSPACE)
-                time.sleep(random.uniform(0.3, 0.7))
-
-                # Печатаем запрос
-                browser.human_type(search_box, query)
-                time.sleep(random.uniform(0.5, 1.2))
-
-                # Проверка что текст реально попал в поле
-                typed_value = driver.execute_script(
-                    "return arguments[0].value;", search_box
-                )
-                if query not in typed_value:
-                    logging.warning(f"  Текст не попал в поле (в поле: '{typed_value}'). Пробуем через JS")
-                    driver.execute_script(
-                        "arguments[0].value = arguments[1]; "
-                        "arguments[0].dispatchEvent(new Event('input', {bubbles: true}));",
-                        search_box, query
-                    )
-                    time.sleep(0.5)
-
-                search_box.send_keys(Keys.RETURN)
-
+            # После парсинга — взаимодействие с выдачей (даже если рекламы нет)
+            # Это сигнал "живой юзер прочитал страницу"
             try:
-                browser.safe_execute(
-                    do_search,
-                    description=f"search_{query}",
-                    retries=2,
-                    screenshot_on_fail=browser.is_alive()
-                )
-            except Exception as e:
-                logging.error(f"Поиск '{query}' провален: {type(e).__name__}")
-                if not browser.is_alive():
-                    break
-                continue
+                interact_with_serp(browser, dwell_min=2, dwell_max=6)
+            except Exception:
+                pass
 
-            time.sleep(random.uniform(4, 7))
+            # Метрика результата
+            if ads:
+                sqm.record("search_ok", query=query,
+                           results_count=len(ads), duration_sec=duration)
+                if IS_ROTATING_PROXY and current_ip:
+                    browser.report_rotating(current_ip, success=True, captcha=False)
+            else:
+                sqm.record("search_empty", query=query, duration_sec=duration)
 
-            # Капча после поиска
-            if page_state(driver) == "captcha":
-                logging.warning("Капча после поиска")
-                if not solve_captcha(driver):
-                    time.sleep(random.uniform(30, 60))
-                    continue
+            # ЗАПИСЬ ССЫЛОК В ФАЙЛ
+            append_competitor_urls(ads, COMPETITOR_URLS_FILE)
 
-            # Небольшой скролл — имитация просмотра
-            browser.human_scroll(1, 2)
-            time.sleep(random.uniform(1, 2))
-
-            # Извлекаем рекламу
-            ads = parse_ads(driver, query)
-
+            # Собираем в сводку конкурентов
             for ad in ads:
                 domain = ad["domain"]
                 if domain in competitors:
-                    # Уже видели — добавляем запрос в список
                     if query not in competitors[domain]["queries"]:
                         competitors[domain]["queries"].append(query)
                 else:
                     competitors[domain] = {
-                        "domain": domain,
-                        "title": ad["title"],
-                        "display_url": ad["display_url"],
-                        "clean_url": ad["clean_url"],
+                        "domain":           domain,
+                        "title":            ad["title"],
+                        "display_url":      ad["display_url"],
+                        "clean_url":        ad["clean_url"],
                         "google_click_url": ad["google_click_url"],
-                        "queries": [query],
-                        "first_seen": ad["found_at"],
+                        "queries":          [query],
+                        "first_seen":       ad["found_at"],
                     }
-                href = ad["google_click_url"]
-                link = driver.find_element(By.CSS_SELECTOR, f'a[href="{href}"]')
-                logging.info(f"Заходим на рекламу конкурента: {domain}.")
-                browser.bezier_move_to(link)  # человекоподобный клик
-                time.sleep(random.uniform(15, 30))
-                driver.back()
 
-            if not ads:
-                logging.info("  (реклама не найдена)")
+            # Между запросами
+            tabs.maybe_switch_around(probability=0.3)
+            if CFG.get("behavior.idle_pauses", True):
+                browser.idle_pause(kind="random")
+            time.sleep(random.uniform(8, 15))
+
+        tabs.close_all_background()
+
+        # ── 8. ИТОГИ ──────────────────────────────────
+        print_report(competitors)
+        save_report(competitors)
+
+        if IS_ROTATING_PROXY:
+            tracker = browser.get_rotating_tracker()
+            if tracker:
+                tracker.print_stats()
+
+        # HTML dashboard
+        try:
+            from dashboard import (
+                collect_profile_stats, collect_latest_competitors,
+                collect_proxy_stats, generate_html
+            )
+            generate_html(
+                profiles    = collect_profile_stats(),
+                competitors = collect_latest_competitors(),
+                proxy_stats = collect_proxy_stats(),
+            )
+        except Exception as e:
+            logging.debug(f"Dashboard: {e}")
 
 
 # ──────────────────────────────────────────────────────────────
@@ -513,7 +797,7 @@ def run_monitor():
 def print_report(competitors: dict):
     logging.info("")
     logging.info("╔" + "═" * 68 + "╗")
-    logging.info("║" + f" ИТОГОВЫЙ ОТЧЁТ — КОНКУРЕНТЫ В КОНТЕКСТНОЙ РЕКЛАМЕ ".center(68) + "║")
+    logging.info("║" + " ИТОГОВЫЙ ОТЧЁТ — КОНКУРЕНТЫ В КОНТЕКСТНОЙ РЕКЛАМЕ ".center(68) + "║")
     logging.info("╚" + "═" * 68 + "╝")
 
     if not competitors:
@@ -523,7 +807,6 @@ def print_report(competitors: dict):
     logging.info(f"Найдено уникальных рекламодателей: {len(competitors)}")
     logging.info("")
 
-    # Сортируем по количеству запросов (чаще встречающиеся наверху)
     sorted_items = sorted(
         competitors.values(),
         key=lambda c: (-len(c["queries"]), c["domain"])
@@ -532,12 +815,14 @@ def print_report(competitors: dict):
     for i, c in enumerate(sorted_items, 1):
         logging.info(f"[{i}] {c['domain']}")
         if c["title"]:
-            logging.info(f"    Заголовок: {c['title']}")
+            logging.info(f"    Заголовок:  {c['title']}")
         if c["display_url"]:
-            logging.info(f"    Display:   {c['display_url']}")
-        if c["real_url"]:
-            logging.info(f"    URL:       {c['real_url']}")
-        logging.info(f"    Запросы:   {', '.join(c['queries'])}")
+            logging.info(f"    Display:    {c['display_url']}")
+        if c.get("clean_url"):
+            logging.info(f"    Clean URL:  {c['clean_url']}")
+        if c.get("google_click_url"):
+            logging.info(f"    Google ref: {c['google_click_url'][:120]}...")
+        logging.info(f"    Запросы:    {', '.join(c['queries'])}")
         logging.info("")
 
 
@@ -550,22 +835,21 @@ def save_report(competitors: dict):
     os.makedirs(reports_dir, exist_ok=True)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
 
-    # JSON
     json_path = os.path.join(reports_dir, f"competitors_{timestamp}.json")
     with open(json_path, "w", encoding="utf-8") as f:
         json.dump(list(competitors.values()), f, indent=2, ensure_ascii=False)
     logging.info(f"📄 JSON отчёт: {json_path}")
 
-    # CSV
     csv_path = os.path.join(reports_dir, f"competitors_{timestamp}.csv")
-    with open(csv_path, "w", encoding="utf-8-sig") as f:  # BOM для Excel
-        f.write("Домен;Заголовок;Display URL;Real URL;Запросы;Впервые замечен\n")
+    with open(csv_path, "w", encoding="utf-8-sig") as f:
+        f.write("Домен;Заголовок;Display URL;Clean URL;Google Click URL;Запросы;Впервые замечен\n")
         for c in competitors.values():
             row = [
                 c["domain"],
                 (c["title"] or "").replace(";", ","),
                 (c["display_url"] or "").replace(";", ","),
-                (c["real_url"] or "").replace(";", ","),
+                (c.get("clean_url") or "").replace(";", ","),
+                (c.get("google_click_url") or "").replace(";", ","),
                 "|".join(c["queries"]),
                 c["first_seen"],
             ]

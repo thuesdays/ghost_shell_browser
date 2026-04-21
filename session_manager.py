@@ -53,8 +53,8 @@ class SessionManager:
 
     def import_cookies(self, filepath: str, domain_filter: list = None) -> int:
         """
-        Импортирует cookies из JSON.
-        domain_filter — если указан, импортирует только для этих доменов
+        Импортирует cookies из JSON через CDP Network.setCookie.
+        Это работает мгновенно и не требует навигации на сайты.
         """
         if not os.path.exists(filepath):
             logging.warning(f"[Session] Файл не найден: {filepath}")
@@ -63,47 +63,35 @@ class SessionManager:
         with open(filepath, "r", encoding="utf-8") as f:
             cookies = json.load(f)
 
-        # Нужно сначала зайти на домен чтобы установить его cookies
-        domains = set()
-        for cookie in cookies:
-            domain = cookie.get("domain", "").lstrip(".")
-            if domain_filter and not any(d in domain for d in domain_filter):
-                continue
-            domains.add(domain)
-
         imported = 0
-        for domain in domains:
+        for cookie in cookies:
             try:
-                # Заходим на домен чтобы иметь право ставить его cookies
-                self.driver.get(f"https://{domain}")
-                time.sleep(1)
+                domain = cookie.get("domain", "")
+                if domain_filter and not any(d in domain for d in domain_filter):
+                    continue
 
-                for cookie in cookies:
-                    cookie_domain = cookie.get("domain", "").lstrip(".")
-                    if cookie_domain != domain:
-                        continue
-                    if domain_filter and not any(d in cookie_domain for d in domain_filter):
-                        continue
+                # Подготовка параметров для CDP Network.setCookie
+                params = {
+                    "name":   cookie["name"],
+                    "value":  cookie["value"],
+                    "domain": domain,
+                    "path":   cookie.get("path", "/"),
+                    "secure": cookie.get("secure", False),
+                    "httpOnly": cookie.get("httpOnly", False),
+                }
+                if "expiry" in cookie:
+                    params["expires"] = int(cookie["expiry"])
+                if "sameSite" in cookie:
+                    ss = cookie["sameSite"]
+                    if ss in ("None", "Lax", "Strict"):
+                        params["sameSite"] = ss
 
-                    # Selenium не принимает некоторые поля
-                    clean_cookie = {
-                        k: v for k, v in cookie.items()
-                        if k in ("name", "value", "domain", "path", "secure", "httpOnly", "expiry", "sameSite")
-                    }
-                    # expiry должен быть int
-                    if "expiry" in clean_cookie:
-                        clean_cookie["expiry"] = int(clean_cookie["expiry"])
-
-                    try:
-                        self.driver.add_cookie(clean_cookie)
-                        imported += 1
-                    except Exception as e:
-                        logging.debug(f"[Session] Не удалось импортировать {cookie.get('name')}: {e}")
-
+                self.driver.execute_cdp_cmd("Network.setCookie", params)
+                imported += 1
             except Exception as e:
-                logging.debug(f"[Session] Ошибка импорта для {domain}: {e}")
+                logging.debug(f"[Session] Ошибка импорта куки {cookie.get('name')}: {e}")
 
-        logging.info(f"[Session] Импортировано {imported} cookies")
+        logging.info(f"[Session] Импортировано {imported} cookies через CDP")
         return imported
 
     # ──────────────────────────────────────────────────────────

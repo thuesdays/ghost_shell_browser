@@ -22,31 +22,39 @@ class ProxyDiagnostics:
         diag.print_report(report)
     """
 
-    def __init__(self, driver):
+    def __init__(self, driver, proxy_url: str = None):
         self.driver = driver
+        self.proxy_url = proxy_url
 
     # ──────────────────────────────────────────────────────────
     # IP CHECK
     # ──────────────────────────────────────────────────────────
 
     def get_browser_ip(self) -> dict:
-        """Получаем IP через который работает браузер"""
+        """Получаем IP через requests (бесшумно)"""
+        import requests
+        # Добавляем протокол если его нет (нужно для requests)
+        p_url = self.proxy_url
+        if p_url and not p_url.startswith("http"):
+            p_url = f"http://{p_url}"
+        proxies = {"http": p_url, "https": p_url} if p_url else None
         try:
-            self.driver.get("https://api.ipify.org?format=json")
-            time.sleep(2)
-            body = self.driver.execute_script("return document.body.innerText;")
-            data = json.loads(body)
-            return {"ok": True, "ip": data.get("ip")}
+            r = requests.get("https://api.ipify.org?format=json", proxies=proxies, timeout=10)
+            return {"ok": True, "ip": r.json().get("ip")}
         except Exception as e:
             return {"ok": False, "error": str(e)}
 
     def get_ip_info(self) -> dict:
-        """Получаем гео-информацию IP: страна, город, провайдер, тип"""
+        """Получаем гео-инфо через requests (бесшумно)"""
+        import requests
+        # Добавляем протокол если его нет (нужно для requests)
+        p_url = self.proxy_url
+        if p_url and not p_url.startswith("http"):
+            p_url = f"http://{p_url}"
+        proxies = {"http": p_url, "https": p_url} if p_url else None
         try:
-            self.driver.get("https://ipapi.co/json/")
-            time.sleep(2)
-            body = self.driver.execute_script("return document.body.innerText;")
-            data = json.loads(body)
+            r = requests.get("https://ipapi.co/json/", proxies=proxies, timeout=10)
+            data = r.json()
             return {
                 "ok":       True,
                 "ip":       data.get("ip"),
@@ -66,31 +74,33 @@ class ProxyDiagnostics:
 
     def webrtc_leak_check(self) -> dict:
         """Проверяем не утекает ли локальный IP через WebRTC"""
-        script = """
-        return new Promise((resolve) => {
-            const ips = new Set();
-            try {
-                const pc = new RTCPeerConnection({
-                    iceServers: [{urls: 'stun:stun.l.google.com:19302'}]
-                });
-                pc.createDataChannel('');
-                pc.onicecandidate = (e) => {
-                    if (!e.candidate) {
-                        resolve({ ok: true, ips: Array.from(ips) });
-                        return;
-                    }
-                    const match = e.candidate.candidate.match(/(\\d+\\.\\d+\\.\\d+\\.\\d+)/);
-                    if (match) ips.add(match[1]);
-                };
-                pc.createOffer().then(o => pc.setLocalDescription(o));
-                setTimeout(() => resolve({ ok: true, ips: Array.from(ips) }), 3000);
-            } catch(e) {
-                resolve({ ok: false, error: e.toString() });
-            }
-        });
+        # В execute_async_script последний аргумент — это callback, который нужно вызвать
+        script = r"""
+        const callback = arguments[arguments.length - 1];
+        const ips = new Set();
+        try {
+            const pc = new RTCPeerConnection({
+                iceServers: [{urls: 'stun:stun.l.google.com:19302'}]
+            });
+            pc.createDataChannel('');
+            pc.onicecandidate = (e) => {
+                if (!e.candidate) {
+                    callback({ ok: true, ips: Array.from(ips) });
+                    return;
+                }
+                const match = e.candidate.candidate.match(/(\d+\.\d+\.\d+\.\d+)/);
+                if (match) ips.add(match[1]);
+            };
+            pc.createOffer().then(o => pc.setLocalDescription(o), e => callback({ok: false, error: e.toString()}));
+            // Таймаут на случай если stun не ответит
+            setTimeout(() => callback({ ok: true, ips: Array.from(ips) }), 5000);
+        } catch(e) {
+            callback({ ok: false, error: e.toString() });
+        }
         """
         try:
-            return self.driver.execute_async_script(script)
+            res = self.driver.execute_async_script(script)
+            return res if res else {"ok": False, "error": "Empty script result"}
         except Exception as e:
             return {"ok": False, "error": str(e)}
 
@@ -168,7 +178,7 @@ class ProxyDiagnostics:
 
         # Определяем утечку WebRTC
         webrtc_leak = False
-        if webrtc.get("ok") and ip_info.get("ok"):
+        if webrtc and webrtc.get("ok") and ip_info and ip_info.get("ok"):
             proxy_ip = ip_info.get("ip")
             for leaked_ip in webrtc.get("ips", []):
                 # Игнорируем локальные и сам прокси-IP

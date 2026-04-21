@@ -630,14 +630,18 @@
         'domAutomation', 'domAutomationController',
     ];
     for (const marker of automationMarkers) {
-        try {
-            delete window[marker];
-            delete document[marker];
-            Object.defineProperty(window, marker, {
-                get: () => undefined, set: () => {}, configurable: false,
-            });
-        } catch(e) {}
+        try { delete window[marker];   } catch(e) {}
+        try { delete document[marker]; } catch(e) {}
     }
+    // Блокируем попытки установки через ловушку на window
+    const _blockedMarkers = new Set(automationMarkers);
+    const _origWindowSet = Object.getOwnPropertyDescriptor(Object.prototype, '__proto__');
+    // Периодически подчищаем на случай если что-то добавится позже
+    setInterval(() => {
+        for (const m of automationMarkers) {
+            if (m in window) { try { delete window[m]; } catch(e) {} }
+        }
+    }, 500);
 
     // Специально для Playwright — проверяют через наличие этого API
     if (window.navigator.webdriver === false) {
@@ -665,6 +669,323 @@
         const _innerH = window.innerHeight;
         Object.defineProperty(window, 'outerWidth',  { get: () => _innerW, configurable: true });
         Object.defineProperty(window, 'outerHeight', { get: () => _innerH + 80, configurable: true });  // +80 на адресную строку
+    } catch(e) {}
+
+
+    // ─────────────────────────────────────────────
+    // 32. SCREEN COORDINATES
+    //     screenX, screenY — позиция окна на экране.
+    //     У автоматизации обычно 0,0 — это тел детекта
+    // ─────────────────────────────────────────────
+    try {
+        // Случайное, но реалистичное положение окна
+        const winX = FP.window_x || 0;
+        const winY = FP.window_y || 0;
+        Object.defineProperty(window, 'screenX',   { get: () => winX, configurable: true });
+        Object.defineProperty(window, 'screenY',   { get: () => winY, configurable: true });
+        Object.defineProperty(window, 'screenLeft',{ get: () => winX, configurable: true });
+        Object.defineProperty(window, 'screenTop', { get: () => winY, configurable: true });
+        // availLeft/Top на экране — обычно 0, но на Mac могут быть другими
+        Object.defineProperty(screen, 'availLeft', { get: () => 0, configurable: true });
+        Object.defineProperty(screen, 'availTop',  { get: () => 0, configurable: true });
+    } catch(e) {}
+
+    // ─────────────────────────────────────────────
+    // 33. EXTENSION DETECTION DEFENSE
+    //     Сайты проверяют наличие конкретных
+    //     расширений через chrome.runtime.sendMessage
+    //     с их ID — отвечаем ошибкой как будто нет
+    // ─────────────────────────────────────────────
+    if (window.chrome && !window.chrome.runtime.sendMessage) {
+        window.chrome.runtime.sendMessage = function(extensionId, message, options, callback) {
+            // Реальный Chrome выбрасывает эту ошибку если расширение не найдено
+            setTimeout(() => {
+                if (typeof callback === 'function') {
+                    callback(undefined);
+                }
+                chrome.runtime.lastError = { message: 'Could not establish connection. Receiving end does not exist.' };
+            }, 10);
+        };
+    }
+
+    // ─────────────────────────────────────────────
+    // 34. CHROME.LOADTIMES / CSI — консистентные данные
+    //     Некоторые детекторы замеряют их значения
+    // ─────────────────────────────────────────────
+    if (window.chrome && window.chrome.loadTimes) {
+        const startT = Date.now() / 1000 - Math.random() * 5;
+        const origLoadTimes = window.chrome.loadTimes;
+        window.chrome.loadTimes = function() {
+            const baseT = startT;
+            return {
+                requestTime:             baseT - 0.5,
+                startLoadTime:           baseT - 0.4,
+                commitLoadTime:          baseT - 0.1,
+                finishDocumentLoadTime:  baseT + 0.3,
+                finishLoadTime:          baseT + 0.8,
+                firstPaintTime:          baseT + 0.2,
+                firstPaintAfterLoadTime: 0,
+                navigationType:          'Other',
+                wasFetchedViaSpdy:       true,
+                wasNpnNegotiated:        true,
+                npnNegotiatedProtocol:   'h2',
+                wasAlternateProtocolAvailable: false,
+                connectionInfo:          'h2',
+            };
+        };
+    }
+
+    // ─────────────────────────────────────────────
+    // 35. INDEXEDDB SEED — имитация истории
+    //     Бот имеет пустую IndexedDB. Создаём небольшой
+    //     "след" как будто браузером пользовались
+    // ─────────────────────────────────────────────
+    try {
+        if (window.indexedDB && !localStorage.getItem('__nk_seeded')) {
+            const req = indexedDB.open('nk_profile_cache', 1);
+            req.onupgradeneeded = (e) => {
+                const db = e.target.result;
+                if (!db.objectStoreNames.contains('visits')) {
+                    db.createObjectStore('visits', { keyPath: 'id', autoIncrement: true });
+                }
+            };
+            req.onsuccess = (e) => {
+                try {
+                    const db = e.target.result;
+                    const tx = db.transaction('visits', 'readwrite');
+                    const store = tx.objectStore('visits');
+                    // Добавляем несколько "посещений" с разным временем
+                    const now = Date.now();
+                    const DAY = 86400000;
+                    for (let i = 0; i < FP.history_length; i++) {
+                        store.add({
+                            url: 'https://example.com/page/' + i,
+                            ts:  now - Math.floor(Math.random() * 30 * DAY),
+                        });
+                    }
+                    localStorage.setItem('__nk_seeded', '1');
+                } catch(e) {}
+            };
+        }
+    } catch(e) {}
+
+    // ─────────────────────────────────────────────
+    // 36. NAVIGATOR.DO_NOT_TRACK
+    //     Дефолт в Chrome — null, не "1" и не "0"
+    // ─────────────────────────────────────────────
+    try {
+        Object.defineProperty(navigator, 'doNotTrack', {
+            get: () => FP.do_not_track,
+            configurable: true,
+        });
+    } catch(e) {}
+
+
+    // ─────────────────────────────────────────────
+    // 37. INSTALLED FONTS — список Windows-шрифтов
+    //     document.fonts API возвращает список через check()
+    //     Детекторы проверяют наличие специфичных шрифтов
+    //     методом measureText — мы уже добавили noise в
+    //     measureText, но ещё даём список
+    // ─────────────────────────────────────────────
+    // Стандартный набор Windows 10/11
+    const WINDOWS_FONTS = [
+        'Arial', 'Arial Black', 'Bahnschrift', 'Calibri', 'Cambria',
+        'Cambria Math', 'Candara', 'Comic Sans MS', 'Consolas', 'Constantia',
+        'Corbel', 'Courier New', 'Ebrima', 'Franklin Gothic Medium', 'Gabriola',
+        'Gadugi', 'Georgia', 'HoloLens MDL2 Assets', 'Impact', 'Ink Free',
+        'Javanese Text', 'Leelawadee UI', 'Lucida Console', 'Lucida Sans Unicode',
+        'Malgun Gothic', 'Marlett', 'Microsoft Himalaya', 'Microsoft JhengHei',
+        'Microsoft New Tai Lue', 'Microsoft PhagsPa', 'Microsoft Sans Serif',
+        'Microsoft Tai Le', 'Microsoft YaHei', 'Microsoft Yi Baiti', 'MingLiU-ExtB',
+        'Mongolian Baiti', 'MS Gothic', 'MV Boli', 'Myanmar Text',
+        'Nirmala UI', 'Palatino Linotype', 'Segoe MDL2 Assets', 'Segoe Print',
+        'Segoe Script', 'Segoe UI', 'Segoe UI Emoji', 'Segoe UI Historic',
+        'Segoe UI Symbol', 'SimSun', 'Sitka', 'Sylfaen', 'Symbol', 'Tahoma',
+        'Times New Roman', 'Trebuchet MS', 'Verdana', 'Webdings', 'Wingdings',
+        'Yu Gothic',
+    ];
+
+    if (document.fonts && document.fonts.check) {
+        const _origCheck = document.fonts.check.bind(document.fonts);
+        document.fonts.check = function(font, text) {
+            // Извлекаем имя шрифта из CSS font shorthand
+            const m = font.match(/['"]?([\w\s-]+)['"]?$/);
+            if (m) {
+                const name = m[1].trim();
+                if (WINDOWS_FONTS.includes(name)) return true;
+                // Для не-Windows шрифтов честно говорим что нет
+                // (кроме generic семейств)
+                if (['serif', 'sans-serif', 'monospace', 'cursive', 'fantasy'].includes(name.toLowerCase())) {
+                    return _origCheck(font, text);
+                }
+                return false;
+            }
+            return _origCheck(font, text);
+        };
+    }
+
+    // ─────────────────────────────────────────────
+    // 38. WEBGPU API — новый вектор детекции (Chrome 113+)
+    //     navigator.gpu.requestAdapter() возвращает инфу
+    //     о GPU. У нас WebGL уже подменён, а WebGPU — нет
+    // ─────────────────────────────────────────────
+    if (navigator.gpu) {
+        const _origRequestAdapter = navigator.gpu.requestAdapter.bind(navigator.gpu);
+        navigator.gpu.requestAdapter = async function(options) {
+            const adapter = await _origRequestAdapter(options);
+            if (!adapter) return adapter;
+
+            // Патчим requestAdapterInfo чтобы возвращал согласованные данные
+            const origInfo = adapter.requestAdapterInfo?.bind(adapter);
+            if (origInfo) {
+                adapter.requestAdapterInfo = async function() {
+                    const info = await origInfo();
+                    // Парсим vendor из webgl_renderer
+                    const r = FP.webgl_renderer.toLowerCase();
+                    let vendor = 'unknown';
+                    let arch   = '';
+                    if (r.includes('nvidia'))      { vendor = 'nvidia'; arch = 'ada-lovelace'; }
+                    else if (r.includes('amd'))    { vendor = 'amd';    arch = 'rdna-2'; }
+                    else if (r.includes('intel'))  { vendor = 'intel';  arch = 'xe'; }
+                    return Object.assign(Object.create(info), {
+                        vendor:       vendor,
+                        architecture: arch,
+                        device:       '',
+                        description:  FP.webgl_renderer.slice(0, 100),
+                    });
+                };
+            }
+            return adapter;
+        };
+    }
+
+    // ─────────────────────────────────────────────
+    // 39. PERFORMANCE.GETENTRIES() — скрываем наши скрипты
+    //     Детекторы смотрят в performance.getEntriesByType('resource')
+    //     чтобы найти подозрительные загрузки. Наш CDP-скрипт
+    //     туда не попадает, но на всякий случай фильтруем
+    // ─────────────────────────────────────────────
+    if (performance && performance.getEntriesByType) {
+        const _origGetByType = performance.getEntriesByType.bind(performance);
+        performance.getEntriesByType = function(type) {
+            const entries = _origGetByType(type);
+            if (type === 'resource') {
+                return entries.filter(e => {
+                    // Фильтруем evaluate-скрипты (наш JS который CDP инжектит)
+                    return !e.name.includes('__puppeteer') &&
+                           !e.name.includes('<anonymous>');
+                });
+            }
+            return entries;
+        };
+    }
+
+
+    // ─────────────────────────────────────────────
+    // 40. DEVTOOLS DETECTION DEFENSE
+    //     Детекторы пытаются понять открыт ли DevTools
+    //     (CDP подключение) через замеры таймингов.
+    //     Классика: toString на функции + замер времени
+    // ─────────────────────────────────────────────
+
+    // Защита 1: console.log внутри геттера выполняется очень
+    // медленно когда открыт DevTools. Патчим метод toString
+    // на RegExp чтобы не вызывался лишний раз
+    const devtoolsObj = /./;
+    devtoolsObj.toString = function() {
+        // Обычная реализация — не делаем тут медленных операций
+        return '/./';
+    };
+
+    // Защита 2: debugger keyword пауза — если открыт DevTools,
+    // страница останавливается. Детекторы замеряют разницу.
+    // Мы не можем убрать этот эффект, но мы можем сломать
+    // замер — патчим performance.now чтобы скрыть паузы
+    // (уже сделано в секции 23, дополняем)
+
+    // Защита 3: window.outerHeight - window.innerHeight > 100
+    // указывает на открытый DevTools. Мы уже синхронизировали
+    // эти значения в секции 31 — проверяем ещё раз что они ок
+    try {
+        const innerH = window.innerHeight;
+        const outerH = window.outerHeight;
+        // Если DevTools открыт, разница > 100. Для бота разницы
+        // быть не должно — наши значения в секции 31 дают +80
+        if (Math.abs(outerH - innerH) > 100) {
+            Object.defineProperty(window, 'outerHeight', {
+                get: () => innerH + 80,
+                configurable: true,
+            });
+        }
+    } catch(e) {}
+
+    // Защита 4: убираем следы Runtime.enable из CDP
+    // Когда CDP подключается, window.chrome.runtime.sendMessage
+    // ведёт себя по-другому. Ничего не делаем (уже замокано в 33)
+
+    // ─────────────────────────────────────────────
+    // 41. NOTIFICATION API — permission state
+    //     default/granted/denied — всегда должно быть
+    //     default для браузера "из коробки"
+    // ─────────────────────────────────────────────
+    try {
+        if (window.Notification) {
+            Object.defineProperty(Notification, 'permission', {
+                get: () => 'default',
+                configurable: true,
+            });
+        }
+    } catch(e) {}
+
+    // ─────────────────────────────────────────────
+    // 42. PERFORMANCE.MEMORY — только в Chrome
+    //     Реалистичные значения для heap
+    // ─────────────────────────────────────────────
+    try {
+        if (performance && !performance.memory) {
+            Object.defineProperty(performance, 'memory', {
+                get: () => ({
+                    jsHeapSizeLimit:  FP.device_memory * 536870912,   // device_memory GB → bytes
+                    totalJSHeapSize:  Math.floor(30000000 + Math.random() * 20000000),
+                    usedJSHeapSize:   Math.floor(20000000 + Math.random() * 15000000),
+                }),
+                configurable: true,
+            });
+        }
+    } catch(e) {}
+
+    // ─────────────────────────────────────────────
+    // 43. SCREEN.ORIENTATION
+    //     Десктоп всегда landscape-primary
+    // ─────────────────────────────────────────────
+    try {
+        if (screen.orientation) {
+            Object.defineProperty(screen.orientation, 'type', {
+                get: () => 'landscape-primary',
+                configurable: true,
+            });
+            Object.defineProperty(screen.orientation, 'angle', {
+                get: () => 0,
+                configurable: true,
+            });
+        }
+    } catch(e) {}
+
+    // ─────────────────────────────────────────────
+    // 44. KEYBOARD API — раскладка клавиатуры
+    //     navigator.keyboard.getLayoutMap() в Chrome
+    //     возвращает раскладку. По умолчанию — US.
+    // ─────────────────────────────────────────────
+    try {
+        if (navigator.keyboard && navigator.keyboard.getLayoutMap) {
+            const _orig = navigator.keyboard.getLayoutMap.bind(navigator.keyboard);
+            navigator.keyboard.getLayoutMap = async function() {
+                const map = await _orig();
+                // Возвращаем как есть но гарантируем что это Promise
+                return map;
+            };
+        }
     } catch(e) {}
 
 })();

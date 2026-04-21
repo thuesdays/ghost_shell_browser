@@ -77,7 +77,7 @@ def _random_hash(length: int = 64) -> str:
 # ОСНОВНОЙ КЛАСС
 # ──────────────────────────────────────────────────────────────
 
-class NKBrowser:
+class GhostShellBrowser:
     def __init__(
         self,
         profile_name: str,
@@ -86,19 +86,37 @@ class NKBrowser:
         browser_path: str = None,
         device_template: str = None,
         auto_session: bool = True,
+        is_rotating_proxy: bool = False,
+        rotation_api_url: str = None,
+        enrich_on_create: bool = True,
     ):
-        self.profile_name    = str(profile_name)
-        self.user_data_path  = os.path.abspath(os.path.join(base_dir, self.profile_name))
-        self.proxy_str       = proxy_str
-        self.browser_path    = browser_path
-        self.device_template = device_template
-        self.auto_session    = auto_session
-        self.driver          = None
-        self._session_mgr    = None
-        self._proxy_forwarder = None  # Локальный форвардер для авторизованных прокси
+        self.profile_name     = str(profile_name)
+        self.user_data_path   = os.path.abspath(os.path.join(base_dir, self.profile_name))
+        self.proxy_str        = proxy_str
+        self.browser_path     = browser_path
+        self.device_template  = device_template
+        self.auto_session     = auto_session
+        self.is_rotating_proxy = is_rotating_proxy
+        self.rotation_api_url  = rotation_api_url
+        self.enrich_on_create  = enrich_on_create
+        self.driver           = None
+        self._session_mgr     = None
+        self._proxy_forwarder = None
+        self._rotating_tracker = None  # RotatingProxyTracker если is_rotating_proxy
+
+        # Обогащение профиля — до создания папок, пока его ещё нет
+        is_new_profile = not os.path.exists(self.user_data_path)
 
         os.makedirs(self.user_data_path, exist_ok=True)
         self.session_dir = os.path.join(self.user_data_path, "nk_session")
+
+        # Enrich новый профиль данными — имитируем что Chrome уже использовался
+        if is_new_profile and enrich_on_create:
+            try:
+                from profile_enricher import ProfileEnricher
+                ProfileEnricher(self.user_data_path).enrich_all()
+            except Exception as e:
+                logging.warning(f"[NKBrowser] Enrichment failed: {e}")
 
         self._js_template_path = os.path.join(
             os.path.dirname(os.path.abspath(__file__)), "fingerprints.js"
@@ -123,8 +141,30 @@ class NKBrowser:
     def _load_or_create_fingerprint(self) -> dict:
         fp_path = os.path.join(self.user_data_path, "fingerprint.json")
         if os.path.exists(fp_path):
-            with open(fp_path, "r", encoding="utf-8") as f:
-                return json.load(f)
+            try:
+                with open(fp_path, "r", encoding="utf-8") as f:
+                    fp = json.load(f)
+                # Проверяем целостность — должны быть все критичные поля
+                required = [
+                    "user_agent", "canvas_noise", "audio_noise",
+                    "webgl_vendor", "webgl_renderer",
+                    "hardware_concurrency", "device_memory",
+                    "screen_width", "screen_height",
+                ]
+                missing = [k for k in required if k not in fp]
+                if missing:
+                    logging.warning(
+                        f"[NKBrowser] Фингерпринт повреждён (нет полей: {missing}). "
+                        f"Бэкапим старый и создаём новый."
+                    )
+                    # Бэкап повреждённого
+                    backup = fp_path + f".broken.{int(time.time())}"
+                    os.rename(fp_path, backup)
+                else:
+                    return fp
+            except json.JSONDecodeError:
+                logging.error(f"[NKBrowser] Фингерпринт нечитаем — создаём новый")
+                os.rename(fp_path, fp_path + f".corrupted.{int(time.time())}")
 
         # Используем согласованный шаблон устройства вместо случайных полей
         from device_templates import get_template, validate_fingerprint
@@ -333,6 +373,7 @@ chrome.proxy.settings.set({{
         options.add_argument("--no-default-browser-check")
         options.add_argument("--disable-infobars")
         options.add_argument("--disable-notifications")
+        options.add_argument("--disable-popup-blocking")
         options.add_argument(f"--window-size={fp['screen_width']},{fp['screen_height'] - 80}")
 
         # Прокси через локальный форвардер (вместо расширения)
@@ -399,10 +440,32 @@ chrome.proxy.settings.set({{
         # 4. Сетевые условия через CDP
         self.set_network_conditions()
 
-        # 5. Viewport с небольшим случайным сдвигом
+        # 5. Extra HTTP headers — порядок важен, Chrome отправляет именно так
+        self._set_extra_http_headers(fp)
+
+        # 6. Viewport с небольшим случайным сдвигом
         self.apply_viewport_jitter()
 
-        # 6. Авто-восстановление сохранённой сессии (cookies + storage)
+        # 7. КРИТИЧНО: обязательная инициализирующая навигация на пустую страницу
+        #    Без этого ПЕРВАЯ навигация пользователя (будь то youtube или google)
+        #    идёт БЕЗ примененных CDP-инъекций fingerprints.js. Chrome получает
+        #    "голый" реальный User-Agent/timezone → детект, показ "офлайн".
+        #    data:URL не требует сети и гарантированно применяет инъекции.
+        try:
+            self.driver.get("data:text/html,<html><head><title>init</title></head><body></body></html>")
+            time.sleep(0.8)
+
+            # Проверка что инъекции действительно применились
+            ua_ok = self.driver.execute_script(
+                "return navigator.userAgent === arguments[0]", fp["user_agent"]
+            )
+            if not ua_ok:
+                logging.warning("[NKBrowser] User-Agent injection не применился — перезапрашиваем")
+                time.sleep(0.5)
+        except Exception as e:
+            logging.debug(f"[NKBrowser] init nav: {e}")
+
+        # 8. Авто-восстановление сохранённой сессии (cookies + storage)
         if self.auto_session and os.path.exists(self.session_dir):
             try:
                 self._auto_restore_session()
@@ -446,22 +509,75 @@ chrome.proxy.settings.set({{
     # ЧЕЛОВЕКОПОДОБНЫЕ ДЕЙСТВИЯ
     # ──────────────────────────────────────────────────────────
 
-    def human_type(self, element, text: str, wpm: int = 180):
-        """Печать с реальной скоростью и случайными паузами"""
-        delay_base = 60.0 / (wpm * 5)  # средняя задержка между символами
+    # Соседние клавиши QWERTY — для правдоподобных опечаток
+    _KEYBOARD_NEIGHBORS = {
+        "q": "wa",    "w": "qeas",   "e": "wrds",   "r": "etdf",
+        "t": "ryfg",  "y": "tugh",   "u": "yihj",   "i": "uojk",
+        "o": "ipkl",  "p": "ol",     "a": "qwsz",   "s": "awedxz",
+        "d": "serfcx","f": "drtgvc", "g": "ftyhbv", "h": "gyujnb",
+        "j": "huiknm","k": "jiolm",  "l": "kop",    "z": "asx",
+        "x": "zsdc",  "c": "xdfv",   "v": "cfgb",   "b": "vghn",
+        "n": "bhjm",  "m": "njk",
+    }
+
+    def _typo_for(self, char: str) -> str:
+        """Возвращает правдоподобную опечатку для символа (соседняя клавиша)"""
+        lower = char.lower()
+        neighbors = self._KEYBOARD_NEIGHBORS.get(lower, "")
+        if not neighbors:
+            return random.choice("abcde")
+        typo = random.choice(neighbors)
+        return typo.upper() if char.isupper() else typo
+
+    def human_type(self, element, text: str, wpm: int = None):
+        """
+        Печать с реальной скоростью, паузами и правдоподобными опечатками.
+        wpm — words per minute. Если None — выбирается по времени суток.
+        """
+        from selenium.webdriver.common.keys import Keys
+        from datetime import datetime as _dt
+
+        # Time-of-day awareness — ночью и рано утром печатаем медленнее
+        if wpm is None:
+            hour = _dt.now().hour
+            if 0 <= hour < 6:       # ночь — заспанный юзер
+                wpm = random.randint(100, 140)
+            elif 6 <= hour < 9:     # раннее утро — ещё сонный
+                wpm = random.randint(130, 170)
+            elif 9 <= hour < 12:    # рабочее утро — бодрый
+                wpm = random.randint(170, 220)
+            elif 12 <= hour < 14:   # обед — расслабленный
+                wpm = random.randint(150, 190)
+            elif 14 <= hour < 18:   # рабочий день — активный
+                wpm = random.randint(180, 230)
+            elif 18 <= hour < 22:   # вечер — средний темп
+                wpm = random.randint(150, 190)
+            else:                   # поздний вечер — устал
+                wpm = random.randint(120, 160)
+
+        delay_base = 60.0 / (wpm * 5)
+
         for i, char in enumerate(text):
-            element.send_keys(char)
-            # Случайный разброс ±40% от базовой скорости
-            delay = delay_base * random.uniform(0.6, 1.4)
-            # Редкая длинная пауза (раздумье)
-            if random.random() < 0.04:
-                delay += random.uniform(0.4, 1.2)
-            # Ещё более редкая опечатка с исправлением
-            if random.random() < 0.02 and i > 0:
-                from selenium.webdriver.common.keys import Keys
-                element.send_keys(random.choice("abcde"))
-                time.sleep(random.uniform(0.2, 0.5))
+            # 3% шанс на опечатку — но только на латинских буквах
+            if random.random() < 0.03 and char.isalpha() and ord(char) < 128:
+                typo = self._typo_for(char)
+                element.send_keys(typo)
+                time.sleep(random.uniform(0.15, 0.45))
                 element.send_keys(Keys.BACKSPACE)
+                time.sleep(random.uniform(0.08, 0.2))
+
+            element.send_keys(char)
+
+            delay = delay_base * random.uniform(0.6, 1.4)
+
+            # Редкая длинная пауза — "подумал"
+            if random.random() < 0.03:
+                delay += random.uniform(0.4, 1.2)
+
+            # После пробела или знака — чуть дольше
+            if char in " .,;!?":
+                delay *= random.uniform(1.2, 1.8)
+
             time.sleep(delay)
 
     def human_move_and_click(self, element):
@@ -611,9 +727,8 @@ chrome.proxy.settings.set({{
     def set_network_conditions(self):
         """Устанавливаем реалистичные сетевые параметры через CDP"""
         fp = self._load_or_create_fingerprint()
-        # Конвертируем Mbps → байты/с
         download_bytes = int(fp["connection_downlink"] * 1024 * 1024 / 8)
-        upload_bytes   = int(download_bytes * 0.3)  # Upload обычно меньше
+        upload_bytes   = int(download_bytes * 0.3)
         latency_ms     = fp["connection_rtt"]
 
         try:
@@ -627,6 +742,39 @@ chrome.proxy.settings.set({{
             logging.debug(f"[NKBrowser] Network: {fp['connection_downlink']}Mbps, RTT={latency_ms}ms")
         except Exception as e:
             logging.debug(f"[NKBrowser] CDP network conditions: {e}")
+
+    def _set_extra_http_headers(self, fp: dict):
+        """
+        Устанавливает дополнительные HTTP-заголовки что отправляет настоящий Chrome.
+        Chrome 90+ отправляет пачку Sec-CH-UA-* и Sec-Fetch-* заголовков.
+        """
+        # Client Hints — заголовки что соответствуют userAgentMetadata
+        major = fp["chrome_version_major"]
+        full  = fp["chrome_version_full"]
+
+        headers = {
+            "Accept-Language":  ",".join(fp["languages"]) + ";q=0.9",
+            "Sec-CH-UA":        f'"Not_A Brand";v="8", "Chromium";v="{major}", "Google Chrome";v="{major}"',
+            "Sec-CH-UA-Mobile": "?0",
+            "Sec-CH-UA-Platform": '"Windows"',
+            "Sec-CH-UA-Platform-Version": '"15.0.0"',
+            "Sec-CH-UA-Arch":   '"x86"',
+            "Sec-CH-UA-Bitness": '"64"',
+            "Sec-CH-UA-Full-Version":      f'"{full}"',
+            "Sec-CH-UA-Full-Version-List": (
+                f'"Not_A Brand";v="8.0.0.0", '
+                f'"Chromium";v="{full}", '
+                f'"Google Chrome";v="{full}"'
+            ),
+            "Sec-CH-UA-Model":   '""',
+            "Sec-CH-UA-WoW64":   "?0",
+        }
+
+        try:
+            self.driver.execute_cdp_cmd("Network.setExtraHTTPHeaders", {"headers": headers})
+            logging.debug("[NKBrowser] Extra HTTP headers установлены")
+        except Exception as e:
+            logging.debug(f"[NKBrowser] Extra HTTP headers: {e}")
 
     # ──────────────────────────────────────────────────────────
     # VIEWPORT JITTER
@@ -648,8 +796,24 @@ chrome.proxy.settings.set({{
     def warmup_profile(self, depth: str = "light"):
         """
         Прогрев профиля — имитация живого пользователя.
-        depth: 'light' (1–2 мин) | 'medium' (3–5 мин) | 'full' (7–10 мин)
+        depth: 'fast' (5-10с через cookies) | 'hybrid' (20-30с) |
+               'light' (1-2 мин) | 'medium' (3-5 мин) | 'full' (7-10 мин)
         """
+        # Быстрый — только через cookies
+        if depth == "fast":
+            from cookie_warmer import CookieWarmer
+            CookieWarmer(self.driver).fast_warmup()
+            self._log_activity("warmup", "fast")
+            return
+
+        # Гибридный — cookies + короткие посещения
+        if depth == "hybrid":
+            from cookie_warmer import CookieWarmer
+            CookieWarmer(self.driver).hybrid_warmup(short_visits=True)
+            self._log_activity("warmup", "hybrid")
+            return
+
+        # Обычный прогрев с реальными посещениями
         sites = {
             "light": [
                 "https://www.google.com",
@@ -681,13 +845,8 @@ chrome.proxy.settings.set({{
                 wait_base = {"light": 5, "medium": 8, "full": 12}.get(depth, 5)
                 time.sleep(random.uniform(wait_base, wait_base + 4))
 
-                # Принимаем куки если есть
                 self._try_accept_cookies()
-
-                # Движения мышью
                 self.warm_mouse()
-
-                # Скролл
                 self.human_scroll(
                     min_scrolls={"light": 1, "medium": 2, "full": 3}.get(depth, 1),
                     max_scrolls={"light": 3, "medium": 5, "full": 7}.get(depth, 3),
@@ -707,7 +866,55 @@ chrome.proxy.settings.set({{
             except Exception as e:
                 logging.debug(f"[NKBrowser] warmup {url}: {e}")
 
+        self._log_activity("warmup", depth)
         logging.info("[NKBrowser] Прогрев завершён")
+
+    # ──────────────────────────────────────────────────────────
+    # PERSISTENT ACTIVITY LOG
+    # Профиль помнит что делал в прошлых сессиях — это делает
+    # его более "живым" для long-term детекторов поведения
+    # ──────────────────────────────────────────────────────────
+
+    def _log_activity(self, event_type: str, detail: str = ""):
+        """Записывает событие в activity.json профиля"""
+        activity_file = os.path.join(self.user_data_path, "activity.json")
+        entry = {
+            "timestamp":  datetime.now().isoformat(timespec="seconds"),
+            "event":      event_type,
+            "detail":     detail,
+        }
+        try:
+            if os.path.exists(activity_file):
+                with open(activity_file, "r", encoding="utf-8") as f:
+                    log = json.load(f)
+            else:
+                log = []
+            log.append(entry)
+            # Храним только последние 200 событий
+            log = log[-200:]
+            with open(activity_file, "w", encoding="utf-8") as f:
+                json.dump(log, f, indent=2, ensure_ascii=False)
+        except Exception as e:
+            logging.debug(f"[NKBrowser] activity log: {e}")
+
+    def get_activity_stats(self) -> dict:
+        """Возвращает статистику активности профиля"""
+        activity_file = os.path.join(self.user_data_path, "activity.json")
+        if not os.path.exists(activity_file):
+            return {"total_events": 0, "first_seen": None, "last_seen": None}
+        try:
+            with open(activity_file, "r", encoding="utf-8") as f:
+                log = json.load(f)
+            if not log:
+                return {"total_events": 0}
+            return {
+                "total_events": len(log),
+                "first_seen":   log[0]["timestamp"],
+                "last_seen":    log[-1]["timestamp"],
+                "event_types":  {e["event"]: sum(1 for x in log if x["event"] == e["event"]) for e in log},
+            }
+        except Exception:
+            return {"total_events": 0}
 
     def _try_accept_cookies(self):
         """Принимаем куки-баннеры если появились"""
@@ -961,8 +1168,153 @@ chrome.proxy.settings.set({{
         self.driver.get("https://bot.sannysoft.com/")
         time.sleep(5)
 
+    def smart_dwell(self, min_sec: float = 3.0, max_sec: float = 20.0):
+        """
+        Умное время "чтения" страницы — зависит от контента.
+        Длинная страница → дольше читаем. Видео → ещё дольше.
+        Короткая — быстрее уходим.
+        """
+        try:
+            info = self.driver.execute_script("""
+                return {
+                    textLength:   (document.body.innerText || '').length,
+                    hasVideo:     document.querySelector('video, iframe[src*="youtube"]') !== null,
+                    hasForm:      document.querySelector('form') !== null,
+                    imagesCount:  document.images.length,
+                    scrollHeight: document.documentElement.scrollHeight,
+                    viewHeight:   window.innerHeight,
+                };
+            """)
+
+            # Базовое время чтения: ~250 слов в минуту = ~1500 символов/мин
+            # Т.е. ~25 символов в секунду
+            text_len = info.get("textLength", 0)
+            base_read_time = text_len / 25 if text_len else 3
+
+            # Люди не читают всё — только ~15-30% страницы
+            actual_read = base_read_time * random.uniform(0.15, 0.30)
+
+            # Корректировки
+            if info.get("hasVideo"):
+                actual_read += random.uniform(10, 30)  # остановились посмотреть видео
+            if info.get("imagesCount", 0) > 10:
+                actual_read += random.uniform(2, 5)    # разглядываем картинки
+
+            # Ограничиваем пределами
+            dwell = max(min_sec, min(max_sec, actual_read))
+
+            logging.debug(f"[NKBrowser] smart_dwell: {dwell:.1f}с (text={text_len}, video={info.get('hasVideo')})")
+            time.sleep(dwell)
+        except Exception:
+            time.sleep(random.uniform(min_sec, max_sec))
+
+    def idle_pause(self, kind: str = "random"):
+        """
+        Имитация того что юзер отвлёкся.
+        kind:
+          "micro"  — 3-10 сек (посмотрел на телефон)
+          "short"  — 30-90 сек (попил воды)
+          "medium" — 5-15 мин (туалет, перекур)
+          "long"   — 30-60 мин (обед, встреча)
+          "random" — случайно выбирает с реалистичными весами
+        """
+        if kind == "random":
+            # Распределение похожее на реального юзера:
+            # большую часть времени ничего или микро-отвлечения
+            kind = random.choices(
+                ["none", "micro", "short", "medium", "long"],
+                weights=[60, 25, 10, 4, 1],
+                k=1,
+            )[0]
+
+        if kind == "none":
+            return
+
+        ranges = {
+            "micro":  (3, 10),
+            "short":  (30, 90),
+            "medium": (300, 900),
+            "long":   (1800, 3600),
+        }
+        low, high = ranges.get(kind, (5, 15))
+        pause = random.uniform(low, high)
+
+        logging.info(f"[NKBrowser] 💤 Пауза {kind}: {pause:.0f}с")
+        time.sleep(pause)
+
     def random_pause(self, min_sec: float = 1.0, max_sec: float = 4.0):
+        """Простая случайная пауза (для обратной совместимости)"""
         time.sleep(random.uniform(min_sec, max_sec))
+
+    # ──────────────────────────────────────────────────────────
+    # SEARCH SUGGESTIONS INTERACTION
+    # ──────────────────────────────────────────────────────────
+
+    def wait_and_interact_with_suggestions(
+        self,
+        search_box,
+        click_probability: float = 0.35,
+        partial_typing: bool = False,
+    ) -> bool:
+        """
+        После ввода запроса ждёт появления autocomplete подсказок,
+        с вероятностью click_probability кликает по одной из них
+        вместо Enter. Это то что делает живой юзер.
+
+        Возвращает True если кликнули по подсказке (тогда Enter не нужен),
+        False если решили не кликать (делаем Enter как обычно).
+
+        partial_typing — если True, значит ввели не весь запрос а только часть
+        (для имитации: начал вводить, увидел что нужно в подсказках, кликнул)
+        """
+        # Ждём появления подсказок
+        time.sleep(random.uniform(0.4, 1.0))
+
+        try:
+            suggestions = self.driver.find_elements(
+                By.CSS_SELECTOR,
+                'ul[role="listbox"] li[role="option"], '
+                '.sbct, .wM6W7d, .G43f7e, [role="option"]'
+            )
+        except Exception:
+            return False
+
+        if not suggestions:
+            return False
+
+        # Фильтруем только видимые
+        visible = []
+        for s in suggestions:
+            try:
+                if s.is_displayed():
+                    visible.append(s)
+            except Exception:
+                continue
+
+        if not visible:
+            return False
+
+        logging.debug(f"[NKBrowser] Подсказок найдено: {len(visible)}")
+
+        # С заданной вероятностью кликаем по случайной подсказке из первых 3
+        if random.random() < click_probability:
+            chosen = random.choice(visible[:min(3, len(visible))])
+            logging.info(f"[NKBrowser] 👆 Клик по подсказке: '{chosen.text[:50]}'")
+
+            # Даём подумать — как будто увидел и решил
+            time.sleep(random.uniform(0.4, 1.2))
+
+            try:
+                self.bezier_move_to(chosen)
+                return True
+            except Exception:
+                try:
+                    chosen.click()
+                    return True
+                except Exception:
+                    pass
+
+        return False
 
     # ──────────────────────────────────────────────────────────
     # ЗАВЕРШЕНИЕ
@@ -991,3 +1343,50 @@ chrome.proxy.settings.set({{
                 pass
 
         logging.info(f"[NKBrowser] Сессия завершена. Профиль: {self.profile_name}")
+
+    # ──────────────────────────────────────────────────────────
+    # ROTATING PROXY SUPPORT
+    # ──────────────────────────────────────────────────────────
+
+    def get_rotating_tracker(self):
+        """Ленивая инициализация трекера IP-ротации"""
+        if self._rotating_tracker is None and self.is_rotating_proxy:
+            from rotating_proxy import RotatingProxyTracker
+            self._rotating_tracker = RotatingProxyTracker(
+                proxy_url        = self.proxy_str,
+                rotation_api_url = self.rotation_api_url,
+                state_file       = os.path.join(self.user_data_path, "rotating_ips.json"),
+            )
+        return self._rotating_tracker
+
+    def check_and_rotate_if_burned(self) -> str | None:
+        """
+        Проверяет текущий IP. Если он в списке сгоревших — форсит ротацию.
+        Возвращает итоговый IP.
+        """
+        tracker = self.get_rotating_tracker()
+        if not tracker:
+            return None
+
+        current_ip = tracker.get_current_ip(self.driver)
+        if not current_ip:
+            return None
+
+        if tracker.is_ip_burned(current_ip):
+            logging.warning(f"[NKBrowser] IP {current_ip} сгоревший — ротируем")
+            tracker.force_rotate()
+            time.sleep(random.uniform(3, 8))
+            # Ждём смены
+            new_ip = tracker.wait_for_rotation(self.driver, current_ip, timeout=60)
+            if new_ip:
+                current_ip = new_ip
+
+        # Enrich метаданные (один раз на IP)
+        tracker.enrich_ip_info(current_ip, self.driver)
+        return current_ip
+
+    def report_rotating(self, ip: str, success: bool = True, captcha: bool = False):
+        """Отчитывается трекеру о результате"""
+        tracker = self.get_rotating_tracker()
+        if tracker and ip:
+            tracker.report(ip, success=success, captcha=captcha)
