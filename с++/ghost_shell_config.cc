@@ -229,8 +229,31 @@ void GhostShellConfig::Initialize() {
   if (const auto* plugins = dict.FindList("plugins"))
     plugins_json_ = SerializeListAsJson(*plugins);
 
-  LOG(INFO) << "[GhostShell] Stealth profile loaded. Template=" << platform_.Utf8();
-  LOG(INFO) << "[GhostShell] UA=" << user_agent_.Utf8().substr(0, 80);
+  // ─── Permissions API ───────────────────────────────────
+  // Payload shape: {"permissions": {"geolocation": "prompt",
+  //                                 "notifications": "prompt",
+  //                                 "camera": "prompt", ...}}
+  // Values are the W3C PermissionState enum strings.
+  permissions_.clear();
+  if (const auto* perms = dict.FindDict("permissions")) {
+    for (const auto [k, v] : *perms) {
+      if (v.is_string()) {
+        permissions_.insert(ToBlinkString(k), ToBlinkString(v.GetString()));
+      }
+    }
+  }
+
+  // Use VLOG(1) instead of LOG(INFO) so these only appear when explicitly
+  // debugging via --v=1 / --enable-logging. Prevents console spam in
+  // normal runs where Chromium spawns renderers/GPU/utility subprocesses.
+  VLOG(1) << "[GhostShell] Stealth profile loaded. Template=" << platform_.Utf8();
+  VLOG(1) << "[GhostShell] UA=" << user_agent_.Utf8().substr(0, 80);
+}
+
+String GhostShellConfig::GetPermissionState(const String& name) const {
+  auto it = permissions_.find(name);
+  if (it == permissions_.end()) return String();
+  return it->value;
 }
 
 }  // namespace blink

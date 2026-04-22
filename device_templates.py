@@ -37,13 +37,36 @@ logger.setLevel(logging.DEBUG)
 # CONSTANT POOLS — актуальные значения на Q1 2026
 # =============================================================================
 
+# Chrome version pool — current as of April 22, 2026.
+# Stable channel distribution (approx):
+#   ~55% on current stable    (147)
+#   ~25% on previous stable   (146)
+#   ~12% on older stable      (145)
+#   ~5%  on older             (144)
+#   ~3%  on extended stable   (143)
+#
+# The `weight` field biases random selection: higher weight → more common.
+# Real-world CTO distribution (from browser telemetry reports) skews
+# toward the current stable, with a long tail of enterprise stragglers.
 CHROME_VERSIONS = [
-    {"major": "131", "full": "131.0.6778.205"},
-    {"major": "132", "full": "132.0.6834.210"},
-    {"major": "133", "full": "133.0.6943.128"},
-    {"major": "134", "full": "134.0.7025.101"},
-    {"major": "135", "full": "135.0.7088.90"},
+    {"major": "147", "full": "147.0.7780.88",  "weight": 55},  # current stable (Apr 7, 2026)
+    {"major": "146", "full": "146.0.7715.130", "weight": 25},  # prev stable (Mar 2026)
+    {"major": "145", "full": "145.0.7665.162", "weight": 12},  # older (Feb 2026)
+    {"major": "144", "full": "144.0.7615.185", "weight": 5},   # Jan 2026
+    {"major": "143", "full": "143.0.7556.210", "weight": 3},   # Extended stable / enterprise laggers
 ]
+
+
+def pick_chrome_version(rnd):
+    """Weighted random pick from CHROME_VERSIONS — newer = more common."""
+    total = sum(v["weight"] for v in CHROME_VERSIONS)
+    pick = rnd.randint(1, total)
+    running = 0
+    for v in CHROME_VERSIONS:
+        running += v["weight"]
+        if pick <= running:
+            return v
+    return CHROME_VERSIONS[0]
 
 PLATFORMS = [
     {
@@ -264,7 +287,7 @@ class DeviceTemplateBuilder:
             self.template = _weighted_choice(self.rnd, DEVICE_TEMPLATES)
 
         self.platform = self.rnd.choice(PLATFORMS)
-        self.chrome_v = self.rnd.choice(CHROME_VERSIONS)
+        self.chrome_v = pick_chrome_version(self.rnd)
         self.timezone = self.rnd.choice(TIMEZONE_PROFILES)
 
         if preferred_language:
@@ -292,11 +315,24 @@ class DeviceTemplateBuilder:
     # ──────────────────────────────────────────────────────────
 
     def _build_hardware(self) -> Dict[str, Any]:
+        # W3C spec: navigator.deviceMemory is clamped to one of
+        # {0.25, 0.5, 1, 2, 4, 8} — max 8 GB for privacy.
+        # Pre-clamp here so the payload matches what the browser
+        # will expose (even without our C++ clamp in the getter).
+        raw_mem = self.template["cpu"]["memory"]
+        if   raw_mem >= 8:   clamped_mem = 8
+        elif raw_mem >= 4:   clamped_mem = 4
+        elif raw_mem >= 2:   clamped_mem = 2
+        elif raw_mem >= 1:   clamped_mem = 1
+        elif raw_mem >= 0.5: clamped_mem = 0.5
+        else:                clamped_mem = 0.25
+
         return {
             "user_agent":           self._build_user_agent(),
             "platform":             self.platform["navigator_platform"],
             "hardware_concurrency": self.template["cpu"]["concurrency"],
-            "device_memory":        self.template["cpu"]["memory"],
+            "device_memory":        clamped_mem,
+            "device_memory_raw":    raw_mem,   # for display / other logic
             "max_touch_points":     0,
             "do_not_track":         None,
             "pdf_viewer_enabled":   True,
@@ -471,6 +507,45 @@ class DeviceTemplateBuilder:
             "mobile":             False,
         }
 
+    def _build_permissions(self) -> Dict[str, str]:
+        """
+        Default permission states for a realistic Chrome profile.
+        Values match what a freshly-installed Chrome returns when JS
+        queries navigator.permissions.query({name: X}).
+
+        W3C PermissionState: "granted" | "denied" | "prompt"
+        """
+        return {
+            # User-facing — always "prompt" until user interacts
+            "geolocation":         "prompt",
+            "notifications":       "prompt",
+            "camera":              "prompt",
+            "microphone":          "prompt",
+            "midi":                "prompt",
+            "clipboard-read":      "prompt",
+
+            # Chrome grants these automatically in normal browsing
+            "clipboard-write":     "granted",
+            "accelerometer":       "granted",
+            "gyroscope":           "granted",
+            "magnetometer":        "granted",
+            "ambient-light-sensor": "granted",
+            "background-sync":     "granted",
+            "payment-handler":     "granted",
+
+            # Storage APIs
+            "persistent-storage":  "prompt",
+            "storage-access":      "prompt",
+
+            # Push / background
+            "push":                "prompt",
+            "background-fetch":    "granted",
+
+            # Screen capture — desktop-only
+            "display-capture":     "prompt",
+            "window-management":   "prompt",
+        }
+
     # ──────────────────────────────────────────────────────────
 
     def generate_payload_dict(self) -> Dict[str, Any]:
@@ -492,6 +567,7 @@ class DeviceTemplateBuilder:
             "fonts":         self._build_fonts(),
             "ua_metadata":   self._build_ua_metadata(),
             "plugins":       STANDARD_CHROME_PLUGINS,
+            "permissions":   self._build_permissions(),
         }
 
     def get_cli_flag(self) -> str:

@@ -296,6 +296,21 @@ class GhostShellBrowser:
         options.add_argument("--disable-renderer-backgrounding")
         options.add_argument("--disable-background-timer-throttling")
 
+        # ── WebRTC IP leak hardening ────────────────────────────────
+        # Without these, RTCPeerConnection ICE candidates can expose
+        # the user's real local network (192.168.x.x / 10.x.x.x / fe80::)
+        # AND the direct WAN IP even when all HTTP/HTTPS goes through
+        # the proxy. Google can compare WebRTC-leaked IP vs exit IP and
+        # detect geo mismatch → captcha.
+        # Policy 'disable_non_proxied_udp' forces WebRTC to use TURN/TCP
+        # through the proxy; no direct host/srflx candidates leak.
+        options.add_argument(
+            "--force-webrtc-ip-handling-policy=disable_non_proxied_udp"
+        )
+        # mDNS ICE candidates (.local) are a weaker leak vector but still
+        # expose the device's presence on its LAN — disable.
+        options.add_argument("--disable-features=WebRtcHideLocalIpsWithMdns")
+
         # Defensive: force the window to be visible on the primary desktop.
         options.add_argument("--window-position=100,100")
         options.add_argument("--start-maximized")
@@ -1074,8 +1089,27 @@ class GhostShellBrowser:
         Проверяет that C++ патчи реально onменorсь.
         Сравнивает значения в JS с ожиyesемыми из payload.
         """
-        self.driver.get("about:blank")
-        time.sleep(1)
+        # CRITICAL: UA-CH (navigator.userAgentData), navigator.deviceMemory,
+        # navigator.getBattery, navigator.mediaDevices.enumerateDevices
+        # are all gated by "secure context" — they are NOT exposed on
+        # about:blank or http:// pages. Previously we self-checked on
+        # about:blank and every secure-context API returned null/undefined,
+        # giving us a false "patch broken" signal.
+        #
+        # Navigate to a lightweight Google endpoint (204 No Content) which:
+        #   - is a secure (https://) context
+        #   - returns 0 bytes so nothing to render
+        #   - goes through our proxy so doesn't leak real IP
+        try:
+            self.driver.get("https://www.google.com/generate_204")
+            time.sleep(0.8)
+        except Exception as e:
+            logging.warning(
+                f"[GhostShellBrowser] couldn't open secure context for selfcheck, "
+                f"falling back to about:blank ({e})"
+            )
+            self.driver.get("about:blank")
+            time.sleep(0.5)
 
         # Ожиyesемые значения из afterднего сгенерированного payload
         expected = {}
@@ -1089,6 +1123,9 @@ class GhostShellBrowser:
         exp_langs  = expected.get("languages", {})
         exp_screen = expected.get("screen", {})
         exp_tz     = expected.get("timezone", {})
+        exp_battery = expected.get("battery")   # can be None (desktop)
+        exp_perms  = expected.get("permissions", {})
+        exp_ua_md  = expected.get("ua_metadata", {})
 
         # Базовые checks (инвариантные)
         tests = {
@@ -1139,12 +1176,230 @@ class GhostShellBrowser:
                 "Intl.DateTimeFormat().resolvedOptions().timeZone)"
             )
 
+        # ── UA Client Hints (Patch 3) ─────────────────────────────
+        # navigator.userAgentData.platform must match payload.ua_metadata.platform
+        if exp_ua_md.get("platform"):
+            tests["ua_ch_platform_matches"] = (
+                f"navigator.userAgentData && "
+                f"navigator.userAgentData.platform === "
+                f"{json.dumps(exp_ua_md['platform'])}"
+            )
+        # Brand list must have at least 3 entries (Not_A Brand + Chromium + Chrome)
+        tests["ua_ch_brands_present"] = (
+            "navigator.userAgentData && "
+            "Array.isArray(navigator.userAgentData.brands) && "
+            "navigator.userAgentData.brands.length >= 3"
+        )
+        # Mobile flag must match (usually false on our desktop/laptop templates)
+        if "mobile" in exp_ua_md:
+            tests["ua_ch_mobile_matches"] = (
+                "navigator.userAgentData && "
+                f"navigator.userAgentData.mobile === "
+                f"{'true' if exp_ua_md['mobile'] else 'false'}"
+            )
+
+        # ── Async tests (Promise-returning APIs) ──────────────────
+        # These run via execute_async_script so we can await them.
+        # Each entry: (test_name, JS-code-returning-Promise<boolean>)
+        async_tests = {}
+
+        # Battery API (Patch 2)
+        # When exp_battery is a dict — laptop profile with battery values.
+        # When None — desktop, we expect "fully charged, plugged in" defaults.
+        if exp_battery is not None:
+            exp_charging = "true" if exp_battery.get("charging", True) else "false"
+            async_tests["battery_charging_matches"] = (
+                f"navigator.getBattery().then(b => b.charging === {exp_charging})"
+            )
+            # Level should be within ±0.02 of payload (battery status has
+            # tiny OS-level quantization)
+            if "level" in exp_battery and exp_battery["level"] is not None:
+                lvl = float(exp_battery["level"])
+                async_tests["battery_level_matches"] = (
+                    f"navigator.getBattery().then(b => "
+                    f"Math.abs(b.level - {lvl}) < 0.02)"
+                )
+        else:
+            # Desktop — expect charging:true, level:1 (plugged-in state)
+            async_tests["battery_desktop_default"] = (
+                "navigator.getBattery().then(b => "
+                "b.charging === true && b.level === 1)"
+            )
+
+        # Permissions API (Patch 2)
+        # Sample a handful of well-known permissions and verify they match
+        # payload. The payload.permissions map has 15+ entries — we check
+        # the ones most commonly probed by detection scripts.
+        for perm_name in ("geolocation", "notifications", "clipboard-write",
+                          "camera", "midi"):
+            if perm_name not in exp_perms:
+                continue
+            expected_state = exp_perms[perm_name]
+            async_tests[f"perm_{perm_name.replace('-','_')}_matches"] = (
+                f"navigator.permissions.query({{name: {json.dumps(perm_name)}}})"
+                f".then(r => r.state === {json.dumps(expected_state)})"
+                f".catch(() => false)"
+            )
+
+        # UA-CH getHighEntropyValues — verify platformVersion and
+        # uaFullVersion are populated from our payload (not empty).
+        if exp_ua_md.get("platform_version"):
+            async_tests["ua_ch_platform_version_matches"] = (
+                f"navigator.userAgentData.getHighEntropyValues(['platformVersion'])"
+                f".then(h => h.platformVersion === "
+                f"{json.dumps(exp_ua_md['platform_version'])})"
+            )
+        if exp_ua_md.get("full_version"):
+            async_tests["ua_ch_full_version_matches"] = (
+                f"navigator.userAgentData.getHighEntropyValues(['uaFullVersion'])"
+                f".then(h => h.uaFullVersion === "
+                f"{json.dumps(exp_ua_md['full_version'])})"
+            )
+
+        # ── MediaDevices enumerateDevices (Patch 1.1) ─────────────
+        # Headless/bot browsers often return [] here, or only a single
+        # "default" entry. Real Chrome on a desktop returns 3-6 devices
+        # with distinct deviceIds (one per audioinput, videoinput,
+        # audiooutput). Our C++ patch returns the payload's media list.
+        exp_media = expected.get("media") or {}
+        exp_ai = exp_media.get("audio_inputs")  or []
+        exp_vi = exp_media.get("video_inputs")  or []
+        exp_ao = exp_media.get("audio_outputs") or []
+        exp_total = len(exp_ai) + len(exp_vi) + len(exp_ao)
+        if exp_total > 0:
+            # Expected counts per kind
+            async_tests["media_devices_count_matches"] = (
+                "navigator.mediaDevices.enumerateDevices().then(d => {"
+                f"  const ai = d.filter(x => x.kind === 'audioinput').length;"
+                f"  const vi = d.filter(x => x.kind === 'videoinput').length;"
+                f"  const ao = d.filter(x => x.kind === 'audiooutput').length;"
+                f"  return ai === {len(exp_ai)} && vi === {len(exp_vi)}"
+                f"      && ao === {len(exp_ao)};"
+                "})"
+            )
+            # Device IDs should NOT all be empty strings (headless bots
+            # often return empty strings when permissions are denied).
+            async_tests["media_devices_have_ids"] = (
+                "navigator.mediaDevices.enumerateDevices().then(d => "
+                "d.length > 0 && d.every(x => x.deviceId && x.deviceId.length > 0))"
+            )
+
+        # ── SpeechSynthesis getVoices (Patch 1.2) ─────────────────
+        # Headless returns []. Real Chrome on Windows returns 5-10
+        # voices (Microsoft David, Zira, etc.). Our payload may carry
+        # a voices list — if so, compare count. Otherwise just assert
+        # non-empty.
+        exp_voices = (expected.get("speech") or {}).get("voices") or []
+        if exp_voices:
+            # Voices load async in real Chrome — poll briefly.
+            async_tests["speech_voices_count_matches"] = (
+                "(async () => {"
+                "  for (let i = 0; i < 15; i++) {"
+                "    const v = speechSynthesis.getVoices();"
+                f"    if (v.length === {len(exp_voices)}) return true;"
+                "    await new Promise(r => setTimeout(r, 80));"
+                "  }"
+                "  return false;"
+                "})()"
+            )
+        else:
+            # No payload — just confirm non-empty (real browser behavior)
+            async_tests["speech_voices_non_empty"] = (
+                "(async () => {"
+                "  for (let i = 0; i < 15; i++) {"
+                "    if (speechSynthesis.getVoices().length > 0) return true;"
+                "    await new Promise(r => setTimeout(r, 80));"
+                "  }"
+                "  return false;"
+                "})()"
+            )
+
+        # ── Performance.now() jitter (Patch 1.3) ──────────────────
+        # Without jitter, performance.now() is quantized (e.g. 1 ms or
+        # 0.1 ms steps) and deltas between samples have near-zero
+        # variance — a bot tell. Our patch adds sub-ms randomness, so
+        # fractional parts of samples should cover many distinct values,
+        # not always end in .000.
+        tests["performance_now_has_jitter"] = (
+            "(() => {"
+            "  const s = new Array(200).fill(0).map(() => performance.now());"
+            "  const fracMicros = s.map(x => "
+            "      Math.round((x - Math.floor(x)) * 1000) % 1000);"
+            "  return new Set(fracMicros).size >= 10;"
+            "})()"
+        )
+
         results = {}
+        # Run sync tests first
         for name, code in tests.items():
             try:
                 results[name] = bool(self.driver.execute_script(f"return Boolean({code});"))
             except Exception as e:
                 results[name] = f"Error: {str(e)[:40]}"
+
+        # Run async tests — each one goes through execute_async_script
+        for name, code in async_tests.items():
+            try:
+                # Selenium's execute_async_script: last arg is a callback
+                # we resolve with the test result. 8s timeout per probe.
+                self.driver.set_script_timeout(8)
+                js = (
+                    "const cb = arguments[arguments.length - 1];"
+                    f"({code}).then(v => cb(Boolean(v)))"
+                    ".catch(e => cb('Error: ' + (e.message || e)));"
+                )
+                r = self.driver.execute_async_script(js)
+                results[name] = r if isinstance(r, bool) else str(r)[:40]
+            except Exception as e:
+                results[name] = f"Error: {str(e)[:40]}"
+
+        # ── Mouse event timestamp jitter (Patch 4.3) ──────────────
+        # Our C++ patch adds sub-ms randomness to PointerEvent.timeStamp.
+        # Without it, all mousemove events arrive at integer-ms marks
+        # (e.g. 123.000, 145.000) which is a bot tell.
+        #
+        # We attach a listener, fire ~10 real mouse moves via Selenium's
+        # CDP-backed Input API, then read collected timestamps.
+        try:
+            from selenium.webdriver.common.action_chains import ActionChains
+            # Install listener
+            self.driver.execute_script("""
+                window.__gs_mouse_stamps = [];
+                window.__gs_handler = (e) => window.__gs_mouse_stamps.push(e.timeStamp);
+                document.addEventListener('mousemove', window.__gs_handler,
+                                          {capture: true, passive: true});
+            """)
+            # Fire ~10 micro-moves
+            ac = ActionChains(self.driver, duration=0)
+            for i in range(10):
+                ac.move_by_offset(random.randint(2, 6),
+                                  random.randint(1, 4))
+                ac.pause(random.uniform(0.02, 0.05))
+            ac.perform()
+            time.sleep(0.4)
+
+            stamps = self.driver.execute_script(
+                "document.removeEventListener('mousemove', window.__gs_handler, "
+                "{capture: true}); return window.__gs_mouse_stamps;"
+            ) or []
+
+            if len(stamps) >= 4:
+                # Count unique µs-level fractional parts — with jitter
+                # applied, we expect a wide spread; without jitter, most
+                # stamps land on integer-ms marks (fractional = 0).
+                fracs = [round((s - int(s)) * 1000) % 1000 for s in stamps]
+                non_zero = sum(1 for f in fracs if f != 0)
+                # Pass if at least half of samples have non-zero sub-ms
+                # fractional component.
+                results["mouse_timestamp_jitter"] = (
+                    non_zero >= max(2, len(stamps) // 2)
+                )
+            else:
+                results["mouse_timestamp_jitter"] = (
+                    f"Error: only {len(stamps)} events captured"
+                )
+        except Exception as e:
+            results["mouse_timestamp_jitter"] = f"Error: {str(e)[:40]}"
 
         # Также собираем АКТУАЛЬНЫЕ значения из JS (for yesшборyes)
         actual_values = {}
@@ -1168,14 +1423,100 @@ class GhostShellBrowser:
                     locale: Intl.DateTimeFormat().resolvedOptions().locale,
                     pluginsCount: navigator.plugins.length,
                     maxTouchPoints: navigator.maxTouchPoints,
+                    // UA Client Hints — sync values
+                    uaCH: navigator.userAgentData ? {
+                        brands: navigator.userAgentData.brands,
+                        mobile: navigator.userAgentData.mobile,
+                        platform: navigator.userAgentData.platform,
+                    } : null,
                 };
             """)
         except Exception as e:
             logging.debug(f"[GhostShellBrowser] couldn't snapshot actual values: {e}")
 
+        # Async snapshots — UA-CH high-entropy + Battery + a few permissions
+        try:
+            self.driver.set_script_timeout(8)
+            async_snap = self.driver.execute_async_script("""
+                const cb = arguments[arguments.length - 1];
+                const out = {};
+                const tasks = [];
+                // UA-CH high entropy
+                if (navigator.userAgentData) {
+                    tasks.push(navigator.userAgentData.getHighEntropyValues([
+                        'architecture','bitness','model','platformVersion',
+                        'uaFullVersion','fullVersionList','wow64'
+                    ]).then(he => out.uaCH_he = he).catch(() => {}));
+                }
+                // Battery
+                if (navigator.getBattery) {
+                    tasks.push(navigator.getBattery().then(b => {
+                        out.battery = {
+                            charging: b.charging,
+                            level: b.level,
+                            chargingTime: b.chargingTime,
+                            dischargingTime: b.dischargingTime
+                        };
+                    }).catch(() => {}));
+                }
+                // Permissions (a few notable ones)
+                const probe = ['geolocation','notifications','camera',
+                               'clipboard-read','clipboard-write'];
+                const perms = {};
+                for (const p of probe) {
+                    tasks.push(
+                        navigator.permissions.query({name: p})
+                            .then(r => perms[p] = r.state)
+                            .catch(() => { perms[p] = 'unavailable'; })
+                    );
+                }
+                // Media devices (Patch 1.1)
+                tasks.push(
+                    navigator.mediaDevices.enumerateDevices().then(list => {
+                        out.mediaDevices = list.map(d => ({
+                            kind: d.kind,
+                            label: d.label,
+                            deviceIdPresent: !!d.deviceId && d.deviceId.length > 0,
+                            groupIdPresent: !!d.groupId
+                        }));
+                    }).catch(() => { out.mediaDevices = null; })
+                );
+                // Speech synthesis voices (Patch 1.2) — may need a tick
+                const waitForVoices = async () => {
+                    for (let i = 0; i < 12; i++) {
+                        const v = speechSynthesis.getVoices();
+                        if (v.length) return v;
+                        await new Promise(r => setTimeout(r, 80));
+                    }
+                    return speechSynthesis.getVoices();
+                };
+                tasks.push(waitForVoices().then(v => {
+                    out.speechVoices = v.slice(0, 6).map(x => ({
+                        name: x.name, lang: x.lang, default: x.default
+                    }));
+                    out.speechVoicesCount = v.length;
+                }));
+                // Performance.now jitter sample (Patch 1.3)
+                const pSamples = [];
+                for (let i = 0; i < 40; i++) pSamples.push(performance.now());
+                out.performanceSample = pSamples;
+                out.performanceUniqueFracs = new Set(
+                    pSamples.map(x => Math.round((x - Math.floor(x)) * 1000) % 1000)
+                ).size;
+
+                Promise.all(tasks).then(() => {
+                    out.permissions = perms;
+                    cb(out);
+                });
+            """) or {}
+            if isinstance(async_snap, dict):
+                actual_values.update(async_snap)
+        except Exception as e:
+            logging.debug(f"[GhostShellBrowser] couldn't snapshot async values: {e}")
+
         # Сохраняем результаты в файл for yesшборyes
         passed = sum(1 for v in results.values() if v is True)
-        total  = len(tests)
+        total  = len(results)       # counts sync + async + mouse test
         selfcheck_data = {
             "timestamp":     datetime.now().isoformat(timespec="seconds"),
             "profile_name":  self.profile_name,
@@ -1184,10 +1525,13 @@ class GhostShellBrowser:
             "tests":         {k: (v if v is True else str(v)) for k, v in results.items()},
             "actual_values": actual_values,
             "expected_values": {
-                "hardware": exp_hw,
-                "screen":   exp_screen,
-                "languages": exp_langs,
-                "timezone": exp_tz,
+                "hardware":    exp_hw,
+                "screen":      exp_screen,
+                "languages":   exp_langs,
+                "timezone":    exp_tz,
+                "battery":     exp_battery,
+                "permissions": exp_perms,
+                "ua_metadata": exp_ua_md,
             },
         }
         try:

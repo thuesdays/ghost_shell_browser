@@ -6,6 +6,7 @@
 
 #include "base/no_destructor.h"
 #include "third_party/blink/renderer/platform/platform_export.h"
+#include "third_party/blink/renderer/platform/wtf/hash_map.h"
 #include "third_party/blink/renderer/platform/wtf/text/wtf_string.h"
 #include "third_party/blink/renderer/platform/wtf/vector.h"
 
@@ -22,7 +23,21 @@ class PLATFORM_EXPORT GhostShellConfig {
 
   // ─── Hardware ───────────────────────────────────────────
   int GetHardwareConcurrency() const { return hardware_concurrency_; }
-  double GetDeviceMemory() const { return device_memory_; }
+  // W3C spec: navigator.deviceMemory must be one of
+  // {0.25, 0.5, 1, 2, 4, 8} — anything above is clamped to 8 for
+  // privacy. The underlying device_memory_ can be set to 16 etc. for
+  // consistency with other fingerprint fields, but this getter —
+  // the one feeding navigator.deviceMemory — applies the spec clamp.
+  double GetDeviceMemory() const {
+    if (device_memory_ >= 8.0) return 8.0;
+    if (device_memory_ >= 4.0) return 4.0;
+    if (device_memory_ >= 2.0) return 2.0;
+    if (device_memory_ >= 1.0) return 1.0;
+    if (device_memory_ >= 0.5) return 0.5;
+    return 0.25;
+  }
+  // Raw value (for internal use, e.g. performance.memory.jsHeapSizeLimit)
+  double GetDeviceMemoryRaw() const { return device_memory_; }
   String GetPlatform() const { return platform_; }
   String GetUserAgent() const { return user_agent_; }
   int GetMaxTouchPoints() const { return max_touch_points_; }
@@ -112,6 +127,12 @@ class PLATFORM_EXPORT GhostShellConfig {
 
   // ─── Plugins (JSON-массив для navigator.plugins) ────────
   String GetPluginsJSON() const { return plugins_json_; }
+
+  // ─── Permissions API (for navigator.permissions.query) ───
+  // Returns "granted" / "denied" / "prompt" / empty-string for
+  // unspecified permission names. Chromium code calls this with the
+  // feature name ("geolocation", "notifications", "camera", etc.).
+  String GetPermissionState(const String& name) const;
 
  private:
   friend class base::NoDestructor<GhostShellConfig>;
@@ -212,6 +233,11 @@ class PLATFORM_EXPORT GhostShellConfig {
 
   // Plugins (для navigator.plugins)
   String plugins_json_ = "[]";
+
+  // Permissions (name → "granted"/"denied"/"prompt").
+  // Example default: {"geolocation": "prompt", "notifications": "prompt",
+  //                   "clipboard-read": "prompt", "camera": "prompt"}
+  HashMap<String, String> permissions_;
 };
 
 }  // namespace blink
