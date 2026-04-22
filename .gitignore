@@ -10,3 +10,4 @@ chrome-test-profile/
 ghost_shell.db
 ghost_shell.db-shm
 ghost_shell.db-wal
+.scheduler.pid
