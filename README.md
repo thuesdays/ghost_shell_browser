@@ -52,12 +52,6 @@ set covers:
 - `performance.now()` sub-millisecond jitter
 - MouseEvent `timeStamp` sub-millisecond jitter
 - WebRTC IP leak hardening (command-line flag)
-
-See [`CHROMIUM_PATCHES.md`](./CHROMIUM_PATCHES.md),
-[`CHROMIUM_PATCHES_2.md`](./CHROMIUM_PATCHES_2.md) and
-[`CHROMIUM_PATCHES_3.md`](./CHROMIUM_PATCHES_3.md) for the exact
-source-tree diffs.
-
 ---
 
 ## Stack
@@ -79,7 +73,7 @@ source-tree diffs.
 
 ```powershell
 cd F:\projects\
-git clone https://github.com/YOUR-HANDLE/ghost_shell_browser.git
+git clone https://github.com/thuesdays/ghost_shell_browser.git
 cd ghost_shell_browser
 ```
 
@@ -93,8 +87,6 @@ pip install -r requirements.txt
 ```
 
 ### 3. Build the patched Chromium (one-time, ~2-4 hours)
-
-Full walkthrough: [`CHROMIUM_PATCHES.md`](./CHROMIUM_PATCHES.md).
 
 Short version:
 
@@ -284,11 +276,7 @@ and our patches.
 
 ## Documentation
 
-- [`CHROMIUM_PATCHES.md`](./CHROMIUM_PATCHES.md) — initial patches (webdriver, plugins, canvas, audio, UA, screen, timezone, GPU)
-- [`CHROMIUM_PATCHES_2.md`](./CHROMIUM_PATCHES_2.md) — Battery + Permissions + device_memory W3C clamp
-- [`CHROMIUM_PATCHES_3.md`](./CHROMIUM_PATCHES_3.md) — UA Client Hints (JS API + HTTP headers)
 - [`DATABASE.md`](./DATABASE.md) — SQLite schema reference
-- [`DASHBOARD.md`](./DASHBOARD.md) — dashboard internals
 - [`MACOS_BUILD.md`](./MACOS_BUILD.md) — Chromium build on macOS
 - [`MACOS_SETUP.md`](./MACOS_SETUP.md) — dashboard-only mode and SSH-tunnel usage
 
