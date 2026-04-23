@@ -1,6 +1,15 @@
 <section>
   <!-- Hero panel with headline stats + trends -->
   <div class="ov-hero">
+    <!-- Reset button sits top-right, floating over the hero gradient.
+         Kept low-contrast (ghost style) so it doesn't compete with
+         the stats, but turns visibly red on hover to signal danger. -->
+    <button class="ov-hero-reset-btn" id="ov-reset-stats-btn"
+            title="Reset all stats (runs, events, competitors, traffic)">
+      <span class="ov-hero-reset-icon">↻</span>
+      <span class="ov-hero-reset-label">Reset stats</span>
+    </button>
+
     <div class="ov-hero-greeting">Ghost Shell</div>
     <div class="ov-hero-title" id="ov-hero-title">Dashboard</div>
     <div class="ov-hero-sub" id="ov-hero-sub">Loading overview…</div>

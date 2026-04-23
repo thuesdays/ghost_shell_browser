@@ -181,6 +181,115 @@ class GhostShellBrowser:
     # ──────────────────────────────────────────────────────────
 
     def start(self) -> webdriver.Chrome:
+        """Launch Chrome with retry-once on the "early death" quirk.
+
+        On Windows, Chrome 147 occasionally dies within 50-100ms of the
+        session being established — chromedriver logs "Chrome session
+        established ✓", then the next CDP call (typically Network.enable
+        or setBlockedURLs) throws InvalidSessionIdException. The Chrome
+        process is just gone, no crash dump, no useful chromedriver log.
+        Observed with plain `webdriver.Chrome()` too — not our bug, but
+        we have to deal with it.
+
+        Root cause is usually one of: Windows Defender scanning the new
+        Chrome.exe, GPU sandbox init race with an ANGLE dll, or the
+        proxy forwarder's listen socket still being in TIME_WAIT from
+        a previous run. All fix themselves on retry.
+
+        Retry criteria: must happen within first 5 seconds AND be an
+        InvalidSessionId / NoSuchWindow / "chrome not reachable" style
+        exception. Later failures or different errors bubble up — those
+        are real problems that retry can't fix.
+
+        Only retries ONCE. If second attempt also dies early, give up
+        and raise — scheduler will mark the run failed and try again
+        on next cadence.
+        """
+        from selenium.common.exceptions import (
+            InvalidSessionIdException, WebDriverException,
+            NoSuchWindowException,
+        )
+
+        for attempt in (1, 2):
+            t0 = time.time()
+            try:
+                return self._start_once()
+            except (InvalidSessionIdException, NoSuchWindowException,
+                    WebDriverException) as e:
+                elapsed = time.time() - t0
+                msg = str(e).lower()
+                is_early_death = elapsed < 5.0 and (
+                    "invalid session"        in msg or
+                    "no such window"         in msg or
+                    "chrome not reachable"   in msg or
+                    "disconnected"           in msg or
+                    "target window already closed" in msg
+                )
+                if attempt == 2 or not is_early_death:
+                    raise
+                logging.warning(
+                    f"[GhostShellBrowser] Chrome died {elapsed:.1f}s after "
+                    f"launch ({type(e).__name__}: {str(e)[:80]}) — "
+                    f"retrying once..."
+                )
+                self._cleanup_after_failed_start()
+                # Brief pause — lets OS release file locks on the user-data-dir,
+                # TIME_WAIT drain on our proxy_forwarder port, and Defender
+                # finish whatever it was doing to the fresh Chrome.exe.
+                time.sleep(2.5)
+
+    def _cleanup_after_failed_start(self):
+        """Tear down partially-initialised Chrome/driver/proxy state so
+        start() can retry cleanly. Safe on incomplete state — every step
+        is independently guarded."""
+        # Kill driver + Chrome processes
+        if self.driver is not None:
+            try:
+                self.driver.quit()
+            except Exception:
+                pass
+            # Force-kill any Chrome children that quit() didn't reach.
+            # quit() sometimes returns cleanly after the Chrome process
+            # is already dead, leaving orphan chromedriver.exe processes.
+            try:
+                service = getattr(self.driver, "service", None)
+                proc = getattr(service, "process", None) if service else None
+                pid = getattr(proc, "pid", None) if proc else None
+                if pid:
+                    from process_reaper import kill_process_tree
+                    kill_process_tree(pid)
+            except Exception as e:
+                logging.debug(f"[start-retry] child kill: {e}")
+            self.driver = None
+
+        # Stop proxy forwarder — _start_once binds a fresh one on
+        # entry. Leaving the old one up means the new Chrome tries to
+        # connect to a half-dead local port.
+        if self._proxy_forwarder is not None:
+            try:
+                self._proxy_forwarder.stop()
+            except Exception:
+                pass
+            self._proxy_forwarder = None
+
+        # Release the GS lock file — _start_once reclaims it on retry.
+        try:
+            if self._gs_lock_path and os.path.exists(self._gs_lock_path):
+                os.remove(self._gs_lock_path)
+                self._gs_lock_path = None
+        except Exception:
+            pass
+
+        # Clear traffic collector reference — the old one holds a
+        # reference to the dead driver.
+        if getattr(self, "_traffic_collector", None):
+            try:
+                self._traffic_collector.stop()
+            except Exception:
+                pass
+            self._traffic_collector = None
+
+    def _start_once(self) -> webdriver.Chrome:
         """Launches the C++ native stealth browser."""
         # 1. Generate Deterministic C++ Payload
         builder = DeviceTemplateBuilder(profile_name=self.profile_name,

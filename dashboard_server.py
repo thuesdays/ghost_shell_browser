@@ -450,6 +450,96 @@ def api_stats():
 # API: TRAFFIC STATS (aggregated by profile × domain × hour)
 # ──────────────────────────────────────────────────────────────
 
+@app.route("/api/stats/reset", methods=["POST"])
+def api_stats_reset():
+    """Nuke all run history, events, competitors, traffic, and IP-health
+    counters — the "wipe stats and start fresh" button on Overview.
+
+    What this KEEPS (deliberately):
+      - Config values (proxy settings, behavior toggles, queries)
+      - `profiles` table rows (tags, notes, per-profile proxy overrides)
+      - Fingerprints (expensive to regen; stale fingerprints don't affect stats)
+      - On-disk profile folders (cookies, local storage, history)
+        — per-profile "Clear history" buttons handle those separately.
+      - Action events scripts, schedules, etc.
+
+    What this CLEARS:
+      - runs                — run history + per-run counters
+      - events              — search_ok / search_empty / captcha telemetry
+      - competitors         — collected ad URLs + per-query matches
+      - traffic_samples     — bandwidth/domain aggregates
+      - ip_history          — per-IP health (captcha count, burn state)
+      - selfchecks          — cached fingerprint validation results
+      - action_events       — post-click action telemetry
+
+    Refuses while any run is active — would corrupt the active run's
+    DB rows mid-flight.
+    """
+    # Guard: active runs. Deleting `runs` rows under a live process
+    # means the process's run_finish() at the end writes an UPDATE that
+    # affects 0 rows (no-op), and the active_runs() list goes stale.
+    active = RUNNER_POOL.active_runs()
+    if active:
+        names = ", ".join(r["profile_name"] for r in active)
+        return jsonify({
+            "error": f"Can't reset stats while runs are active: {names}. "
+                     f"Stop them first, then reset."
+        }), 409
+
+    db = get_db()
+    conn = db._get_conn()
+
+    # Tables to truncate. Order doesn't matter — no foreign keys between
+    # these in the current schema — but we list them grouped by purpose
+    # for easier audit.
+    tables_cleared = []
+    targets = [
+        # Run / query telemetry
+        "runs", "events", "selfchecks", "action_events",
+        # What we collected
+        "competitors",
+        # Network/IP hygiene
+        "traffic_samples", "ip_history",
+    ]
+    errors = []
+    for t in targets:
+        try:
+            # Check table exists — an older DB might not have all of them.
+            row = conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name=?",
+                (t,)
+            ).fetchone()
+            if not row:
+                continue
+            cnt = conn.execute(f"SELECT COUNT(*) AS n FROM {t}").fetchone()["n"]
+            conn.execute(f"DELETE FROM {t}")
+            tables_cleared.append({"table": t, "rows_deleted": cnt})
+        except Exception as e:
+            errors.append({"table": t, "error": str(e)})
+            logging.warning(f"[reset stats] {t}: {e}")
+
+    # VACUUM reclaims the freed pages back to the OS — on a heavily-used
+    # db with millions of events this can save hundreds of MB. Safe
+    # because we've verified no active writers above.
+    try:
+        conn.execute("VACUUM")
+    except Exception as e:
+        logging.debug(f"[reset stats] VACUUM: {e}")
+
+    total_rows = sum(t["rows_deleted"] for t in tables_cleared)
+    logging.info(
+        f"[reset stats] cleared {total_rows} rows across "
+        f"{len(tables_cleared)} tables"
+    )
+
+    return jsonify({
+        "ok":           True,
+        "tables":       tables_cleared,
+        "total_rows":   total_rows,
+        "errors":       errors,
+    })
+
+
 @app.route("/api/traffic/summary", methods=["GET"])
 def api_traffic_summary():
     """Global traffic totals + hourly time series.
@@ -1448,15 +1538,25 @@ def api_profile_delete(name: str):
         # Reassign active profile if we nuked the default. Without this,
         # browser.profile_name keeps pointing at a dead profile and every
         # page reading it breaks.
+        #
+        # CRITICAL: profiles_list() treats `browser.profile_name` as an
+        # "alive" source (last-resort fallback for fresh installs). Since
+        # we haven't reset that config value YET, profiles_list() still
+        # returns the deleted name. If we pick remaining[0] without
+        # filtering, we reassign the config to the deleted profile and
+        # the UI sees no change — the exact bug user reported when
+        # deleting the sole default profile.
         reassigned_to = None
         active = db.config_get("browser.profile_name")
         if active == name:
-            remaining = [p["name"] for p in db.profiles_list()]
+            remaining = [p["name"] for p in db.profiles_list()
+                         if p["name"] != name]
             reassigned_to = remaining[0] if remaining else "profile_01"
             db.config_set("browser.profile_name", reassigned_to)
             logging.info(
                 f"[delete profile] active profile was '{name}', "
-                f"reassigned browser.profile_name -> '{reassigned_to}'"
+                f"reassigned browser.profile_name -> '{reassigned_to}' "
+                f"({'remaining profiles: ' + str(remaining) if remaining else 'no profiles left — fresh profile_01 will be created on next run'})"
             )
 
         return jsonify({

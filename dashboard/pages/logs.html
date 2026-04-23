@@ -24,6 +24,13 @@
              placeholder="grep text…" style="min-width: 160px; max-width: 220px;">
       <button class="btn btn-secondary" id="switch-to-live-btn"
               style="display:none;">● Switch to live</button>
+      <!-- Copy / Download — operate on the CURRENTLY-VISIBLE log set.
+           If filters are active, only filtered lines get copied/saved;
+           that matches intuition ("what you see is what you get"). -->
+      <button class="btn btn-secondary" id="copy-logs-btn"
+              title="Copy visible logs to clipboard">📋 Copy</button>
+      <button class="btn btn-secondary" id="download-logs-btn"
+              title="Save visible logs as .txt file">⬇ Download</button>
       <button class="btn btn-secondary" id="clear-logs-btn">Clear</button>
     </div>
   </div>

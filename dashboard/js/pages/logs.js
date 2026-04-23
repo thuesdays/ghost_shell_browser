@@ -44,6 +44,14 @@ const Logs = {
       this.render();
       toast("✓ Cleared");
     });
+
+    // Copy visible logs to clipboard. Honors current filters — if you
+    // filtered to one profile, you get only that profile's lines.
+    $("#copy-logs-btn")?.addEventListener("click", () => this.copyLogs());
+    // Download visible logs as .txt. Filename includes active filter
+    // + timestamp so multiple saves don't overwrite each other.
+    $("#download-logs-btn")?.addEventListener("click", () => this.downloadLogs());
+
     $("#back-to-runs-btn").addEventListener("click", () => navigate("runs"));
     $("#switch-to-live-btn").addEventListener("click", () => {
       window.LOGS_MODE = { type: "live" };
@@ -141,6 +149,92 @@ const Logs = {
       if (!hay.includes(this._filterText)) return false;
     }
     return true;
+  },
+
+  /** Serialize the currently-visible (filtered) log lines to plain
+   *  text. Format matches what appears on screen but without HTML:
+   *    [timestamp] [LEVEL] [profile_name] message
+   *  Profile tag is included always (not just when multi-profile
+   *  chip is shown) so downloaded logs are self-documenting. */
+  _visibleAsText() {
+    const visible = LOG_BUFFER.filter(l => this._passesFilter(l));
+    return visible.map(l => {
+      const ts    = l.ts || "";
+      const lvl   = (l.level || "info").toUpperCase();
+      const pn    = l.profile_name ? `[${l.profile_name}] ` : "";
+      const msg   = l.message || "";
+      return `${ts} [${lvl}] ${pn}${msg}`;
+    }).join("\n");
+  },
+
+  /** Builds a descriptive filename for the .txt download. Embeds the
+   *  active filters + ISO timestamp so saving 5 times in a row produces
+   *  5 differently-named files (no accidental overwrites). */
+  _downloadFilename() {
+    const parts = ["ghost-shell-logs"];
+    if (this._filterProfile) parts.push(this._filterProfile);
+    if (this._filterLevel)   parts.push(this._filterLevel);
+    // ISO timestamp, colons → dashes so Windows filesystems accept it
+    const ts = new Date().toISOString().replace(/[:T]/g, "-").slice(0, 19);
+    parts.push(ts);
+    return parts.join("_") + ".txt";
+  },
+
+  async copyLogs() {
+    const text = this._visibleAsText();
+    if (!text) {
+      toast("Nothing to copy (buffer empty or filtered out)", true);
+      return;
+    }
+    // Prefer the async Clipboard API — works on localhost + HTTPS.
+    // Fallback via hidden textarea + execCommand covers http origins
+    // and older browsers; it's ugly but bulletproof.
+    try {
+      if (navigator.clipboard?.writeText) {
+        await navigator.clipboard.writeText(text);
+      } else {
+        const ta = document.createElement("textarea");
+        ta.value = text;
+        ta.style.position = "fixed";
+        ta.style.opacity = "0";
+        document.body.appendChild(ta);
+        ta.select();
+        document.execCommand("copy");
+        document.body.removeChild(ta);
+      }
+      const lines = text.split("\n").length;
+      toast(`✓ Copied ${lines.toLocaleString()} line${lines === 1 ? "" : "s"} to clipboard`);
+    } catch (e) {
+      toast("Copy failed: " + (e.message || e), true);
+    }
+  },
+
+  downloadLogs() {
+    const text = this._visibleAsText();
+    if (!text) {
+      toast("Nothing to download (buffer empty or filtered out)", true);
+      return;
+    }
+    try {
+      const blob = new Blob([text], { type: "text/plain;charset=utf-8" });
+      const url  = URL.createObjectURL(blob);
+      // Temp <a> + click is the standard "programmatic download" trick.
+      // Appending to document before click is required in some browsers
+      // (Firefox historically wouldn't fire click() on detached nodes).
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = this._downloadFilename();
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      // Revoke the blob URL after a tick so the browser has time to
+      // start the download. Immediate revoke races on Safari.
+      setTimeout(() => URL.revokeObjectURL(url), 1000);
+      const lines = text.split("\n").length;
+      toast(`✓ Saved ${lines.toLocaleString()} line${lines === 1 ? "" : "s"} to ${a.download}`);
+    } catch (e) {
+      toast("Download failed: " + (e.message || e), true);
+    }
   },
 
   render() {

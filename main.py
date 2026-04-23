@@ -769,6 +769,7 @@ def search_query(browser, query: str, sqm: SessionQualityMonitor,
                     f"Google still flags us. Burning this IP."
                 )
             sqm.record("captcha", query=query, url=driver.current_url)
+            RUN_COUNTERS["total_captchas"] += 1
             if current_ip:
                 browser.report_rotating(current_ip, success=False, captcha=True)
             return []
@@ -796,6 +797,7 @@ def search_query(browser, query: str, sqm: SessionQualityMonitor,
             if is_captcha_page(driver):
                 logging.error("  ✗ CAPTCHA appeared during poll")
                 sqm.record("captcha", query=query, url=driver.current_url)
+                RUN_COUNTERS["total_captchas"] += 1
                 if current_ip:
                     browser.report_rotating(current_ip, success=False, captcha=True)
                 return []
@@ -819,17 +821,18 @@ def search_query(browser, query: str, sqm: SessionQualityMonitor,
             # ad load on the next query. Configurable via Settings; all
             # parts are independently toggleable, exceptions swallowed.
             #
-            # Pass MY_DOMAINS + TARGET_DOMAINS as exclude list so the
-            # organic-click step never visits our own site. That would
-            # be (a) a wasted self-click and (b) a detectable
-            # "same fingerprint keeps searching then clicks its own
-            # brand" pattern.
+            # Pass MY_DOMAINS (only) as exclude list so the organic-click
+            # step never visits our own site. We do NOT include
+            # TARGET_DOMAINS here — those are the domains the operator
+            # is researching (competitors, tracked sites). Excluding
+            # them would DEFEAT the research purpose: organic-click
+            # on a target is exactly the high-signal engagement we
+            # want to occasionally generate for them.
             try:
                 from serp_behavior import post_ads_behavior
-                own_domains = list(set((MY_DOMAINS or []) + (TARGET_DOMAINS or [])))
                 post_ads_behavior(
                     driver, DB,
-                    exclude_domains=own_domains,
+                    exclude_domains=list(MY_DOMAINS or []),
                     watchdog=watchdog,
                 )
             except Exception as e:
@@ -946,6 +949,33 @@ def print_summary(all_ads: list[dict]):
 # ──────────────────────────────────────────────────────────────
 # MAIN
 # ──────────────────────────────────────────────────────────────
+
+# Per-run counters — incremented during run_monitor(), read by the
+# `finally:` block at the end of __main__ for the run-summary banner.
+#
+# Why we can't use DB.events_summary() like the old code did:
+#   1. events_summary(hours=24) aggregates the last 24h, not this run.
+#      On a profile that did 5 runs today, the summary would show the
+#      sum of ALL those runs every time — Run #5 would claim Run #1-4's
+#      captchas.
+#   2. sqm.record() silently swallows errors (encoding issues, locked
+#      sqlite, etc.). When that happens we get the right Chrome
+#      behaviour but no event row → summary shows 0 even though the
+#      run actually found ads.
+#   3. "search_ok" counts SUCCESSFUL QUERIES, not ads — old code was
+#      mapping `total_ads = summary["search_ok"]` which was just wrong.
+#
+# These counters live in process memory so they're reset per run (each
+# run is its own python process). Incremented next to the point where
+# the corresponding sqm.record() call sits, so if sqm ever starts
+# working for real the numbers stay aligned.
+RUN_COUNTERS = {
+    "total_ads":      0,   # Actual ad count across all queries
+    "total_queries":  0,   # Successful queries (ads > 0)
+    "total_empty":    0,   # Queries that returned no ads
+    "total_captchas": 0,   # Captcha hits (any recovery action)
+}
+
 
 def run_monitor():
     all_ads: list[dict] = []
@@ -1358,14 +1388,19 @@ def run_monitor():
                     my_domain_matched = my_matched,
                 )
 
-                # Record metrics
+                # Record metrics — both in DB (sqm) AND in local counters.
+                # Local counters are the source of truth for the run
+                # summary since sqm.record() has silent-fail modes.
                 if ads:
                     sqm.record("search_ok", query=query,
                                results_count=len(ads), duration_sec=duration)
+                    RUN_COUNTERS["total_ads"]     += len(ads)
+                    RUN_COUNTERS["total_queries"] += 1
                     if IS_ROTATING_PROXY and current_ip:
                         browser.report_rotating(current_ip, success=True)
                 else:
                     sqm.record("search_empty", query=query, duration_sec=duration)
+                    RUN_COUNTERS["total_empty"] += 1
 
                 # Save and run action pipeline per ad (can take a while → pause)
                 save_ads(ads)
@@ -1413,16 +1448,18 @@ if __name__ == "__main__":
         run_duration = time.time() - run_started_at
 
         if RUN_ID:
-            stats_dict = {}
+            # Read per-run stats from our local counters instead of
+            # DB.events_summary(hours=24), which aggregated across the
+            # last 24h AND miscounted `search_ok` as ads. See the
+            # RUN_COUNTERS definition at the top for rationale.
+            stats_dict = {
+                "queries_done":  RUN_COUNTERS["total_queries"] + RUN_COUNTERS["total_empty"],
+                "queries_total": len(SEARCH_QUERIES),
+                "total_ads":     RUN_COUNTERS["total_ads"],
+                "captchas":      RUN_COUNTERS["total_captchas"],
+                "empty_results": RUN_COUNTERS["total_empty"],
+            }
             try:
-                summary = DB.events_summary(profile_name=PROFILE_NAME, hours=24)
-                stats_dict = {
-                    "queries_done":  summary.get("search_ok", 0) + summary.get("search_empty", 0),
-                    "queries_total": len(SEARCH_QUERIES),
-                    "total_ads":     summary.get("search_ok", 0),
-                    "captchas":      summary.get("captcha", 0),
-                    "empty_results": summary.get("search_empty", 0),
-                }
                 DB.run_finish(
                     RUN_ID,
                     exit_code    = exit_code,

@@ -1566,6 +1566,64 @@ a:hover { text-decoration: underline; }
   background: radial-gradient(circle, rgba(99, 102, 241, 0.18), transparent 70%);
   pointer-events: none;
 }
+
+/* ─── Reset stats button ─────────────────────────────────────
+ * Floats at top-right of the hero. Low-contrast by default
+ * (matches the hero's muted accent palette), glows danger-red
+ * on hover. Absolute positioning so it doesn't push the stats
+ * grid down. z-index above the ::before gradient glow.
+ */
+.ov-hero-reset-btn {
+  position: absolute;
+  top: 20px;
+  right: 20px;
+  z-index: 2;
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 14px;
+  background: rgba(15, 23, 42, 0.55);
+  border: 1px solid rgba(148, 163, 184, 0.22);
+  border-radius: 10px;
+  color: var(--text-dim);
+  font-size: 12.5px;
+  font-weight: 500;
+  cursor: pointer;
+  transition: all .18s ease;
+  backdrop-filter: blur(6px);
+  -webkit-backdrop-filter: blur(6px);
+}
+.ov-hero-reset-btn:hover {
+  background: rgba(239, 68, 68, 0.12);
+  border-color: rgba(239, 68, 68, 0.55);
+  color: #fca5a5;
+  transform: translateY(-1px);
+  box-shadow: 0 4px 16px -4px rgba(239, 68, 68, 0.35);
+}
+.ov-hero-reset-btn:active {
+  transform: translateY(0);
+  box-shadow: 0 2px 8px -2px rgba(239, 68, 68, 0.4);
+}
+.ov-hero-reset-btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+  transform: none;
+  box-shadow: none;
+}
+.ov-hero-reset-icon {
+  font-size: 14px;
+  line-height: 1;
+  display: inline-block;
+  transition: transform .4s ease;
+}
+.ov-hero-reset-btn:hover .ov-hero-reset-icon {
+  transform: rotate(-180deg);
+}
+/* Hide label on narrow screens — icon alone still communicates. */
+@media (max-width: 640px) {
+  .ov-hero-reset-label { display: none; }
+  .ov-hero-reset-btn { padding: 8px 10px; }
+}
 .ov-hero-greeting {
   font-size: 13px;
   color: var(--text-muted);

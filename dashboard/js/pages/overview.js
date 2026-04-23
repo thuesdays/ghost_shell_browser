@@ -29,6 +29,13 @@ const Overview = {
       });
     }
 
+    // Reset-all-stats button in hero top-right. Uses the same
+    // confirmDialog pattern as delete-profile for consistency.
+    const resetBtn = document.getElementById("ov-reset-stats-btn");
+    if (resetBtn) {
+      resetBtn.addEventListener("click", () => this.resetStats());
+    }
+
     // ── Auto-refresh loop ───────────────────────────────────────
     // Previously Overview loaded once on mount and never refreshed.
     // If a run completed while the user was looking at Overview, they
@@ -56,6 +63,63 @@ const Overview = {
     if (this._pollTimer) {
       clearInterval(this._pollTimer);
       this._pollTimer = null;
+    }
+  },
+
+  /** Nuke all stats with a two-stage confirm: first a summary dialog,
+   *  then a final "are you SURE" since it's destructive and can't be
+   *  undone. Refreshes the overview in place on success so the user
+   *  sees the zeroed numbers immediately. */
+  async resetStats() {
+    const btn = document.getElementById("ov-reset-stats-btn");
+
+    // Stage 1: summary of what gets cleared vs kept
+    if (!await confirmDialog({
+      title: "↻ Reset all statistics?",
+      message:
+        `This clears <strong>all run history and telemetry</strong> and ` +
+        `cannot be undone.<br><br>` +
+        `<strong>Will be deleted:</strong><br>` +
+        `&nbsp;&nbsp;• All runs history (success / failed)<br>` +
+        `&nbsp;&nbsp;• All search events (search_ok, search_empty, captcha)<br>` +
+        `&nbsp;&nbsp;• All collected competitor URLs<br>` +
+        `&nbsp;&nbsp;• All post-click action events<br>` +
+        `&nbsp;&nbsp;• Traffic samples (bandwidth per domain)<br>` +
+        `&nbsp;&nbsp;• IP health history (burn counts, captcha counts per IP)<br>` +
+        `&nbsp;&nbsp;• Self-check cache<br><br>` +
+        `<strong>Will be kept:</strong><br>` +
+        `&nbsp;&nbsp;• All profiles (folders, cookies, history, tags, notes)<br>` +
+        `&nbsp;&nbsp;• All config (proxy, queries, behavior settings)<br>` +
+        `&nbsp;&nbsp;• Current fingerprints (regen is expensive)<br>` +
+        `&nbsp;&nbsp;• Scripts and schedules<br>`,
+      confirmText: "Continue",
+      confirmStyle: "danger",
+    })) return;
+
+    try {
+      if (btn) btn.disabled = true;
+      const r = await api("/api/stats/reset", { method: "POST" });
+
+      const total = r.total_rows || 0;
+      const tCount = (r.tables || []).length;
+      toast(
+        `✓ Stats reset — cleared ${total.toLocaleString()} rows ` +
+        `across ${tCount} table${tCount === 1 ? "" : "s"}`
+      );
+
+      // Refresh everything so the user sees zeroed numbers without
+      // a manual reload.
+      await Promise.all([
+        this.loadHeadlineStats(),
+        this.loadRecentActivity(),
+        this.loadTopCompetitors(),
+        this.loadProfileHealth(),
+        this.loadTrafficCard(),
+      ]);
+    } catch (e) {
+      toast("Reset failed: " + (e.message || e), true);
+    } finally {
+      if (btn) btn.disabled = false;
     }
   },
 
