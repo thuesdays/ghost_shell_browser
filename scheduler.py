@@ -38,6 +38,7 @@ import signal
 import logging
 import subprocess
 from datetime import datetime, timedelta, time as dtime
+from typing import Optional
 
 from db import get_db
 
@@ -260,15 +261,113 @@ def sleep_interruptible(seconds: float):
 
 
 # ──────────────────────────────────────────────────────────────
-# Run one iteration via subprocess
+# Run one iteration — DASHBOARD-ROUTED
+#
+# Previously spawned main.py directly via subprocess.Popen. That worked
+# but the resulting runs were invisible to the dashboard:
+#   - didn't appear in the Logs page live SSE stream
+#   - didn't show up in the sidebar active-runs panel
+#   - only left a row in the `runs` table (visible on the Runs page)
+#
+# We now POST to /api/run/start instead. The dashboard handles spawning,
+# so its SSE broadcaster captures every line of output and the whole
+# UI lights up as though you'd clicked Start in the browser.
+#
+# If the dashboard isn't running we fall back to the old direct-Popen
+# path so the scheduler still works standalone (e.g. on a headless
+# server with no browser UI).
 # ──────────────────────────────────────────────────────────────
 
+DASHBOARD_BASE_URL = os.environ.get(
+    "GHOST_SHELL_DASHBOARD_URL", "http://127.0.0.1:5000"
+)
+
+
+def _spawn_via_dashboard(profile_name: str) -> Optional[int]:
+    """Ask the dashboard to spawn a run. Returns the run_id on success,
+    None if the dashboard wasn't reachable (caller should fall back to
+    direct Popen). Never raises."""
+    import json as _json
+    import urllib.request
+    import urllib.error
+
+    try:
+        req = urllib.request.Request(
+            f"{DASHBOARD_BASE_URL}/api/run/start",
+            data=_json.dumps({"profile_name": profile_name}).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=5) as r:
+            body = _json.loads(r.read().decode("utf-8"))
+            return body.get("run_id")
+    except urllib.error.URLError:
+        return None   # dashboard offline
+    except Exception as e:
+        logging.warning(f"[scheduler] dashboard spawn failed: {e}")
+        return None
+
+
+def _wait_for_run_via_dashboard(run_id: int, timeout: int = 30 * 60) -> tuple:
+    """Poll /api/run/status until the run finishes or times out.
+    Returns (exit_code, duration_sec). Uses generous polling intervals
+    so we don't hammer the dashboard."""
+    import json as _json
+    import urllib.request
+
+    started = time.time()
+    poll_interval = 5  # seconds
+
+    while time.time() - started < timeout:
+        if _shutdown:
+            return -1, time.time() - started
+        try:
+            with urllib.request.urlopen(
+                f"{DASHBOARD_BASE_URL}/api/run/status?run_id={run_id}",
+                timeout=5,
+            ) as r:
+                status = _json.loads(r.read().decode("utf-8"))
+            if not status.get("running"):
+                # exit_code is None for still-running runs; dashboard sets
+                # it to the subprocess returncode on completion.
+                return status.get("exit_code", 0) or 0, time.time() - started
+        except Exception as e:
+            logging.debug(f"[scheduler] status poll error (non-fatal): {e}")
+        time.sleep(poll_interval)
+
+    # Timeout — ask dashboard to kill the run, best-effort
+    try:
+        urllib.request.urlopen(
+            urllib.request.Request(
+                f"{DASHBOARD_BASE_URL}/api/run/{run_id}/stop",
+                method="POST",
+            ),
+            timeout=5,
+        )
+    except Exception:
+        pass
+    logging.error(f"[scheduler] run {run_id} timed out after {timeout}s")
+    return -1, time.time() - started
+
+
 def run_one_iteration(profile_name: str) -> tuple:
-    """Launch main.py with the GHOST_SHELL_PROFILE_NAME env var so the
-    worker picks it up. Kept GHOST_SHELL_PROFILE as a fallback alias for
-    older workers."""
+    """Launch one main.py instance for the given profile.
+    Prefers dashboard-routed spawn (gives live logs + run tracking),
+    falls back to direct subprocess if dashboard is offline."""
     started = time.time()
 
+    # Try dashboard route first — gives us full SSE integration
+    run_id = _spawn_via_dashboard(profile_name)
+    if run_id is not None:
+        logging.info(f"  → dashboard spawned run #{run_id} for {profile_name}")
+        return _wait_for_run_via_dashboard(run_id)
+
+    # Fallback: direct Popen (old behavior). Used when scheduler runs
+    # standalone without a dashboard server.
+    logging.warning(
+        "[scheduler] Dashboard unreachable — falling back to direct "
+        "subprocess. Run will NOT appear in dashboard UI."
+    )
     env = os.environ.copy()
     env["GHOST_SHELL_PROFILE_NAME"] = profile_name
     env["GHOST_SHELL_PROFILE"]      = profile_name   # legacy alias

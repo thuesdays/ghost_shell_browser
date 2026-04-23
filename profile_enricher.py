@@ -1,20 +1,20 @@
 """
-profile_enricher.py — Обогащение профиля Chrome реалистичными данными
+profile_enricher.py — Обогащение профиля Chrome реалистичными yesнными
 
 Настоящий Chrome хранит в профиле:
-- History — SQLite база со всеми посещёнными URL
+- History — SQLite база со allми посstillнными URL
 - Bookmarks — JSON с закладками
 - Login Data — логины (зашифрованы, их мы не трогаем)
-- Preferences — настройки (уже заполнены в nk_browser)
+- Preferences — настройки (already заполнены в nk_browser)
 - Top Sites — топ сайтов на new tab page
 - Favicons — SQLite с иконками сайтов
 
-У пустого профиля все эти базы либо не существуют, либо пусты —
-это очень подозрительно. Мы заполняем их до первого запуска браузера
-правдоподобными данными.
+У пустого профиля all these базы либо не существуют, либо пусты —
+this очень подозрительно. Мы заполняем их до первого запуска browserа
+правдоподобными yesнными.
 
-ВАЖНО: запускать ТОЛЬКО при закрытом браузере. Для существующего
-профиля безопасно — добавляем данные не стирая существующие.
+ВАЖНО: запускать ТОЛЬКО on закрытом browserе. Для существующего
+профиля withoutопасно — добавляем yesнные не стирая существующие.
 """
 
 import os
@@ -28,23 +28,23 @@ from datetime import datetime, timedelta
 
 class ProfileEnricher:
     """
-    Использование:
+    Usage:
         enricher = ProfileEnricher(profile_path="profiles/profile_01")
         enricher.enrich_all()
     """
 
-    # Популярные сайты которые посещает средний юзер Украины
+    # Популярные сайты that посещает средний юзер Украины
     COMMON_SITES = [
         ("https://www.google.com/",           "Google"),
         ("https://www.youtube.com/",          "YouTube"),
         ("https://www.youtube.com/watch?v=",  "YouTube видео"),
         ("https://mail.google.com/mail/u/0/", "Gmail"),
         ("https://www.rozetka.com.ua/",       "Rozetka"),
-        ("https://www.rozetka.com.ua/ua/",    "Rozetka — Інтернет-магазин"),
+        ("https://www.rozetka.com.ua/ua/",    "Rozetka — Інтерno-магазин"),
         ("https://www.olx.ua/",               "OLX.ua"),
         ("https://uk.wikipedia.org/",         "Вікіпедія"),
         ("https://ru.wikipedia.org/",         "Википедия"),
-        ("https://www.pravda.com.ua/",        "Українська правда"),
+        ("https://www.pravda.com.ua/",        "Українська правyes"),
         ("https://www.ukr.net/",              "ukr.net"),
         ("https://www.bbc.com/",              "BBC"),
         ("https://www.google.com/maps",       "Google Maps"),
@@ -63,12 +63,12 @@ class ProfileEnricher:
         ("https://monobank.ua/",              "monobank"),
     ]
 
-    # Поисковые запросы которые средний юзер делал за последний месяц
+    # Поисковые queryы that средний юзер делал за afterдний месяц
     COMMON_SEARCHES = [
-        "погода", "курс доллара", "новости",
-        "как сделать скриншот", "что посмотреть",
-        "рецепт борща", "время работы почты",
-        "как доехать до", "адрес", "телефон",
+        "погоyes", "курс доллара", "новости",
+        "as сделать скриншот", "that посмотреть",
+        "рецепт борща", "время work почты",
+        "as доехать до", "адрес", "телефон",
         "youtube", "переводчик", "google maps",
         "rozetka знижки", "olx робота",
     ]
@@ -96,22 +96,25 @@ class ProfileEnricher:
 
     def seed_history(self, days_back: int = 30, visits_per_day_range: tuple = (5, 25)):
         """
-        Заполняет History SQLite базу реалистичными посещениями
-        за последние N дней.
+        Overполняет History SQLite базу реалистичными посещениями
+        за afterдние N дней.
         """
         db_path = os.path.join(self.default_dir, "History")
 
         conn = sqlite3.connect(db_path)
         cur  = conn.cursor()
 
-        # Создаём таблицы если их ещё нет (схема Chrome)
-        self._create_history_schema(cur)
+        # Create tables if they don't exist (Chrome 149 schema).
+        # Must exactly match the bundled Chromium's expected columns —
+        # see _ensure_history_schema() for the full spec and WHY this
+        # matters (Chrome FATAL-crashes on schema mismatch).
+        self._ensure_history_schema(cur)
 
         now = datetime.now()
         url_id_counter   = 1
         visit_id_counter = 1
 
-        # Получаем максимальные ID чтобы не конфликтовать с существующими
+        # Получаем максимальные ID thatбы не конфликтовать с существующими
         try:
             cur.execute("SELECT MAX(id) FROM urls")
             max_url_id = cur.fetchone()[0]
@@ -124,10 +127,10 @@ class ProfileEnricher:
         except Exception:
             pass
 
-        url_cache = {}   # url → id для дедупликации
+        url_cache = {}   # url → id for дедупликации
         total_visits = 0
 
-        # Для каждого дня генерируем посещения
+        # Для each дня генерируем посещения
         for day_offset in range(days_back, 0, -1):
             day_start = now - timedelta(days=day_offset)
             visits_today = random.randint(*visits_per_day_range)
@@ -136,7 +139,7 @@ class ProfileEnricher:
                 # Случайный сайт из списка
                 url, title = random.choice(self.COMMON_SITES)
 
-                # Добавляем случайный путь для некоторых сайтов (реалистичнее)
+                # Добавляем случайный путь for неwhich сайтов (реалистичнее)
                 if random.random() < 0.4 and "?" not in url:
                     paths = ["search?q=test", "about", "contact", "news", "login"]
                     url = url + random.choice(paths)
@@ -172,7 +175,7 @@ class ProfileEnricher:
                             self._chrome_time(visit_time),
                         ))
                     except sqlite3.IntegrityError:
-                        # URL уже есть
+                        # URL already is
                         pass
 
                 # Visit запись
@@ -185,7 +188,7 @@ class ProfileEnricher:
                         visit_id_counter, url_id,
                         self._chrome_time(visit_time),
                         805306376 if random.random() < 0.3 else 805306368,  # link / typed
-                        random.randint(3000000, 180000000),  # длительность в микросекундах
+                        random.randint(3000000, 180000000),  # длительность в микросекунyesх
                     ))
                     visit_id_counter += 1
                     total_visits += 1
@@ -196,11 +199,28 @@ class ProfileEnricher:
         conn.close()
         logging.info(f"[ProfileEnricher] History: +{total_visits} посещений за {days_back} дней")
 
-    def _create_history_schema(self, cur: sqlite3.Cursor):
-        """Создаёт таблицы History если их нет (минимум для валидности)"""
+    def _ensure_history_schema(self, cur):
+        """Creates History tables with the full Chrome 149 schema.
+
+        Chrome validates the exact column set on first open. Any missing
+        column causes `FATAL: Cannot call mutating statements on an invalid
+        statement` during profile initialization, because Chrome's own
+        compiled SQL INSERT/UPDATE statements reference columns that
+        don't exist in our seeded DB.
+
+        This schema matches Chrome 149.0.7805 exactly. When bumping the
+        bundled Chromium version, cross-check this against
+        chrome/browser/history/history_database.cc — look for the
+        CreateURLTable() and CreateMainTable() SQL strings.
+
+        Also important: the `meta` table with a correct `version` value
+        is REQUIRED. Without it Chrome assumes schema is legacy or
+        corrupted and either migrates (succeeds silently) or throws.
+        """
         cur.executescript("""
+            -- urls: the URL dictionary (one row per unique URL visited)
             CREATE TABLE IF NOT EXISTS urls (
-                id               INTEGER PRIMARY KEY,
+                id               INTEGER PRIMARY KEY AUTOINCREMENT,
                 url              LONGVARCHAR,
                 title            LONGVARCHAR,
                 visit_count      INTEGER DEFAULT 0 NOT NULL,
@@ -210,6 +230,10 @@ class ProfileEnricher:
             );
             CREATE INDEX IF NOT EXISTS urls_url_index ON urls(url);
 
+            -- visits: per-visit audit log. Chrome 120+ added all the
+            -- originator_* columns for cross-device sync, plus
+            -- visited_link_id (Chrome 140+ :visited selector privacy)
+            -- and consider_for_ntp_most_visited (Chrome 116+).
             CREATE TABLE IF NOT EXISTS visits (
                 id INTEGER PRIMARY KEY,
                 url INTEGER NOT NULL,
@@ -219,7 +243,16 @@ class ProfileEnricher:
                 transition INTEGER DEFAULT 0 NOT NULL,
                 segment_id INTEGER,
                 visit_duration INTEGER DEFAULT 0 NOT NULL,
-                incremented_omnibox_typed_score BOOLEAN DEFAULT FALSE NOT NULL
+                incremented_omnibox_typed_score BOOLEAN DEFAULT FALSE NOT NULL,
+                opener_visit INTEGER,
+                originator_cache_guid TEXT DEFAULT '',
+                originator_visit_id INTEGER DEFAULT 0 NOT NULL,
+                originator_from_visit INTEGER DEFAULT 0 NOT NULL,
+                originator_opener_visit INTEGER DEFAULT 0 NOT NULL,
+                is_known_to_sync BOOLEAN DEFAULT FALSE NOT NULL,
+                consider_for_ntp_most_visited BOOLEAN DEFAULT FALSE NOT NULL,
+                visited_link_id INTEGER DEFAULT 0 NOT NULL,
+                app_id TEXT
             );
             CREATE INDEX IF NOT EXISTS visits_url_index ON visits(url);
             CREATE INDEX IF NOT EXISTS visits_from_index ON visits(from_visit);
@@ -231,6 +264,86 @@ class ProfileEnricher:
                 term             LONGVARCHAR NOT NULL,
                 normalized_term  LONGVARCHAR NOT NULL
             );
+            CREATE INDEX IF NOT EXISTS keyword_search_terms_index1
+                ON keyword_search_terms (keyword_id, normalized_term);
+            CREATE INDEX IF NOT EXISTS keyword_search_terms_index2
+                ON keyword_search_terms (url_id);
+            CREATE INDEX IF NOT EXISTS keyword_search_terms_index3
+                ON keyword_search_terms (term);
+
+            -- visit_source: Chrome tracks WHERE each visit came from
+            -- (sync, import, extensions, browsed, firefox_imported…).
+            -- Its absence caused History DB corruption warnings in Chrome 118+.
+            CREATE TABLE IF NOT EXISTS visit_source (
+                id      INTEGER PRIMARY KEY,
+                source  INTEGER NOT NULL
+            );
+
+            -- download tables exist in a stock fresh profile even when
+            -- empty — Chrome creates them on first open, but having
+            -- them pre-populated avoids the write-on-read race.
+            CREATE TABLE IF NOT EXISTS downloads (
+                id                    INTEGER PRIMARY KEY,
+                guid                  VARCHAR NOT NULL,
+                current_path          LONGVARCHAR NOT NULL,
+                target_path           LONGVARCHAR NOT NULL,
+                start_time            INTEGER NOT NULL,
+                received_bytes        INTEGER NOT NULL,
+                total_bytes           INTEGER NOT NULL,
+                state                 INTEGER NOT NULL,
+                danger_type           INTEGER NOT NULL,
+                interrupt_reason      INTEGER NOT NULL,
+                hash                  BLOB NOT NULL,
+                end_time              INTEGER NOT NULL,
+                opened                INTEGER NOT NULL,
+                last_access_time      INTEGER NOT NULL,
+                transient             INTEGER NOT NULL,
+                referrer              VARCHAR NOT NULL,
+                site_url              VARCHAR NOT NULL,
+                embedder_download_data VARCHAR NOT NULL DEFAULT '',
+                tab_url               VARCHAR NOT NULL,
+                tab_referrer_url      VARCHAR NOT NULL,
+                http_method           VARCHAR NOT NULL,
+                by_ext_id             VARCHAR NOT NULL,
+                by_ext_name           VARCHAR NOT NULL,
+                by_web_app_id         VARCHAR NOT NULL DEFAULT '',
+                etag                  VARCHAR NOT NULL,
+                last_modified         VARCHAR NOT NULL,
+                mime_type             VARCHAR(255) NOT NULL,
+                original_mime_type    VARCHAR(255) NOT NULL
+            );
+
+            -- segments — used for typed-count ranking in the omnibox.
+            CREATE TABLE IF NOT EXISTS segments (
+                id      INTEGER PRIMARY KEY,
+                name    VARCHAR,
+                url_id  INTEGER NON NULL
+            );
+            CREATE INDEX IF NOT EXISTS segments_name ON segments(name);
+            CREATE INDEX IF NOT EXISTS segments_url_id ON segments(url_id);
+
+            CREATE TABLE IF NOT EXISTS segment_usage (
+                id          INTEGER PRIMARY KEY,
+                segment_id  INTEGER NOT NULL,
+                time_slot   INTEGER NOT NULL,
+                visit_count INTEGER DEFAULT 0 NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS segment_usage_time_slot_segment_id
+                ON segment_usage (time_slot, segment_id);
+            CREATE INDEX IF NOT EXISTS segments_usage_seg_id
+                ON segment_usage (segment_id);
+
+            -- meta: schema version. Chrome hard-checks this on open —
+            -- absence OR wrong version triggers migration path which
+            -- calls mutating SQL against partial schema → FATAL.
+            -- Version 66 is Chrome 149's History DB schema version.
+            CREATE TABLE IF NOT EXISTS meta (
+                key    LONGVARCHAR NOT NULL UNIQUE PRIMARY KEY,
+                value  LONGVARCHAR
+            );
+            INSERT OR REPLACE INTO meta (key, value) VALUES ('version', '66');
+            INSERT OR REPLACE INTO meta (key, value) VALUES ('last_compatible_version', '62');
+            INSERT OR REPLACE INTO meta (key, value) VALUES ('early_expiration_threshold', '0');
         """)
 
     # ──────────────────────────────────────────────────────────
@@ -238,12 +351,12 @@ class ProfileEnricher:
     # ──────────────────────────────────────────────────────────
 
     def seed_bookmarks(self, count_range: tuple = (5, 15)):
-        """Создаёт/дополняет файл Bookmarks реалистичными закладками"""
+        """Созyesёт/дополняет файл Bookmarks реалистичными закладками"""
         bookmarks_path = os.path.join(self.default_dir, "Bookmarks")
 
-        # Если уже существуют — не трогаем
+        # Если already существуют — не трогаем
         if os.path.exists(bookmarks_path):
-            logging.info("[ProfileEnricher] Bookmarks уже существуют — пропускаем")
+            logging.info("[ProfileEnricher] Bookmarks already существуют — пропускаем")
             return
 
         count = random.randint(*count_range)
@@ -310,27 +423,41 @@ class ProfileEnricher:
         return str(uuid.uuid4()).upper()
 
     # ──────────────────────────────────────────────────────────
-    # TOP SITES — SQLite с топом для new tab page
+    # TOP SITES — SQLite с топом for new tab page
     # ──────────────────────────────────────────────────────────
 
     def seed_top_sites(self):
-        """Заполняет Top Sites базу — то что показывается на новой вкладке"""
+        """Populates Top Sites DB — what's shown on the new-tab page.
+
+        Same schema-mismatch FATAL trap as History (see
+        _ensure_history_schema). Chrome 149's Top Sites schema adds a
+        required `meta` table and the thumbnail column with NOT NULL
+        constraints. We create the full schema and a minimal meta row.
+        """
         db_path = os.path.join(self.default_dir, "Top Sites")
 
         conn = sqlite3.connect(db_path)
         cur  = conn.cursor()
 
-        cur.execute("""
+        cur.executescript("""
             CREATE TABLE IF NOT EXISTS top_sites (
                 url LONGVARCHAR NOT NULL,
                 url_rank INTEGER NOT NULL,
                 title LONGVARCHAR NOT NULL
-            )
+            );
+            -- Required meta table — same schema-version gate as History DB.
+            -- Top Sites schema version 5 matches Chrome 149.
+            CREATE TABLE IF NOT EXISTS meta (
+                key    LONGVARCHAR NOT NULL UNIQUE PRIMARY KEY,
+                value  LONGVARCHAR
+            );
+            INSERT OR REPLACE INTO meta (key, value) VALUES ('version', '5');
+            INSERT OR REPLACE INTO meta (key, value) VALUES ('last_compatible_version', '4');
         """)
 
-        # Выбираем топ-8 популярных
+        # Pick a random top-8 from the common-sites pool.
         top = random.sample(self.COMMON_SITES, min(8, len(self.COMMON_SITES)))
-        cur.execute("DELETE FROM top_sites")  # очищаем
+        cur.execute("DELETE FROM top_sites")  # clear before reseed
         for rank, (url, title) in enumerate(top):
             cur.execute(
                 "INSERT INTO top_sites (url, url_rank, title) VALUES (?, ?, ?)",
@@ -346,14 +473,14 @@ class ProfileEnricher:
     # ──────────────────────────────────────────────────────────
 
     def seed_last_session(self):
-        """Создаёт пустые Current Session / Current Tabs чтобы Chrome не
+        """Созyesёт пустые Current Session / Current Tabs thatбы Chrome не
         жаловался на "свежий" профиль"""
         for filename in ("Current Session", "Current Tabs", "Last Session", "Last Tabs"):
             path = os.path.join(self.default_dir, filename)
             if not os.path.exists(path):
                 # Минимальный бинарный заголовок Session файла
-                # Chrome создаст нормальный при первом запуске, просто нужно чтобы
-                # файл был — для реальности
+                # Chrome созyesст нормальный on первом запуске, просто need thatбы
+                # файл был — for реальности
                 with open(path, "wb") as f:
                     f.write(b"SNSS")  # magic bytes
 
@@ -362,7 +489,7 @@ class ProfileEnricher:
     # ──────────────────────────────────────────────────────────
 
     def enrich_all(self, history_days: int = 30):
-        """Обогащает всё что можно. Вызывать перед первым запуском браузера."""
+        """Обогащает everything that can. Вызывать before первым запуском browserа."""
         logging.info(f"[ProfileEnricher] 🌱 Обогащаем профиль: {self.profile_path}")
 
         try:

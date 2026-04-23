@@ -16,6 +16,7 @@ const Scheduler = {
 
     await Promise.all([
       this.loadProfiles(),
+      this.loadGroups(),
       this.refresh(),
     ]);
 
@@ -28,6 +29,27 @@ const Scheduler = {
         clearInterval(this._pollTimer);
       }
     }, 4000);
+  },
+
+  /** Populate the "Run as group" dropdown with every defined group.
+   *  Current selection comes from configCache.scheduler.group_id; we
+   *  preserve it if the list refreshes (e.g. after group creation). */
+  async loadGroups() {
+    const sel = document.getElementById("sched-group-select");
+    if (!sel) return;
+    try {
+      const groups = await api("/api/groups");
+      const current = getByPath(configCache, "scheduler.group_id");
+      sel.innerHTML = `<option value="">— none (cycle profiles instead) —</option>` +
+        groups.map(g => {
+          const isSel = String(current) === String(g.id) ? "selected" : "";
+          return `<option value="${g.id}" ${isSel}>
+            ${escapeHtml(g.name)} (${g.member_count} member${g.member_count === 1 ? "" : "s"})
+          </option>`;
+        }).join("");
+    } catch (e) {
+      console.warn("Could not load groups for scheduler:", e);
+    }
   },
 
   async loadProfiles() {
@@ -143,12 +165,27 @@ const Scheduler = {
   },
 
   async start() {
+    const btn = $("#sched-start-btn");
+    // Guard against double-click: disable immediately, don't wait for
+    // refresh() to update the UI — the HTTP round-trip can take 500ms+
+    // and users hit the button twice during that window.
+    if (btn) {
+      btn.disabled = true;
+      btn.textContent = "Starting...";
+    }
     try {
       await api("/api/scheduler/start", { method: "POST" });
       toast("✓ Scheduler started");
       await this.refresh();
     } catch (e) {
       toast("Error: " + e.message, true);
+    } finally {
+      if (btn) {
+        btn.disabled = false;
+        // refresh() toggles display:none when running, so the label
+        // reset only shows briefly on start-failure.
+        btn.innerHTML = "<span>▶</span> <span>Start scheduler</span>";
+      }
     }
   },
 
@@ -160,12 +197,22 @@ const Scheduler = {
       confirmStyle: "warning",
     });
     if (!ok) return;
+    const btn = $("#sched-stop-btn");
+    if (btn) {
+      btn.disabled = true;
+      btn.textContent = "Stopping...";
+    }
     try {
       await api("/api/scheduler/stop", { method: "POST" });
       toast("✓ Scheduler stopped");
       await this.refresh();
     } catch (e) {
       toast("Error: " + e.message, true);
+    } finally {
+      if (btn) {
+        btn.disabled = false;
+        btn.innerHTML = "<span>■</span> <span>Stop scheduler</span>";
+      }
     }
   },
 };

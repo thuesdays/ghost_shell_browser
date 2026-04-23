@@ -248,7 +248,11 @@ DEFAULT_CONFIG = {
     "search.refresh_max_attempts": 4,
 
     "proxy.url":                  "",
-    "proxy.is_rotating":          True,
+    # None = auto-derive from rotation_api_url presence (recommended).
+    # Explicit True = force rotation on even without API (rare).
+    # Explicit False = disable rotation even if API configured (debug).
+    # See main.py::_resolve_rotation() for the full logic.
+    "proxy.is_rotating":          None,
     "proxy.rotation_provider":    "none",    # none | asocks | brightdata | generic
     "proxy.rotation_api_url":     None,
     # asocks uses a path + query-param URL shape. We store the two parts
@@ -295,13 +299,17 @@ DEFAULT_CONFIG = {
     # Each bucket is an English category — dashboard_server maps it to
     # URL patterns at runtime. Patterns stay in code, not config, so
     # users can't accidentally break Google by blocking it.
-    "browser.block_youtube_video":      False,  # *.ytimg.com, *.youtube.com/*.mp4
-    "browser.block_google_images":      False,  # encrypted-tbn*.gstatic.com, *.ggpht.com
-    "browser.block_google_maps_tiles":  False,  # *mt*.google.com/vt/*
-    "browser.block_fonts":              False,  # fonts.gstatic.com, *.woff2
-    "browser.block_analytics":          False,  # google-analytics, doubleclick beacons
-    "browser.block_social_widgets":     False,  # facebook.net, twitter/x embeds
-    "browser.block_video_everywhere":   False,  # *.mp4, *.webm, *.m3u8 universally
+    # Default-on because they burn MASSIVE proxy traffic without affecting
+    # ad detection at all — YouTube video blobs alone can be 5-20 MB each
+    # if a SERP result happens to contain an embedded video preview.
+    # Users on unlimited/free proxies can turn these off in Settings.
+    "browser.block_youtube_video":      True,   # *.ytimg.com, *.youtube.com/*.mp4, *.googlevideo.com
+    "browser.block_google_images":      False,  # off — thumbnails sometimes matter for context
+    "browser.block_google_maps_tiles":  True,   # *mt*.google.com/vt/* — huge when "map pack" in SERP
+    "browser.block_fonts":              False,  # off — affects page rendering
+    "browser.block_analytics":          True,   # google-analytics, doubleclick beacons — no ad-parse impact
+    "browser.block_social_widgets":     True,   # facebook/twitter/linkedin embeds — unrelated to ads
+    "browser.block_video_everywhere":   False,  # off — too aggressive, can break some sites
     "browser.block_custom_patterns":    [],     # user-supplied URL patterns (CDP wildcard syntax)
 
     # ── Runner pool ────────────────────────────────────────────

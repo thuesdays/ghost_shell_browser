@@ -155,11 +155,33 @@
       <input type="text" class="input"
              data-config="proxy.url"
              placeholder="user:pass@host:port">
-      <div class="form-hint">Format: username:password@host:port</div>
+    <div class="form-hint">Format: username:password@host:port</div>
     </div>
+    <!-- ── Rotation override ───────────────────────────────────────
+         The Rotation API card below is the PRIMARY switch — configure
+         a provider there and rotation turns on automatically. This
+         checkbox exists only to let power-users FORCE-DISABLE rotation
+         (for debugging, or when the proxy is actually static but the
+         user wants the pool UI to stop complaining). Most users never
+         need to touch it. -->
     <div class="checkbox-row">
       <input type="checkbox" id="cfg-is-rotating" data-config="proxy.is_rotating">
-      <label for="cfg-is-rotating">This endpoint rotates exit IPs</label>
+      <label for="cfg-is-rotating">
+        Force enable rotation (override)
+        <span class="form-hint" style="display:block; margin-top:2px;">
+          Usually leave unchecked — rotation auto-enables when a Rotation
+          API below is configured. Check this only if you need to force
+          rotation on without an API (rare).
+        </span>
+      </label>
+    </div>
+    <!-- Conflict warning — "Force enable" ticked but no API defined -->
+    <div id="rotation-conflict-warning" class="conflict-warning"
+         style="display:none;">
+      ⚠ <strong>You ticked "Force enable rotation" but no Rotation API is
+      configured below.</strong> Rotation will appear enabled in logs, but
+      every rotate attempt will silently fail (no API to call). Configure
+      a provider in the Rotation API card, or uncheck the override.
     </div>
   </div>
 

@@ -104,8 +104,19 @@ else:
 # Also resolve rotation settings with per-profile overrides
 def _resolve_rotation():
     """Returns (is_rotating, rotation_url, rotation_provider, rotation_api_key).
-    Per-profile values in the profiles table take precedence over globals."""
-    is_rot = CFG.get("proxy.is_rotating", True)
+    Per-profile values in the profiles table take precedence over globals.
+
+    SEMANTICS: `is_rotating` is effectively derived — if a rotation_api_url
+    is configured and reachable, we treat the proxy as rotating regardless
+    of the explicit `proxy.is_rotating` flag. The flag was originally a
+    hint for proxies that auto-rotate on each connect (without a trigger
+    API), but we now support trigger-based rotation as the primary path
+    and users kept forgetting to tick the flag after setting up the API.
+
+    Explicit False still wins — a user can force-disable rotation for
+    debugging. But the default behavior is: rotation_api set → rotation on.
+    """
+    explicit_flag = CFG.get("proxy.is_rotating")   # may be None (not set)
     url    = CFG.get("proxy.rotation_api_url")
     prov   = CFG.get("proxy.rotation_provider", "none")
     key    = CFG.get("proxy.rotation_api_key")
@@ -113,7 +124,7 @@ def _resolve_rotation():
         try:
             meta = DB.profile_meta_get(PROFILE_NAME)
             if meta.get("proxy_is_rotating") is not None:
-                is_rot = bool(meta["proxy_is_rotating"])
+                explicit_flag = bool(meta["proxy_is_rotating"])
             if meta.get("rotation_api_url"):
                 url = meta["rotation_api_url"]
             if meta.get("rotation_provider"):
@@ -122,6 +133,18 @@ def _resolve_rotation():
                 key = meta["rotation_api_key"]
         except Exception:
             pass
+
+    # Derivation logic:
+    #   explicit_flag=False  → user explicitly disabled, respect that
+    #   explicit_flag=True   → rotation on (backward-compat)
+    #   explicit_flag=None   → rotation on IFF a rotation API is configured
+    if explicit_flag is False:
+        is_rot = False
+    elif explicit_flag is True:
+        is_rot = True
+    else:
+        is_rot = bool(url and prov and prov != "none")
+
     return is_rot, url, prov, key
 
 IS_ROTATING_PROXY, ROTATION_API_URL, _ROT_PROVIDER, _ROT_KEY = _resolve_rotation()
@@ -627,16 +650,78 @@ def search_query(browser, query: str, sqm: SessionQualityMonitor,
 
     _beat()
 
+    # Captcha recovery attempts — on first sighting of a captcha, we try
+    # to force-rotate the IP and reload, up to this many times, before
+    # giving up. Tuned low: each rotation costs 5-15s of wait + provider
+    # API call, and if 3 rotations in a row all land on flagged IPs the
+    # whole proxy pool is probably burned.
+    CAPTCHA_ROTATE_MAX = 3
+    captcha_rotations_used = 0
+
     for attempt in range(1, REFRESH_MAX_ATTEMPTS + 1):
         if is_offline_page(driver):
             logging.error("  ✗ offline page — proxy broken")
             return []
 
-        # Captcha — the killer scenario. Don't retry, don't refresh
-        # (that makes the captcha mark heavier). Report the IP as burned
-        # so the rotator picks something else for next run.
+        # Captcha path — if rotation is configured, try it up to N times
+        # with a reload between each try. If rotation is unavailable
+        # (disabled in settings, or no API URL configured), fall through
+        # to the "burn IP and give up" branch immediately — retrying with
+        # the same IP just makes Google's flag heavier.
         if is_captcha_page(driver):
-            logging.error("  ✗ CAPTCHA — Google flagged this session")
+            # Single check: is rotation actually usable for this run?
+            # IS_ROTATING_PROXY is the resolved flag from _resolve_rotation()
+            # that already took per-profile overrides into account.
+            rotation_available = bool(IS_ROTATING_PROXY and ROTATION_API_URL)
+
+            if rotation_available and captcha_rotations_used < CAPTCHA_ROTATE_MAX:
+                captcha_rotations_used += 1
+                logging.warning(
+                    f"  ⚠ CAPTCHA — force-rotating IP "
+                    f"(attempt {captcha_rotations_used}/{CAPTCHA_ROTATE_MAX})"
+                )
+                sqm.record("captcha_rotated", query=query, url=driver.current_url)
+                new_ip = browser.force_rotate_ip()
+                if new_ip and new_ip != current_ip:
+                    logging.info(f"  → rotated {current_ip} → {new_ip}, reloading")
+                    current_ip = new_ip
+                    try:
+                        driver.get(search_url)
+                        time.sleep(random.uniform(1.5, 3.0))
+                    except Exception as e:
+                        logging.warning(f"  reload after rotate failed: {e}")
+                    continue   # re-enter for-loop with fresh IP
+                elif new_ip == current_ip:
+                    # API responded, pool is too small / sticky — try again
+                    # next iteration (the provider might serve a different
+                    # exit on the next rotation request).
+                    logging.warning(
+                        f"  ⚠ rotation returned SAME IP ({new_ip}) — "
+                        f"provider pool may be sticky"
+                    )
+                    time.sleep(random.uniform(2, 5))
+                    continue
+                else:
+                    # new_ip is None → rotation API failed entirely
+                    logging.error(
+                        f"  ✗ rotation API call failed — check "
+                        f"Dashboard → Proxy → Rotation settings"
+                    )
+                    # Fall through to final-give-up below
+
+            # Final give-up path. Reached when:
+            #   - rotation not configured at all, OR
+            #   - tried CAPTCHA_ROTATE_MAX rotations without success
+            if not rotation_available:
+                logging.error(
+                    f"  ✗ CAPTCHA — rotation NOT configured, cannot recover. "
+                    f"Enable rotation in Dashboard → Proxy to auto-retry on captchas."
+                )
+            else:
+                logging.error(
+                    f"  ✗ CAPTCHA — tried {captcha_rotations_used} rotations, "
+                    f"Google still flags us. Burning this IP."
+                )
             sqm.record("captcha", query=query, url=driver.current_url)
             if current_ip:
                 browser.report_rotating(current_ip, success=False, captcha=True)
@@ -795,6 +880,33 @@ def print_summary(all_ads: list[dict]):
 
 def run_monitor():
     all_ads: list[dict] = []
+
+    # ── Startup summary — makes it obvious what config this run is using.
+    # Biggest pain point was users couldn't tell if rotation was
+    # configured until something broke mid-run. Now it's on screen
+    # immediately, every run.
+    logging.info("═" * 62)
+    logging.info(f" GHOST SHELL — profile='{PROFILE_NAME or 'default'}'")
+    logging.info(f"   Proxy             : {PROXY or '(none — direct connection)'}")
+    if IS_ROTATING_PROXY and ROTATION_API_URL:
+        # Show only the path, not full URL — API keys sometimes end up in
+        # query strings and we don't want them in user-visible logs.
+        from urllib.parse import urlparse
+        u = urlparse(ROTATION_API_URL)
+        masked = f"{u.scheme}://{u.netloc}{u.path}"
+        logging.info(f"   Rotation API      : {masked} (provider={_ROT_PROVIDER})")
+        logging.info(f"   Rotation trigger  : on captcha (up to 3×), on burn-detection, "
+                     f"on geo-mismatch")
+    elif IS_ROTATING_PROXY:
+        logging.warning(
+            "   Rotation API      : ENABLED but NO URL SET — nothing will "
+            "actually rotate. Dashboard → Proxy → Rotation."
+        )
+    else:
+        logging.info(f"   Rotation API      : disabled (proxy.is_rotating=false)")
+    logging.info(f"   Preferred lang    : {PREFERRED_LANGUAGE}")
+    logging.info(f"   Expected country  : {EXPECTED_COUNTRY} ({EXPECTED_TIMEZONE})")
+    logging.info("═" * 62)
 
     with GhostShellBrowser(
         profile_name       = PROFILE_NAME,

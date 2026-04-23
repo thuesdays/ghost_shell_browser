@@ -23,11 +23,12 @@ const ProxyPage = {
     }
 
     // Rotation-API config status: re-check whenever the user edits the
-    // provider dropdown or the URL field, so the chip/banner update
-    // live without a reload.
+    // provider dropdown, the URL field, or the force-enable override so
+    // the chip/banner/conflict-warning update live without a reload.
     document.querySelectorAll(
       '[data-config="proxy.rotation_provider"], ' +
-      '[data-config="proxy.rotation_api_url"]'
+      '[data-config="proxy.rotation_api_url"], ' +
+      '[data-config="proxy.is_rotating"]'
     ).forEach(el => {
       el.addEventListener("input",  () => this.refreshRotationStatus());
       el.addEventListener("change", () => this.refreshRotationStatus());
@@ -94,18 +95,52 @@ const ProxyPage = {
     const url      = (getByPath(configCache, "proxy.rotation_api_url") || "").trim();
     const configured = provider !== "none" && !!url;
 
+    // The override checkbox — explicit True forces on, explicit False
+    // forces off, null means "let the API config decide".
+    const override = getByPath(configCache, "proxy.is_rotating");
+
+    // Compute effective rotation state — this is what main.py will see.
+    // Keep this logic in sync with main.py::_resolve_rotation().
+    let effective, label, tone;
+    if (override === false) {
+      effective = false;
+      label = "disabled (override)";
+      tone  = "off";
+    } else if (override === true && !configured) {
+      effective = true;
+      label = "✓ forced on (no API!)";
+      tone  = "warn";
+    } else if (configured) {
+      effective = true;
+      label = `✓ ${provider}`;
+      tone  = "on";
+    } else {
+      effective = false;
+      label = "not configured";
+      tone  = "off";
+    }
+
     const chip = document.getElementById("rotation-status-chip");
     if (chip) {
-      chip.classList.toggle("on",  configured);
-      chip.classList.toggle("off", !configured);
-      chip.textContent = configured
-        ? `✓ ${provider}`
-        : "not configured";
+      chip.classList.toggle("on",   tone === "on");
+      chip.classList.toggle("off",  tone === "off");
+      chip.classList.toggle("warn", tone === "warn");
+      chip.textContent = label;
     }
 
     const banner = document.getElementById("rotation-missing-banner");
     if (banner) {
-      banner.style.display = configured ? "none" : "";
+      // Show banner only when rotation isn't going to work.
+      banner.style.display = effective ? "none" : "";
+    }
+
+    // Warn if there's a conflict — user ticked "Force enable" but
+    // didn't configure an API. Rotation will turn on but the tracker
+    // will have nothing to call, leading to silent no-ops.
+    const conflictBox = document.getElementById("rotation-conflict-warning");
+    if (conflictBox) {
+      const conflict = override === true && !configured;
+      conflictBox.style.display = conflict ? "" : "none";
     }
   },
 

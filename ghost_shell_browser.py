@@ -322,8 +322,78 @@ class GhostShellBrowser:
             "--force-webrtc-ip-handling-policy=disable_non_proxied_udp"
         )
         # mDNS ICE candidates (.local) are a weaker leak vector but still
-        # expose the device's presence on its LAN — disable.
-        options.add_argument("--disable-features=WebRtcHideLocalIpsWithMdns")
+        # expose the device's presence on its LAN — disabled via the
+        # unified --disable-features list below. (Chrome's command-line
+        # parser does NOT merge duplicate --disable-features flags; the
+        # last one wins. So every feature must appear in ONE flag.)
+
+        # ── Traffic-saving flags — CRITICAL for paid proxies ───────────
+        #
+        # Chrome's default behavior on a fresh profile is to pull HUNDREDS
+        # of MB of "helpful" payloads during startup, every single startup,
+        # on every profile:
+        #
+        #   Component Updater    — Widevine, Privacy Sandbox, CRL sets,
+        #                          Origin Trials, Trust Tokens, File Type
+        #                          Policies etc. ~50-200 MB per update cycle.
+        #   Safe Browsing        — full URL blocklist downloads. 30-80 MB
+        #                          on first run; incremental updates every
+        #                          ~30 min.
+        #   Variation seeds      — Google's A/B experiment config. Small
+        #                          individually, but pings every startup.
+        #   Translate models     — dictionaries for auto-translate. ~50 MB
+        #                          on first language encounter.
+        #   Optimization Hints   — per-site performance hints. 20-40 MB.
+        #   Enhanced Ad Privacy  — Topics API / FLoC replacement data.
+        #   Sync / Sign-in       — even without sign-in, the sync scheduler
+        #                          pings Google every N minutes.
+        #
+        # ALL of this goes through our proxy because --proxy-server is
+        # system-wide for Chrome. Spinning up 10 new profiles in a day =
+        # 2-5 GB of wasted traffic BEFORE the first search query.
+        #
+        # The block below disables each source. We keep this explicit per-
+        # feature (rather than a single --disable-background-networking)
+        # because that flag alone doesn't catch component updater or
+        # translate downloads.
+        options.add_argument("--disable-background-networking")
+        options.add_argument("--disable-component-update")
+        options.add_argument("--disable-domain-reliability")
+        options.add_argument("--disable-client-side-phishing-detection")
+        options.add_argument("--safebrowsing-disable-auto-update")
+        options.add_argument("--disable-sync")
+        options.add_argument("--disable-translate")
+        # ONE unified --disable-features flag. Chrome overwrites duplicates,
+        # so we merge WebRtcHideLocalIpsWithMdns (fingerprint hardening)
+        # with traffic-saving feature disables.
+        options.add_argument("--disable-features=" + ",".join([
+            # Fingerprint hardening — kept from the prior WebRTC block
+            "WebRtcHideLocalIpsWithMdns",
+            # Traffic savings
+            "OptimizationHints",
+            "OptimizationHintsFetching",
+            "InterestFeedContentSuggestions",
+            "CalculateNativeWinOcclusion",
+            "MediaRouter",
+            "Translate",
+            "AutofillServerCommunication",
+            "CertificateTransparencyComponentUpdater",
+        ]))
+        # Per-pref knob — belt and suspenders. `prefs` gets merged into
+        # the profile's Preferences JSON before Chrome reads it.
+        options.add_experimental_option("prefs", {
+            # Don't ever dial home for update checks of components
+            "component_updater.recovery_component.enabled": False,
+            # Don't download translate models proactively
+            "translate.enabled": False,
+            # Minimize Safe Browsing traffic (still get basic client-side)
+            "safebrowsing.enabled": False,
+            "safebrowsing.scout_reporting_enabled": False,
+            # Don't preload pages / prefetch resources on idle
+            "net.network_prediction_options": 2,  # 2 = disabled
+            # Don't upload usage metrics to Google
+            "user_experience_metrics.reporting_enabled": False,
+        })
 
         # Defensive: force the window to be visible on the primary desktop.
         options.add_argument("--window-position=100,100")
@@ -1386,12 +1456,19 @@ class GhostShellBrowser:
                 f"navigator.getBattery().then(b => b.charging === {exp_charging})"
             )
             # Level should be within ±0.02 of payload (battery status has
-            # tiny OS-level quantization)
+            # tiny OS-level quantization). The test runs in an async closure
+            # and returns a structured result {ok, actual} so when it fails
+            # we log what the JS side actually saw — much easier to debug
+            # than a bare "false".
             if "level" in exp_battery and exp_battery["level"] is not None:
                 lvl = float(exp_battery["level"])
                 async_tests["battery_level_matches"] = (
-                    f"navigator.getBattery().then(b => "
-                    f"Math.abs(b.level - {lvl}) < 0.02)"
+                    f"navigator.getBattery().then(b => {{"
+                    f"  const actual = b.level;"
+                    f"  const ok = Math.abs(actual - {lvl}) < 0.02;"
+                    f"  return ok ? true : "
+                    f"    ('expected=' + {lvl} + ' got=' + actual);"
+                    f"}})"
                 )
         else:
             # Desktop — expect charging:true, level:1 (plugged-in state)
@@ -1503,6 +1580,114 @@ class GhostShellBrowser:
             "})()"
         )
 
+        # ── Feature #8: WebGL / WebGPU vendor consistency ──────────
+        # Real hardware answers identically on both APIs. If we leak
+        # different strings from the two code paths, creepjs flags it
+        # instantly. This test requires the WebGL patch + WebGPU patch
+        # (#6 + #8) to be in place — both should read from
+        # unmasked_vendor_ / unmasked_renderer_ in ghost_shell_config.
+        exp_gpu = expected.get("gpu") or {}
+        if exp_gpu.get("unmasked_vendor"):
+            tests["webgl_unmasked_vendor_matches"] = (
+                "(() => {"
+                "  const c = document.createElement('canvas');"
+                "  const gl = c.getContext('webgl') || c.getContext('experimental-webgl');"
+                "  if (!gl) return false;"
+                "  const ext = gl.getExtension('WEBGL_debug_renderer_info');"
+                "  if (!ext) return false;"
+                "  const v = gl.getParameter(ext.UNMASKED_VENDOR_WEBGL);"
+                f"  return v === {json.dumps(exp_gpu['unmasked_vendor'])};"
+                "})()"
+            )
+            # WebGPU is gated by "secure context" + user agent must opt in.
+            # On our generate_204 page it should work. If WebGPU is not
+            # available (older Chrome, or Linux without Vulkan), skip —
+            # absence of the API is not a failure.
+            async_tests["webgpu_vendor_consistent_with_webgl"] = (
+                "(async () => {"
+                "  if (!navigator.gpu) return true;"   # skip if WebGPU missing
+                "  try {"
+                "    const a = await navigator.gpu.requestAdapter();"
+                "    if (!a) return true;"
+                "    const info = a.requestAdapterInfo"
+                "                 ? await a.requestAdapterInfo() : null;"
+                "    if (!info) return true;"
+                "    const c = document.createElement('canvas');"
+                "    const gl = c.getContext('webgl');"
+                "    const ext = gl && gl.getExtension('WEBGL_debug_renderer_info');"
+                "    if (!ext) return true;"
+                "    const webglVendor = gl.getParameter(ext.UNMASKED_VENDOR_WEBGL);"
+                "    // Both strings reference the same GPU family — loose match"
+                "    // because WebGPU vendor is a short token ('intel'/'nvidia')"
+                "    // while WebGL wraps it in 'Google Inc. (...)'."
+                "    const tok = (info.vendor || '').toLowerCase();"
+                "    return !tok || webglVendor.toLowerCase().includes(tok);"
+                "  } catch (e) { return true; }"   # any exception -> skip gracefully
+                "})()"
+            )
+
+        # ── Feature #5: Canvas noise stability ─────────────────────
+        # Same profile must produce the SAME canvas hash on repeated
+        # reads (stability is a creepjs metric), but our noise makes
+        # it DIFFERENT from a vanilla Chromium baseline.
+        # Here we check only the stability half — the across-profiles
+        # variance is asserted by dashboard-level tooling that compares
+        # hashes between profile_01 / profile_02 / etc.
+        tests["canvas_readback_stable"] = (
+            "(() => {"
+            "  const render = () => {"
+            "    const c = document.createElement('canvas');"
+            "    c.width = 64; c.height = 20;"
+            "    const ctx = c.getContext('2d');"
+            "    ctx.fillStyle = '#f60'; ctx.fillRect(0,0,50,10);"
+            "    ctx.fillStyle = '#069'; ctx.font = '12px Arial';"
+            "    ctx.fillText('GhostShell', 4, 15);"
+            "    return c.toDataURL();"
+            "  };"
+            "  const a = render(); const b = render();"
+            "  return a === b && a.length > 100;"   # identical reads, non-empty
+            "})()"
+        )
+
+        # ── Feature #5: Audio sample rate within expected drift ────
+        exp_audio = expected.get("audio") or {}
+        if exp_audio.get("sample_rate"):
+            # Noise jitter is ±1 Hz around the base rate — accept any
+            # value in [base-1, base+1]. A real sound card drifts in
+            # this range during warmup too.
+            base = int(exp_audio["sample_rate"])
+            tests["audio_rate_in_jitter_band"] = (
+                "(() => {"
+                "  try {"
+                "    const ctx = new (window.AudioContext || window.webkitAudioContext)();"
+                "    const r = ctx.sampleRate;"
+                "    ctx.close();"
+                f"    return r >= {base - 1} && r <= {base + 1};"
+                "  } catch (e) { return false; }"
+                "})()"
+            )
+
+        # ── Feature #8: Media codec matrix matches payload ─────────
+        # For the most-fingerprinted codec (AV1), verify the
+        # power_efficient flag from payload survives through the
+        # media_capabilities.cc patch. Detector scripts compare this
+        # value against the claimed GPU tier — mismatch = tell.
+        exp_codecs = expected.get("codecs") or {}
+        if "av1" in exp_codecs:
+            expected_pe = exp_codecs["av1"].get("power_efficient", True)
+            async_tests["av1_power_efficient_matches"] = (
+                "navigator.mediaCapabilities.decodingInfo({"
+                "  type: 'file',"
+                "  video: {"
+                "    contentType: 'video/mp4; codecs=\"av01.0.05M.08\"',"
+                "    width: 1920, height: 1080,"
+                "    bitrate: 5000000, framerate: 30"
+                "  }"
+                f"}}).then(r => r.powerEfficient === "
+                f"{'true' if expected_pe else 'false'})"
+                ".catch(() => true)"   # codec not supported at all -> pass
+            )
+
         results = {}
         # Run sync tests first
         for name, code in tests.items():
@@ -1516,14 +1701,28 @@ class GhostShellBrowser:
             try:
                 # Selenium's execute_async_script: last arg is a callback
                 # we resolve with the test result. 8s timeout per probe.
+                #
+                # We pass the raw value through — NOT Boolean(v) — so that
+                # tests can return a diagnostic string like
+                # "expected=0.65 got=1" on failure. `true` still reads as
+                # pass, `false` as fail, and anything else gets rendered
+                # as a string for the log. Previously we Boolean'd the
+                # result which turned diagnostic strings into `true` and
+                # masked failures.
                 self.driver.set_script_timeout(8)
                 js = (
                     "const cb = arguments[arguments.length - 1];"
-                    f"({code}).then(v => cb(Boolean(v)))"
+                    f"({code}).then(v => cb(v))"
                     ".catch(e => cb('Error: ' + (e.message || e)));"
                 )
                 r = self.driver.execute_async_script(js)
-                results[name] = r if isinstance(r, bool) else str(r)[:40]
+                if r is True:
+                    results[name] = True
+                elif r is False:
+                    results[name] = False
+                else:
+                    # Diagnostic payload — coerce to string and truncate
+                    results[name] = str(r)[:60]
             except Exception as e:
                 results[name] = f"Error: {str(e)[:40]}"
 
