@@ -18,6 +18,17 @@ import logging
 import threading
 import subprocess
 from datetime import datetime
+from typing import Optional
+
+# Windows cp1252 stdout quirk — force UTF-8 so the dashboard's own log
+# messages (and the stdout of main.py subprocesses we pipe through our
+# broadcast logger) don't crash StreamHandler on emoji/Cyrillic. See
+# main.py for details.
+try:
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+except (AttributeError, Exception):
+    pass
 
 try:
     from flask import Flask, request, jsonify, send_file, Response
@@ -40,24 +51,40 @@ def _popen_no_console_flags():
 # RUNNER STATE
 # ──────────────────────────────────────────────────────────────
 
-class RunnerState:
-    def __init__(self):
-        self.is_running       = False
-        self.current_run_id   = None
-        self.profile_name     = None          # which profile is active
-        self.thread           = None
-        self.process          = None          # subprocess handle (for stop)
-        self.started_at       = None
-        self.finished_at      = None
-        self.last_exit_code   = None
-        self.last_error       = None
-        self.log_queue        = queue.Queue(maxsize=1000)
+# ──────────────────────────────────────────────────────────────
+# RUNNER STATE — now a pool of concurrent runs instead of one slot
+# ──────────────────────────────────────────────────────────────
+
+class RunnerSlot:
+    """
+    Represents a single active run — one profile, one main.py subprocess,
+    one chromium tree. Each slot is fully isolated from other slots.
+
+    Slots are keyed by run_id in RunnerPool. After the subprocess exits,
+    the slot is kept around for a short grace period (so the UI can
+    display the final status) then garbage-collected.
+    """
+    def __init__(self, run_id: int, profile_name: str):
+        self.run_id         = run_id
+        self.profile_name   = profile_name
+        self.thread         = None
+        self.process        = None       # subprocess.Popen handle
+        self.started_at     = datetime.now().isoformat(timespec="seconds")
+        self.finished_at    = None
+        self.last_exit_code = None
+        self.last_error     = None
+        self.is_running     = True
+        # Per-slot ring buffer for streaming logs to the dashboard.
+        # Sized to survive a burst but not eat memory on 100 runs.
+        self.log_queue      = queue.Queue(maxsize=1000)
 
     def log(self, message: str, level: str = "info"):
         entry = {
-            "ts":       datetime.now().strftime("%H:%M:%S"),
-            "level":    level,
-            "message":  message,
+            "ts":           datetime.now().strftime("%H:%M:%S"),
+            "level":        level,
+            "message":      message,
+            "run_id":       self.run_id,
+            "profile_name": self.profile_name,
         }
         try:
             self.log_queue.put_nowait(entry)
@@ -67,14 +94,172 @@ class RunnerState:
                 self.log_queue.put_nowait(entry)
             except Exception:
                 pass
-        # Write to DB log table
         try:
-            get_db().log_add(self.current_run_id, level, message)
+            get_db().log_add(self.run_id, level, message)
         except Exception:
             pass
 
 
-RUNNER = RunnerState()
+class RunnerPool:
+    """
+    Global registry of concurrent runs. Thread-safe reads/writes.
+
+    Responsibilities:
+      - Spawn new slots (one per profile launch)
+      - Enforce max_parallel concurrency cap from config
+      - Route log lines / stop requests / status queries to the right slot
+      - Broadcast a merged log stream to dashboard SSE consumers
+
+    Does NOT own the actual subprocess lifecycle — that lives in the
+    per-slot run_thread inside api_run(). The pool is just the bookkeeping.
+    """
+    def __init__(self):
+        self._lock        = threading.RLock()
+        self._slots       = {}   # run_id -> RunnerSlot
+        # Merged stream for the dashboard — one queue everyone can subscribe to.
+        # Per-slot queues still exist for targeted consumers.
+        self.broadcast_queue = queue.Queue(maxsize=5000)
+
+    # ── Lifecycle ───────────────────────────────────────────────
+    def add(self, slot: RunnerSlot) -> None:
+        with self._lock:
+            self._slots[slot.run_id] = slot
+
+    def mark_finished(self, run_id: int, exit_code: int = None,
+                      error: str = None) -> None:
+        with self._lock:
+            slot = self._slots.get(run_id)
+            if not slot:
+                return
+            slot.is_running     = False
+            slot.finished_at    = datetime.now().isoformat(timespec="seconds")
+            slot.last_exit_code = exit_code
+            slot.last_error     = error
+
+    def remove(self, run_id: int) -> None:
+        with self._lock:
+            self._slots.pop(run_id, None)
+
+    # ── Queries ─────────────────────────────────────────────────
+    def get(self, run_id: int) -> Optional[RunnerSlot]:
+        with self._lock:
+            return self._slots.get(run_id)
+
+    def get_by_profile(self, profile_name: str) -> Optional[RunnerSlot]:
+        """First slot running this profile, or None. Useful for the UI
+        (one profile can realistically only run in one slot at a time —
+        two runs of the same profile would share a user-data-dir and
+        corrupt each other)."""
+        with self._lock:
+            for slot in self._slots.values():
+                if slot.profile_name == profile_name and slot.is_running:
+                    return slot
+            return None
+
+    def active_runs(self) -> list[dict]:
+        with self._lock:
+            return [self._slot_to_dict(s) for s in self._slots.values()
+                    if s.is_running]
+
+    def all_slots(self) -> list[dict]:
+        with self._lock:
+            return [self._slot_to_dict(s) for s in self._slots.values()]
+
+    def active_count(self) -> int:
+        with self._lock:
+            return sum(1 for s in self._slots.values() if s.is_running)
+
+    def is_profile_running(self, profile_name: str) -> bool:
+        return self.get_by_profile(profile_name) is not None
+
+    # ── Broadcast logging (for the merged /api/logs/live stream) ─
+    def broadcast_log(self, entry: dict) -> None:
+        try:
+            self.broadcast_queue.put_nowait(entry)
+        except queue.Full:
+            # Drop oldest so newer messages reach subscribers
+            try:
+                self.broadcast_queue.get_nowait()
+                self.broadcast_queue.put_nowait(entry)
+            except Exception:
+                pass
+
+    # ── Helpers ─────────────────────────────────────────────────
+    def _slot_to_dict(self, slot: RunnerSlot) -> dict:
+        return {
+            "run_id":         slot.run_id,
+            "profile_name":   slot.profile_name,
+            "started_at":     slot.started_at,
+            "finished_at":    slot.finished_at,
+            "last_exit_code": slot.last_exit_code,
+            "last_error":     slot.last_error,
+            "is_running":     slot.is_running,
+        }
+
+
+# The global pool replaces the old singleton RUNNER. A compatibility
+# shim below exposes the old RUNNER.* attributes for code paths that
+# haven't been migrated yet (they see "whatever is most recent").
+RUNNER_POOL = RunnerPool()
+
+
+class _LegacyRunnerShim:
+    """
+    Back-compat for pre-pool code that reads RUNNER.is_running /
+    RUNNER.current_run_id / RUNNER.profile_name. Returns values for
+    the most recently started slot if any is active, else sensible
+    defaults. New code should use RUNNER_POOL directly.
+
+    Writes are accepted and forwarded to RUNNER_POOL for the most
+    recent slot, to keep the older run_thread() paths working during
+    migration.
+    """
+    @property
+    def is_running(self):
+        return RUNNER_POOL.active_count() > 0
+
+    @property
+    def current_run_id(self):
+        runs = RUNNER_POOL.active_runs()
+        return runs[0]["run_id"] if runs else None
+
+    @property
+    def profile_name(self):
+        runs = RUNNER_POOL.active_runs()
+        return runs[0]["profile_name"] if runs else None
+
+    # Fields written by run_thread() — no-ops now (slot owns them)
+    @is_running.setter
+    def is_running(self, _): pass
+    @current_run_id.setter
+    def current_run_id(self, _): pass
+    @profile_name.setter
+    def profile_name(self, _): pass
+
+    # Legacy public attrs — provide stubs so setattr doesn't crash.
+    # Kept for endpoints that hang "started_at / finished_at / etc"
+    # on the global but no longer mean anything meaningful multi-run.
+    started_at     = None
+    finished_at    = None
+    last_exit_code = None
+    last_error     = None
+    thread         = None
+    process        = None
+
+    def log(self, message: str, level: str = "info"):
+        """Legacy global log — broadcast to all subscribers.
+        Individual runs should use their own slot.log() now."""
+        entry = {
+            "ts":       datetime.now().strftime("%H:%M:%S"),
+            "level":    level,
+            "message":  message,
+            "run_id":   None,
+            "profile_name": None,
+        }
+        RUNNER_POOL.broadcast_log(entry)
+
+
+RUNNER = _LegacyRunnerShim()
 
 
 def cleanup_stale_runs():
@@ -262,6 +447,298 @@ def api_profile_clear_session_quality(name: str):
         return jsonify({"error": str(e)}), 500
 
 
+@app.route("/api/profiles/<n>/meta", methods=["GET"])
+def api_profile_meta_get(name: str):
+    """Dashboard-level metadata for a profile: tags, per-profile proxy
+    override, rotation config override, notes, group memberships."""
+    meta = get_db().profile_meta_get(name)
+    return jsonify(meta)
+
+
+@app.route("/api/profiles/<n>/meta", methods=["POST"])
+def api_profile_meta_set(name: str):
+    """Partial update of profile metadata. Only keys in the body are
+    touched — pass {} to get current state without changes."""
+    payload = request.get_json(silent=True) or {}
+    allowed = {
+        "tags", "proxy_url", "proxy_is_rotating",
+        "rotation_api_url", "rotation_provider", "rotation_api_key",
+        "notes",
+    }
+    updates = {k: v for k, v in payload.items() if k in allowed}
+    if updates:
+        get_db().profile_meta_upsert(name, **updates)
+    return jsonify(get_db().profile_meta_get(name))
+
+
+@app.route("/api/profiles/<n>/tags", methods=["POST"])
+def api_profile_set_tags(name: str):
+    """Convenience endpoint for the tag editor — replaces the whole
+    tag list for this profile."""
+    payload = request.get_json(silent=True) or {}
+    tags = payload.get("tags") or []
+    if not isinstance(tags, list):
+        return jsonify({"error": "tags must be a list"}), 400
+    clean = []
+    seen = set()
+    for t in tags:
+        t = str(t).strip()
+        if not t: continue
+        key = t.lower()
+        if key in seen: continue
+        seen.add(key)
+        clean.append(t)
+    get_db().profile_meta_upsert(name, tags=clean)
+    return jsonify({"ok": True, "tags": clean})
+
+
+# ──────────────────────────────────────────────────────────────
+# API: COOKIES / SESSION (per profile)
+# ──────────────────────────────────────────────────────────────
+
+@app.route("/api/profiles/<n>/cookies", methods=["GET"])
+def api_profile_cookies_list(name: str):
+    """Return all stored cookies for this profile as Selenium-shape
+    dicts. Read from profiles/<n>/ghostshell_session/cookies.json —
+    Chrome's live DB is not touched.
+    """
+    import cookie_manager
+    cookies = cookie_manager.list_cookies(name)
+    return jsonify({
+        "count":   len(cookies),
+        "cookies": cookies,
+    })
+
+
+@app.route("/api/profiles/<n>/cookies/export", methods=["GET"])
+def api_profile_cookies_export(name: str):
+    """Download cookies as a JSON or Netscape file.
+    Query params:
+      ?format=json (default) — EditThisCookie-compatible JSON array
+      ?format=netscape       — classic cookies.txt (curl/wget)
+    """
+    import cookie_manager
+    cookies = cookie_manager.list_cookies(name)
+    fmt = (request.args.get("format") or "json").lower()
+
+    if fmt == "netscape":
+        from flask import Response as _Resp
+        body = cookie_manager.to_netscape(cookies)
+        return _Resp(
+            body,
+            mimetype="text/plain",
+            headers={
+                "Content-Disposition":
+                    f'attachment; filename="cookies-{name}.txt"',
+            },
+        )
+
+    # Default JSON
+    from flask import Response as _Resp
+    body = json.dumps(cookies, ensure_ascii=False, indent=2)
+    return _Resp(
+        body,
+        mimetype="application/json",
+        headers={
+            "Content-Disposition":
+                f'attachment; filename="cookies-{name}.json"',
+        },
+    )
+
+
+@app.route("/api/profiles/<n>/cookies/import", methods=["POST"])
+def api_profile_cookies_import(name: str):
+    """Import cookies from a JSON or Netscape blob.
+
+    Body: {blob: "...", mode: "merge" | "replace"}
+    - merge   (default): add these cookies to existing ones, duplicates
+      keyed by (name, domain, path) overwrite old values
+    - replace: discard existing cookies, use imported list only
+
+    Returns {count, added, replaced_total}. If the payload can't be
+    parsed at all, returns 400 with the parse error.
+    """
+    import cookie_manager
+    payload = request.get_json(silent=True) or {}
+    blob = payload.get("blob") or ""
+    mode = (payload.get("mode") or "merge").lower()
+
+    try:
+        new_cookies = cookie_manager.parse_import(blob)
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+
+    existing = cookie_manager.list_cookies(name) if mode == "merge" else []
+
+    # Merge by (name, domain, path) — identical spec overwrites.
+    by_key = {
+        (c.get("name"), c.get("domain"), c.get("path", "/")): c
+        for c in existing
+    }
+    added = 0
+    for c in new_cookies:
+        key = (c.get("name"), c.get("domain"), c.get("path", "/"))
+        if key not in by_key:
+            added += 1
+        by_key[key] = c
+
+    final = list(by_key.values())
+    cookie_manager.save_cookies(name, final)
+    return jsonify({
+        "ok":             True,
+        "count":          len(final),
+        "added":          added,
+        "imported_total": len(new_cookies),
+        "mode":           mode,
+    })
+
+
+@app.route("/api/profiles/<n>/cookies/clear", methods=["POST"])
+def api_profile_cookies_clear(name: str):
+    """Delete all cookies for this profile. Note: if the profile is
+    currently running, Chrome's live DB still holds them until shutdown.
+    The dashboard shows a warning for active profiles."""
+    import cookie_manager
+    cookie_manager.clear_cookies(name)
+    return jsonify({"ok": True})
+
+
+@app.route("/api/profiles/<n>/cookies/<path:cookie_name>", methods=["DELETE"])
+def api_profile_cookie_delete(name: str, cookie_name: str):
+    """Delete a single cookie by its name (across all domains the
+    profile has for it). Used by the row-level delete button in the UI."""
+    import cookie_manager
+    cookies = cookie_manager.list_cookies(name)
+    before = len(cookies)
+    filtered = [c for c in cookies if c.get("name") != cookie_name]
+    cookie_manager.save_cookies(name, filtered)
+    return jsonify({"ok": True, "removed": before - len(filtered)})
+
+
+@app.route("/api/profiles/<n>/storage", methods=["GET"])
+def api_profile_storage_list(name: str):
+    """Return stored localStorage map (per-origin JSON dict)."""
+    import cookie_manager
+    return jsonify(cookie_manager.list_storage(name))
+
+
+# ──────────────────────────────────────────────────────────────
+# API: PROFILE GROUPS
+# ──────────────────────────────────────────────────────────────
+
+@app.route("/api/groups", methods=["GET"])
+def api_groups_list():
+    return jsonify(get_db().group_list())
+
+
+@app.route("/api/groups", methods=["POST"])
+def api_groups_create():
+    payload = request.get_json(silent=True) or {}
+    name = (payload.get("name") or "").strip()
+    if not name:
+        return jsonify({"error": "name required"}), 400
+    try:
+        gid = get_db().group_create(
+            name         = name,
+            description  = payload.get("description"),
+            script       = payload.get("script"),
+            max_parallel = payload.get("max_parallel"),
+        )
+        members = payload.get("members") or []
+        if members:
+            get_db().group_set_members(gid, members)
+        return jsonify({"ok": True, "id": gid,
+                        "group": get_db().group_get(gid)})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 409
+
+
+@app.route("/api/groups/<int:group_id>", methods=["GET"])
+def api_groups_get(group_id: int):
+    g = get_db().group_get(group_id)
+    if not g:
+        return jsonify({"error": "not found"}), 404
+    return jsonify(g)
+
+
+@app.route("/api/groups/<int:group_id>", methods=["POST"])
+def api_groups_update(group_id: int):
+    payload = request.get_json(silent=True) or {}
+    allowed = {"name", "description", "script", "max_parallel"}
+    updates = {k: v for k, v in payload.items() if k in allowed}
+    if updates:
+        get_db().group_update(group_id, **updates)
+    if "members" in payload and isinstance(payload["members"], list):
+        get_db().group_set_members(group_id, payload["members"])
+    return jsonify(get_db().group_get(group_id))
+
+
+@app.route("/api/groups/<int:group_id>", methods=["DELETE"])
+def api_groups_delete(group_id: int):
+    get_db().group_delete(group_id)
+    return jsonify({"ok": True})
+
+
+@app.route("/api/groups/<int:group_id>/start", methods=["POST"])
+def api_groups_start(group_id: int):
+    """
+    Launch every member of this group as a separate concurrent run.
+    Respects the effective max_parallel cap (group-specific if set,
+    otherwise global). Profiles that don't fit end up in `queued`.
+    """
+    g = get_db().group_get(group_id)
+    if not g:
+        return jsonify({"error": "group not found"}), 404
+
+    db = get_db()
+    max_parallel = int(
+        g.get("max_parallel")
+        or db.config_get("runner.max_parallel", 4)
+        or 4
+    )
+    room = max(0, max_parallel - RUNNER_POOL.active_count())
+
+    started, queued, errors = [], [], []
+    for name in g["members"]:
+        if RUNNER_POOL.is_profile_running(name):
+            continue
+        if len(started) >= room:
+            queued.append(name)
+            continue
+        try:
+            result = _spawn_run(name)
+            started.append(result)
+        except ValueError as e:
+            errors.append({"profile_name": name, "error": str(e)})
+
+    return jsonify({
+        "ok":           True,
+        "started":      started,
+        "queued":       queued,
+        "errors":       errors,
+        "max_parallel": max_parallel,
+    })
+
+
+@app.route("/api/groups/<int:group_id>/stop", methods=["POST"])
+def api_groups_stop(group_id: int):
+    """Stop every active run belonging to this group's members."""
+    g = get_db().group_get(group_id)
+    if not g:
+        return jsonify({"error": "group not found"}), 404
+
+    stopped = []
+    for name in g["members"]:
+        slot = RUNNER_POOL.get_by_profile(name)
+        if slot:
+            try:
+                api_runs_stop_specific(slot.run_id)
+                stopped.append({"profile_name": name, "run_id": slot.run_id})
+            except Exception as e:
+                stopped.append({"profile_name": name, "error": str(e)})
+    return jsonify({"ok": True, "stopped": stopped, "count": len(stopped)})
+
+
 # ──────────────────────────────────────────────────────────────
 # API: COMPETITORS
 # ──────────────────────────────────────────────────────────────
@@ -309,14 +786,41 @@ def api_runs():
 
 
 def get_run_status_dict():
+    """
+    Legacy shape — expected by the sidebar's run-status widget.
+    Returns state of the single "sidebar-default" run if the sidebar
+    Start button was used. When multiple profiles are running, returns
+    the most recent one.
+
+    New code should call /api/runs/active for a full list.
+    """
+    active = RUNNER_POOL.active_runs()
+    if not active:
+        # Return a sane "idle" shape. Fields are present so the sidebar
+        # can render "Finished (code N)" text from the last known slot.
+        all_slots = RUNNER_POOL.all_slots()
+        last = all_slots[-1] if all_slots else None
+        return {
+            "is_running":     False,
+            "current_run_id": last["run_id"] if last else None,
+            "profile_name":   last["profile_name"] if last else None,
+            "started_at":     last["started_at"] if last else None,
+            "finished_at":    last["finished_at"] if last else None,
+            "last_exit_code": last["last_exit_code"] if last else None,
+            "last_error":     last["last_error"] if last else None,
+            "active_count":   0,
+        }
+    # Most recently started run (biggest run_id)
+    latest = max(active, key=lambda s: s["run_id"])
     return {
-        "is_running":     RUNNER.is_running,
-        "current_run_id": RUNNER.current_run_id,
-        "profile_name":   RUNNER.profile_name,
-        "started_at":     RUNNER.started_at,
-        "finished_at":    RUNNER.finished_at,
-        "last_exit_code": RUNNER.last_exit_code,
-        "last_error":     RUNNER.last_error,
+        "is_running":     True,
+        "current_run_id": latest["run_id"],
+        "profile_name":   latest["profile_name"],
+        "started_at":     latest["started_at"],
+        "finished_at":    latest["finished_at"],
+        "last_exit_code": latest["last_exit_code"],
+        "last_error":     latest["last_error"],
+        "active_count":   len(active),
     }
 
 
@@ -325,30 +829,76 @@ def api_run_status():
     return jsonify(get_run_status_dict())
 
 
-@app.route("/api/run", methods=["POST"])
-def api_run():
-    if RUNNER.is_running:
-        return jsonify({"error": "Monitor already запущен"}), 409
+@app.route("/api/runs/active", methods=["GET"])
+def api_runs_active():
+    """
+    All currently running slots — one entry per (run_id, profile).
+    Used by Profiles page to show Start↔Stop state per row, by the
+    sidebar "N running" counter, and by the new Groups page to gauge
+    capacity before spawning more.
+    """
+    return jsonify({
+        "runs":    RUNNER_POOL.active_runs(),
+        "count":   RUNNER_POOL.active_count(),
+    })
+
+
+def _spawn_run(profile_name: str) -> dict:
+    """
+    Shared launch path — used by /api/run (legacy default) and
+    /api/runs (explicit per-profile). Enforces:
+      - one-run-per-profile rule (prevents user-data-dir corruption)
+      - global max_parallel cap from config
+    Returns {"ok": True, "run_id": N} on success, or raises ValueError
+    with an HTTP-friendly message on cap violation.
+    """
+    if RUNNER_POOL.is_profile_running(profile_name):
+        raise ValueError(
+            f"Profile {profile_name!r} is already running — one run per "
+            f"profile at a time (they'd corrupt each other's user-data-dir)"
+        )
+
+    db = get_db()
+    max_parallel = int(db.config_get("runner.max_parallel", 4) or 4)
+    if RUNNER_POOL.active_count() >= max_parallel:
+        raise ValueError(
+            f"Concurrent-run cap reached ({max_parallel}). Stop one "
+            f"or raise runner.max_parallel in Settings."
+        )
+
+    # Effective proxy for THIS profile — respects per-profile overrides.
+    proxy_cfg = db.profile_effective_proxy(profile_name)
+    proxy_url = proxy_cfg["url"]
+
+    run_id = db.run_start(profile_name, proxy_url)
+    slot = RunnerSlot(run_id=run_id, profile_name=profile_name)
+    RUNNER_POOL.add(slot)
 
     def run_thread():
-        db = get_db()
-        profile_name = db.config_get("browser.profile_name", "profile_01")
-        proxy_url    = db.config_get("proxy.url", "")
-        run_id = db.run_start(profile_name, proxy_url)
-
-        RUNNER.is_running     = True
-        RUNNER.current_run_id = run_id
-        RUNNER.profile_name   = profile_name
-        RUNNER.started_at     = datetime.now().isoformat(timespec="seconds")
-        RUNNER.finished_at    = None
-        RUNNER.last_exit_code = None
-        RUNNER.last_error     = None
-
-        RUNNER.log(f"Overпуск #{run_id} мониторинга (profile: {profile_name})...", "info")
-
+        slot.log(
+            f"Overпуск #{run_id} мониторинга (profile: {profile_name})...",
+            "info",
+        )
+        # Fan out this log into the broadcast stream so the global SSE
+        # subscribers still see it.
+        RUNNER_POOL.broadcast_log({
+            "ts": datetime.now().strftime("%H:%M:%S"),
+            "level": "info",
+            "message": f"▶ #{run_id} {profile_name} — starting",
+            "run_id": run_id,
+            "profile_name": profile_name,
+        })
         try:
             env = os.environ.copy()
-            env["GHOST_SHELL_RUN_ID"] = str(run_id)
+            env["GHOST_SHELL_RUN_ID"]       = str(run_id)
+            # Tell main.py which profile to run — it used to read
+            # browser.profile_name from DB, but with multi-run we
+            # need to override per-subprocess.
+            env["GHOST_SHELL_PROFILE_NAME"] = profile_name
+            # Per-profile proxy override plumbed through env so main.py
+            # doesn't need to re-resolve effective config itself.
+            if proxy_url:
+                env["GHOST_SHELL_PROXY_URL"] = proxy_url
 
             proc = subprocess.Popen(
                 [sys.executable, "-u", "main.py"],
@@ -359,14 +909,9 @@ def api_run():
                 cwd=os.path.dirname(os.path.abspath(__file__)),
                 env=env,
             )
-            RUNNER.process = proc   # so /api/run/stop can terminate it
+            slot.process = proc
 
-            # ── Monitor chrome process tree ─────────────────────────────
-            # When the user closes the Chrome window manually, main.py can
-            # take 30+ seconds to notice (it's blocked on selenium calls that
-            # only error out on timeout). We proactively watch chrome.exe
-            # under our subprocess and kill main.py instantly when Chrome
-            # disappears — so the "Running" status reflects reality.
+            # Chrome-tree monitor — same logic as before, scoped to this slot.
             chrome_ever_seen = {"value": False}
             monitor_stop     = threading.Event()
 
@@ -390,12 +935,10 @@ def api_run():
                         chrome_ever_seen["value"] = True
                         no_chrome_seen_at = None
                     elif chrome_ever_seen["value"]:
-                        # Chrome was running, now it's gone — probably closed
-                        # by the user. Give it ~3s grace in case it's mid-restart.
                         if no_chrome_seen_at is None:
                             no_chrome_seen_at = time.time()
                         elif time.time() - no_chrome_seen_at > 3:
-                            RUNNER.log(
+                            slot.log(
                                 "Chrome window closed — stopping monitor",
                                 "warning")
                             try:
@@ -411,7 +954,7 @@ def api_run():
             mon_thread = threading.Thread(target=_chrome_monitor, daemon=True)
             mon_thread.start()
 
-            # ── stdout → UI log (blocking, but OK because we have monitor) ─
+            # Route stdout into this slot's log + broadcast
             try:
                 for line in proc.stdout:
                     line = line.rstrip()
@@ -420,99 +963,175 @@ def api_run():
                     lvl = "info"
                     if "ERROR" in line:   lvl = "error"
                     elif "WARN" in line:  lvl = "warning"
-                    RUNNER.log(line, lvl)
+                    slot.log(line, lvl)
+                    RUNNER_POOL.broadcast_log({
+                        "ts":      datetime.now().strftime("%H:%M:%S"),
+                        "level":   lvl,
+                        "message": line,
+                        "run_id":  run_id,
+                        "profile_name": profile_name,
+                    })
             except Exception as e:
-                RUNNER.log(f"stdout reader: {e}", "debug")
+                slot.log(f"stdout reader: {e}", "debug")
 
             monitor_stop.set()
             proc.wait()
-            RUNNER.last_exit_code = proc.returncode
+            exit_code = proc.returncode
 
-            # Podведение итогов for runs
-            total = db.events_summary(hours=24)  # грубо
+            total = db.events_summary(hours=24)
             db.run_finish(
                 run_id,
-                exit_code    = proc.returncode,
+                exit_code    = exit_code,
                 total_queries= total.get("search_ok", 0) + total.get("search_empty", 0),
                 total_ads    = total.get("search_ok", 0),
                 captchas     = total.get("captcha", 0),
             )
-            RUNNER.log(f"Monitor #{run_id} finished (code {proc.returncode})",
-                       "info" if proc.returncode == 0 else "error")
+            slot.log(
+                f"Monitor #{run_id} finished (code {exit_code})",
+                "info" if exit_code == 0 else "error",
+            )
+            RUNNER_POOL.mark_finished(run_id, exit_code=exit_code)
 
         except Exception as e:
-            RUNNER.last_error = str(e)
             db.run_finish(run_id, exit_code=-1, error=str(e))
-            RUNNER.log(f"Error запуска: {e}", "error")
+            slot.log(f"Error запуска: {e}", "error")
+            RUNNER_POOL.mark_finished(run_id, exit_code=-1, error=str(e))
         finally:
-            RUNNER.is_running  = False
-            RUNNER.finished_at = datetime.now().isoformat(timespec="seconds")
+            # Keep the slot around for 60s so the UI can read the final
+            # status, then GC.
+            def _gc():
+                time.sleep(60)
+                RUNNER_POOL.remove(run_id)
+            threading.Thread(target=_gc, daemon=True).start()
 
     t = threading.Thread(target=run_thread, daemon=True)
-    RUNNER.thread = t
+    slot.thread = t
     t.start()
 
-    return jsonify({"ok": True, "started_at": RUNNER.started_at})
+    return {"ok": True, "run_id": run_id, "profile_name": profile_name,
+            "started_at": slot.started_at}
 
 
-@app.route("/api/run/stop", methods=["POST"])
-def api_run_stop():
-    """Forcefully terminate the running monitor subprocess + its children.
+@app.route("/api/run", methods=["POST"])
+def api_run():
+    """Legacy endpoint — launches the default profile (or whatever
+    profile_name is in the POST body). Kept for the sidebar's "Run
+    default profile" button."""
+    payload = request.get_json(silent=True) or {}
+    profile_name = payload.get("profile_name") or \
+                   get_db().config_get("browser.profile_name", "profile_01")
+    try:
+        result = _spawn_run(profile_name)
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 409
+    return jsonify(result)
 
-    Uses psutil to walk the process tree (python.exe spawned main.py which
-    spawned chrome.exe — we need to kill them all, otherwise chrome stays
-    orphaned and the run never actually stops).
+
+@app.route("/api/runs", methods=["POST"])
+def api_runs_start():
     """
-    if not RUNNER.is_running or not RUNNER.process:
-        return jsonify({"error": "No run in progress"}), 409
+    Explicit multi-run endpoint — start a run for a named profile.
+    Body: {profile_name: "..."}
+    Returns 409 if that profile is already running or the concurrency
+    cap is hit.
+    """
+    payload = request.get_json(silent=True) or {}
+    profile_name = payload.get("profile_name")
+    if not profile_name:
+        return jsonify({"error": "profile_name required"}), 400
+    try:
+        result = _spawn_run(profile_name)
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 409
+    return jsonify(result)
+
+
+@app.route("/api/runs/<int:run_id>/stop", methods=["POST"])
+def api_runs_stop_specific(run_id: int):
+    """Stop one specific run by its run_id. Leaves other active runs alone."""
+    slot = RUNNER_POOL.get(run_id)
+    if not slot or not slot.is_running or not slot.process:
+        return jsonify({"error": "Run not found or not active"}), 409
 
     try:
         import psutil
-        parent_pid = RUNNER.process.pid
-        RUNNER.log(f"Stop requested — killing process tree of PID {parent_pid}", "warning")
+        parent_pid = slot.process.pid
+        slot.log(
+            f"Stop requested — killing process tree of PID {parent_pid}",
+            "warning",
+        )
 
         killed = []
         try:
             parent = psutil.Process(parent_pid)
-            # Kill children first (chrome.exe, crashpad_handler.exe, ...)
             for child in parent.children(recursive=True):
                 try:
                     child.kill()
                     killed.append(f"{child.name()}({child.pid})")
                 except psutil.NoSuchProcess:
                     pass
-            # Then the parent python
             parent.kill()
             killed.append(f"{parent.name()}({parent.pid})")
         except psutil.NoSuchProcess:
             pass
 
-        # Wait briefly so the run-watcher thread notices and marks finished_at
+        try: slot.process.wait(timeout=5)
+        except Exception: pass
+
         try:
-            RUNNER.process.wait(timeout=5)
-        except Exception:
-            pass
+            get_db()._get_conn().execute("""
+                UPDATE runs
+                SET finished_at = ?, exit_code = -99,
+                    error = COALESCE(error, 'stopped by user')
+                WHERE id = ? AND finished_at IS NULL
+            """, (datetime.now().isoformat(timespec="seconds"), run_id))
+        except Exception as e:
+            logging.error(f"mark-failed on stop: {e}")
 
-        # Force-mark the run as failed in DB just in case the watcher didn't
-        if RUNNER.current_run_id:
-            try:
-                get_db()._get_conn().execute("""
-                    UPDATE runs
-                    SET finished_at = ?, exit_code = -99,
-                        error = COALESCE(error, 'stopped by user')
-                    WHERE id = ? AND finished_at IS NULL
-                """, (datetime.now().isoformat(timespec="seconds"),
-                      RUNNER.current_run_id))
-            except Exception as e:
-                logging.error(f"mark-failed on stop: {e}")
-
-        RUNNER.is_running  = False
-        RUNNER.finished_at = datetime.now().isoformat(timespec="seconds")
-        RUNNER.log(f"Killed: {', '.join(killed) if killed else '(nothing)'}", "warning")
-
+        RUNNER_POOL.mark_finished(run_id, exit_code=-99,
+                                   error="stopped by user")
+        slot.log(
+            f"Killed: {', '.join(killed) if killed else '(nothing)'}",
+            "warning",
+        )
         return jsonify({"ok": True, "killed": killed})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/run/stop", methods=["POST"])
+def api_run_stop():
+    """Legacy stop — stops the *most recent* active run. Kept so the
+    old sidebar Stop button still works. Use /api/runs/<id>/stop to
+    target a specific run."""
+    active = RUNNER_POOL.active_runs()
+    if not active:
+        return jsonify({"error": "No run in progress"}), 409
+    latest = max(active, key=lambda s: s["run_id"])
+    return api_runs_stop_specific(latest["run_id"])
+
+
+@app.route("/api/runs/stop-all", methods=["POST"])
+def api_runs_stop_all():
+    """Kill every active run. Used by the "Stop all" sidebar button."""
+    active = RUNNER_POOL.active_runs()
+    results = []
+    for run in active:
+        try:
+            resp = api_runs_stop_specific(run["run_id"])
+            results.append({
+                "run_id": run["run_id"],
+                "profile_name": run["profile_name"],
+                "ok": True,
+            })
+        except Exception as e:
+            results.append({
+                "run_id": run["run_id"],
+                "profile_name": run["profile_name"],
+                "ok": False,
+                "error": str(e),
+            })
+    return jsonify({"ok": True, "results": results, "count": len(results)})
 
 
 @app.route("/api/runs/<int:run_id>/mark-failed", methods=["POST"])
@@ -671,13 +1290,17 @@ def api_scheduler_status():
 
 @app.route("/api/logs/live")
 def api_logs_live():
-    """SSE live logs stream"""
+    """SSE live logs stream — merged across all active runs.
+
+    Each entry includes run_id and profile_name so the Logs page can
+    tag/filter lines by which run they came from.
+    """
     def generate():
         last_heartbeat = time.time()
         try:
             while True:
                 try:
-                    entry = RUNNER.log_queue.get(timeout=1)
+                    entry = RUNNER_POOL.broadcast_queue.get(timeout=1)
                     yield f"data: {json.dumps(entry, ensure_ascii=False)}\n\n"
                     last_heartbeat = time.time()
                 except queue.Empty:
@@ -687,7 +1310,6 @@ def api_logs_live():
                         last_heartbeat = time.time()
                     continue
         except GeneratorExit:
-            # Client disconnected — normal, not an error
             return
 
     return Response(generate(), mimetype="text/event-stream", headers={

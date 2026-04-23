@@ -480,11 +480,62 @@ const ScriptsPage = {
                     ${ph}>${escapeHtml(text)}</textarea>
         </div>`;
     }
+    if (p.type === "textarea") {
+      // Multi-line text (code blocks, long descriptions). Stored as-is.
+      const text = (val === undefined || val === null) ? "" : String(val);
+      const rows = Math.max(4, Math.min(12, text.split("\n").length + 1));
+      const hint = p.hint
+        ? `<div class="param-hint">${escapeHtml(p.hint)}</div>`
+        : "";
+      return `
+        <div class="param-row param-row-full">
+          <label class="param-label">${label}</label>
+          <textarea class="textarea param-input" rows="${rows}"
+                    data-param="${name}" data-param-type="textarea"
+                    style="font-family: var(--font-mono, monospace); font-size: 12px;"
+                    ${ph}>${escapeHtml(text)}</textarea>
+          ${hint}
+        </div>`;
+    }
+    if (p.type === "json") {
+      // Arbitrary JSON — stored as a parsed object/array. Pretty-printed
+      // for display; re-parsed on save. Used by fill_form.fields, or any
+      // other action that takes a structured payload.
+      let text;
+      if (val === undefined || val === null || val === "") {
+        text = "";
+      } else if (typeof val === "string") {
+        // Already stringified — try to pretty-print, fall through on failure
+        try { text = JSON.stringify(JSON.parse(val), null, 2); }
+        catch { text = val; }
+      } else {
+        text = JSON.stringify(val, null, 2);
+      }
+      const rows = Math.max(4, Math.min(14, (text.split("\n").length || 1) + 1));
+      const hint = p.hint
+        ? `<div class="param-hint">${escapeHtml(p.hint)}</div>`
+        : "";
+      return `
+        <div class="param-row param-row-full">
+          <label class="param-label">${label}</label>
+          <textarea class="textarea param-input" rows="${rows}"
+                    data-param="${name}" data-param-type="json"
+                    style="font-family: var(--font-mono, monospace); font-size: 12px;"
+                    ${ph}>${escapeHtml(text)}</textarea>
+          ${hint}
+        </div>`;
+    }
+    // Default — single-line text input. Also the renderer for `required`
+    // text params. Hint shows under the input if present.
+    const hint = p.hint
+      ? `<div class="param-hint">${escapeHtml(p.hint)}</div>`
+      : "";
     return `
       <div class="param-row">
         <label class="param-label">${label}</label>
         <input type="text" class="input param-input" data-param="${name}"
                ${ph} value="${val !== undefined && val !== null ? escapeHtml(String(val)) : ""}">
+        ${hint}
       </div>`;
   },
 
@@ -555,6 +606,26 @@ const ScriptsPage = {
         .map(s => s.trim())
         .filter(Boolean);
       val = lines.length ? lines : null;
+    } else if (ptype === "json") {
+      // User-entered JSON — parse back to a structured value.
+      // On parse error, keep the RAW string and flag the field visually
+      // so they see what's wrong rather than silently losing their edit.
+      const raw = (input.value || "").trim();
+      if (!raw) {
+        val = null;
+      } else {
+        try {
+          val = JSON.parse(raw);
+          input.classList.remove("param-json-err");
+        } catch (e) {
+          // Keep the broken string so the user can fix it; mark the field red
+          val = raw;
+          input.classList.add("param-json-err");
+          input.title = `JSON parse error: ${e.message}`;
+        }
+      }
+    } else if (ptype === "textarea") {
+      val = input.value || null;
     } else {
       val = input.value;
     }
@@ -613,9 +684,44 @@ const ScriptsPage = {
       sel.innerHTML = `<option disabled>No compatible actions</option>`;
       return;
     }
-    sel.innerHTML = eligible.map(a =>
-      `<option value="${escapeHtml(a.type)}">${escapeHtml(a.label)}</option>`
-    ).join("");
+
+    // Group by category for readability — the raw list is 20+ actions
+    // now with generic-automation additions. Legacy entries without
+    // a category fall into "general".
+    const byCategory = {};
+    for (const a of eligible) {
+      const cat = a.category || "general";
+      (byCategory[cat] ||= []).push(a);
+    }
+
+    // Display order — put commonly-used categories first, generic
+    // (no-category) last so newcomers see the high-level verbs on top.
+    const CATEGORY_ORDER = [
+      "navigation", "input", "flow", "data", "power", "general",
+    ];
+    const CATEGORY_LABELS = {
+      "navigation": "🌐 Navigation",
+      "input":      "⌨️  Input",
+      "flow":       "⏱ Flow control",
+      "data":       "📊 Data capture",
+      "power":      "⚡ Power tools",
+      "general":    "General",
+    };
+    const cats = Object.keys(byCategory).sort((a, b) => {
+      const ai = CATEGORY_ORDER.indexOf(a); const bi = CATEGORY_ORDER.indexOf(b);
+      return (ai === -1 ? 999 : ai) - (bi === -1 ? 999 : bi);
+    });
+
+    sel.innerHTML = cats.map(cat => {
+      const opts = byCategory[cat].map(a =>
+        `<option value="${escapeHtml(a.type)}">${escapeHtml(a.label)}</option>`
+      ).join("");
+      const label = CATEGORY_LABELS[cat] || cat;
+      // If only one group, skip the optgroup wrapper — avoids clutter
+      return cats.length === 1
+        ? opts
+        : `<optgroup label="${escapeHtml(label)}">${opts}</optgroup>`;
+    }).join("");
   },
 
   /**
@@ -800,6 +906,33 @@ const ScriptsPage = {
           ${hint}
         </div>`;
     }
+    if (p.type === "textarea") {
+      const def = (p.default === undefined || p.default === null) ? "" : String(p.default);
+      return `
+        <div class="form-group">
+          <label class="form-label">${label}${p.required ? " *" : ""}</label>
+          <textarea class="textarea" rows="6" ${scope}="${name}" ${ph}
+                    style="font-family: var(--font-mono, monospace); font-size: 12px;"
+                    >${escapeHtml(def)}</textarea>
+          ${hint}
+        </div>`;
+    }
+    if (p.type === "json") {
+      let def = "";
+      if (p.default !== undefined && p.default !== null && p.default !== "") {
+        def = typeof p.default === "string"
+          ? p.default
+          : JSON.stringify(p.default, null, 2);
+      }
+      return `
+        <div class="form-group">
+          <label class="form-label">${label}${p.required ? " *" : ""}</label>
+          <textarea class="textarea" rows="6" ${scope}="${name}" ${ph}
+                    style="font-family: var(--font-mono, monospace); font-size: 12px;"
+                    >${escapeHtml(def)}</textarea>
+          ${hint}
+        </div>`;
+    }
     return `
       <div class="form-group">
         <label class="form-label">${label}${p.required ? " *" : ""}</label>
@@ -830,6 +963,22 @@ const ScriptsPage = {
           const lines = String(inp.value || "")
             .split("\n").map(s => s.trim()).filter(Boolean);
           val = lines.length ? lines : null;
+        } else if (pmeta?.type === "json") {
+          // Parse JSON blob; blank = null, bad JSON = surface error
+          const raw = (inp.value || "").trim();
+          if (!raw) {
+            val = null;
+          } else {
+            try {
+              val = JSON.parse(raw);
+            } catch (e) {
+              throw new Error(
+                `Field "${pmeta.label || pmeta.name}" has invalid JSON: ${e.message}`
+              );
+            }
+          }
+        } else if (pmeta?.type === "textarea") {
+          val = inp.value || null;
         } else if (pmeta?.type === "steps") {
           val = [];   // nested steps start empty, added via the loop UI
         } else {

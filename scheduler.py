@@ -45,6 +45,15 @@ from db import get_db
 # ──────────────────────────────────────────────────────────────
 # Logging
 # ──────────────────────────────────────────────────────────────
+#
+# Same Windows cp1252 stdout quirk as main.py — force UTF-8 so emoji
+# and Cyrillic don't crash StreamHandler. See main.py comment block
+# for details.
+try:
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+except (AttributeError, Exception):
+    pass
 
 logging.basicConfig(
     level=logging.INFO,
@@ -73,6 +82,14 @@ def load_cfg():
         "profile_names":    db.config_get("scheduler.profile_names") or [],
         "selection_mode":   db.config_get("scheduler.selection_mode") or "random",
         "default_profile":  db.config_get("browser.profile_name") or "profile_01",
+        # Group-based trigger — when set, the scheduler launches the
+        # group's members as a concurrent batch instead of picking one
+        # profile at a time. Takes precedence over profile_names.
+        "group_id":         db.config_get("scheduler.group_id"),
+        # Whether a group launch should wait for ALL members to finish
+        # before counting the "iteration" done (serial group) or just
+        # fire-and-forget (parallel group, default).
+        "group_mode":       db.config_get("scheduler.group_mode") or "parallel",
     }
 
 
@@ -130,16 +147,45 @@ def consecutive_failures() -> int:
 _round_robin_idx = 0
 
 def pick_profile(cfg: dict) -> str:
-    """Return the next profile name to run."""
+    """Single-profile picker — kept for back-compat with any older code
+    paths. New iterations use pick_batch() so they can spawn a group
+    at once. If a group_id is set, returns the group's *first* member
+    to keep callers returning strings."""
+    names = pick_batch(cfg)
+    return names[0] if names else cfg["default_profile"]
+
+
+def pick_batch(cfg: dict) -> list:
+    """Return the list of profile names to run in the next iteration.
+
+    Priority:
+      1. scheduler.group_id (if set) — returns ALL members of the group,
+         so the iteration spawns a concurrent batch
+      2. scheduler.profile_names — picks ONE using selection_mode
+      3. Falls back to browser.profile_name default — ONE profile
+    """
     global _round_robin_idx
+
+    # Group-based triggering
+    group_id = cfg.get("group_id")
+    if group_id:
+        try:
+            g = get_db().group_get(int(group_id))
+            if g and g.get("members"):
+                return list(g["members"])
+        except Exception as e:
+            logging.warning(
+                f"Failed to resolve group {group_id} → falling back to profile_names: {e}"
+            )
+
     pool = cfg["profile_names"]
     if not pool:
-        return cfg["default_profile"]
+        return [cfg["default_profile"]]
     if cfg["selection_mode"] == "round-robin":
         name = pool[_round_robin_idx % len(pool)]
         _round_robin_idx += 1
-        return name
-    return random.choice(pool)
+        return [name]
+    return [random.choice(pool)]
 
 
 # ──────────────────────────────────────────────────────────────
@@ -218,11 +264,14 @@ def sleep_interruptible(seconds: float):
 # ──────────────────────────────────────────────────────────────
 
 def run_one_iteration(profile_name: str) -> tuple:
-    """Launch main.py with GHOST_SHELL_PROFILE env var so the worker picks it up."""
+    """Launch main.py with the GHOST_SHELL_PROFILE_NAME env var so the
+    worker picks it up. Kept GHOST_SHELL_PROFILE as a fallback alias for
+    older workers."""
     started = time.time()
 
     env = os.environ.copy()
-    env["GHOST_SHELL_PROFILE"] = profile_name
+    env["GHOST_SHELL_PROFILE_NAME"] = profile_name
+    env["GHOST_SHELL_PROFILE"]      = profile_name   # legacy alias
 
     try:
         result = subprocess.run(
@@ -298,24 +347,72 @@ def main():
                 sleep_interruptible(pause)
                 continue
 
-            profile = pick_profile(cfg)
+            # A batch is 1 profile in the simple case, or N profiles if
+            # scheduler.group_id is set. We spawn each member as its own
+            # subprocess and optionally wait for them depending on
+            # group_mode ("parallel" = fire-and-forget, "serial" = sequential).
+            batch = pick_batch(cfg)
             run_num = done_today + 1
 
             logging.info("")
             logging.info(
                 f"▶ Run {run_num}/{cfg['target_runs']} at "
-                f"{datetime.now().strftime('%H:%M:%S')} — profile: {profile}"
+                f"{datetime.now().strftime('%H:%M:%S')} — "
+                f"{'batch' if len(batch) > 1 else 'profile'}: "
+                f"{batch[0] if len(batch) == 1 else str(len(batch)) + ' profiles'}"
             )
-            heartbeat({"last_run_profile": profile})
+            heartbeat({"last_run_profile": batch[0] if batch else ""})
 
-            exit_code, duration = run_one_iteration(profile)
-            if exit_code == 0:
-                logging.info(f"✓ Run #{run_num} ok ({duration:.0f}s)")
+            if len(batch) == 1:
+                # Single-profile path — unchanged from the old loop
+                exit_code, duration = run_one_iteration(batch[0])
+                if exit_code == 0:
+                    logging.info(f"✓ Run #{run_num} ok ({duration:.0f}s)")
+                else:
+                    logging.error(
+                        f"✗ Run #{run_num} failed "
+                        f"(exit={exit_code}, {duration:.0f}s)"
+                    )
             else:
-                logging.error(
-                    f"✗ Run #{run_num} failed "
-                    f"(exit={exit_code}, {duration:.0f}s)"
-                )
+                # Batch path — spawn all, wait (or not) depending on mode.
+                # NOTE: each member runs in its own process, so total RAM
+                # scales linearly. The group's max_parallel cap is NOT
+                # enforced here (scheduler bypasses the dashboard's
+                # RUNNER_POOL because it runs in a separate process) —
+                # user sets group size responsibly.
+                if cfg["group_mode"] == "serial":
+                    for name in batch:
+                        if _shutdown:
+                            break
+                        ec, dur = run_one_iteration(name)
+                        logging.info(f"  • {name}: exit={ec} ({dur:.0f}s)")
+                else:
+                    # Parallel — start all then wait for them to finish together
+                    procs = []
+                    for name in batch:
+                        env = os.environ.copy()
+                        env["GHOST_SHELL_PROFILE_NAME"] = name
+                        try:
+                            p = subprocess.Popen(
+                                [sys.executable, "-u", "main.py"],
+                                cwd=os.path.dirname(os.path.abspath(__file__)),
+                                env=env,
+                            )
+                            procs.append((name, p))
+                            logging.info(f"  ▶ spawned {name} (pid {p.pid})")
+                        except Exception as e:
+                            logging.error(f"  ✗ {name}: spawn failed — {e}")
+
+                    # Wait — with a generous timeout per process
+                    for name, p in procs:
+                        try:
+                            rc = p.wait(timeout=30 * 60)
+                            logging.info(f"  • {name}: exit={rc}")
+                        except subprocess.TimeoutExpired:
+                            logging.error(f"  ✗ {name}: timed out, killing")
+                            try: p.kill()
+                            except Exception: pass
+                logging.info(f"✓ Batch #{run_num} done ({len(batch)} profiles)")
 
             if _shutdown:
                 break

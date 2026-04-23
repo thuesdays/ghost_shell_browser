@@ -167,6 +167,58 @@ CREATE TABLE IF NOT EXISTS meta (
     key   TEXT PRIMARY KEY,
     value TEXT NOT NULL
 );
+
+-- ───────────────────────────────────────────────────────────────
+-- Profile metadata. The filesystem folder profiles/<name>/ still
+-- owns the Chrome user-data-dir and session files; this table
+-- tracks _dashboard-level_ state: tags, per-profile proxy override,
+-- group membership, notes.
+--
+-- A profile exists in this table as soon as the user customises it
+-- away from defaults. Profiles that only live on disk are still
+-- listed by profiles_list() as "implicit" — those use global
+-- config values until the user overrides something.
+-- ───────────────────────────────────────────────────────────────
+CREATE TABLE IF NOT EXISTS profiles (
+    name         TEXT PRIMARY KEY,
+    tags         TEXT,             -- JSON array of strings
+    proxy_url    TEXT,             -- overrides global proxy.url when set
+    proxy_is_rotating    INTEGER,  -- 1 / 0 / NULL = inherit global
+    rotation_api_url     TEXT,     -- per-profile rotation endpoint
+    rotation_provider    TEXT,
+    rotation_api_key     TEXT,
+    notes        TEXT,             -- free-form user notes
+    created_at   TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at   TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_profiles_updated ON profiles(updated_at);
+
+-- Profile groups — a named bag of profiles + shared settings
+-- (typically a group-wide script and scheduler entry). Deleting a
+-- group doesn't delete its profiles; profiles can belong to many
+-- groups through profile_group_members.
+CREATE TABLE IF NOT EXISTS profile_groups (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    name         TEXT NOT NULL UNIQUE,
+    description  TEXT,
+    -- Shared script/pipeline snapshot (JSON) applied when this group
+    -- is run as a batch. NULL means "use each profile's own pipelines".
+    script       TEXT,
+    -- Concurrency cap specific to this group (NULL = use global default)
+    max_parallel INTEGER,
+    created_at   TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at   TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE TABLE IF NOT EXISTS profile_group_members (
+    group_id    INTEGER NOT NULL,
+    profile_name TEXT   NOT NULL,
+    position    INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (group_id, profile_name),
+    FOREIGN KEY (group_id) REFERENCES profile_groups(id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_group_members_profile
+    ON profile_group_members(profile_name);
 """
 
 
@@ -251,6 +303,16 @@ DEFAULT_CONFIG = {
     "browser.block_social_widgets":     False,  # facebook.net, twitter/x embeds
     "browser.block_video_everywhere":   False,  # *.mp4, *.webm, *.m3u8 universally
     "browser.block_custom_patterns":    [],     # user-supplied URL patterns (CDP wildcard syntax)
+
+    # ── Runner pool ────────────────────────────────────────────
+    # Maximum number of profiles that can run simultaneously.
+    # Each running profile spawns a full Chrome instance plus a
+    # Python main.py subprocess, so this is a rough memory/CPU cap.
+    # 4 is safe on most desktops (8 GB RAM, 4 cores); scale up on
+    # beefier machines. UI shows a warning when the user is about
+    # to exceed this.
+    "runner.max_parallel":              4,
+    "runner.warn_at_parallel":          3,    # show amber UI warning at this count
     # Auto-rotate exit IP at start of each run. Forces a fresh TCP connection
     # to the rotating proxy so we get a new random Ukrainian IP each time.
     # Without this, subsequent runs in the same session can reuse the same IP
@@ -306,6 +368,12 @@ DEFAULT_CONFIG = {
     # Profiles to cycle through — empty = use browser.profile_name only
     "scheduler.profile_names":           [],
     "scheduler.selection_mode":          "random",   # random | round-robin
+    # Group-based trigger — if set, each scheduler iteration launches
+    # the whole group's members instead of picking one profile at a time.
+    # Takes precedence over profile_names. Leave null to use the old
+    # "pick one profile" flow.
+    "scheduler.group_id":                None,       # int | null
+    "scheduler.group_mode":              "parallel", # parallel | serial
     # Extra jitter % applied on top of the base random spacing (0..100)
     "scheduler.jitter_percent":          25,
 
@@ -346,16 +414,34 @@ class DB:
     def _init_schema(self):
         conn = self._get_conn()
         conn.executescript(SCHEMA_SQL)
-        # Проверяем is ли хоть одно поле configа — if no, заполняем defaults
+        # Check how full config is. On first init (empty), bulk-insert all
+        # defaults. On subsequent starts after an upgrade, only insert keys
+        # that are missing — so user customisations stay and new features
+        # get their default values.
         cursor = conn.execute("SELECT COUNT(*) FROM config_kv")
-        if cursor.fetchone()[0] == 0:
+        row_count = cursor.fetchone()[0]
+        now = datetime.now().isoformat(timespec="seconds")
+        if row_count == 0:
             logging.info("[DB] Config пуст — onменяем defaults")
-            now = datetime.now().isoformat(timespec="seconds")
             for key, value in DEFAULT_CONFIG.items():
                 conn.execute(
                     "INSERT INTO config_kv (key, value, updated_at) VALUES (?, ?, ?)",
                     (key, json.dumps(value, ensure_ascii=False), now)
                 )
+        else:
+            # Idempotent backfill — only adds keys that don't exist yet.
+            # INSERT OR IGNORE leaves existing rows alone so users keep
+            # their customised values through upgrades.
+            added = 0
+            for key, value in DEFAULT_CONFIG.items():
+                cur = conn.execute(
+                    "INSERT OR IGNORE INTO config_kv (key, value, updated_at) "
+                    "VALUES (?, ?, ?)",
+                    (key, json.dumps(value, ensure_ascii=False), now),
+                )
+                added += cur.rowcount
+            if added:
+                logging.info(f"[DB] Backfilled {added} new default config keys")
 
     # ──────────────────────────────────────────────────────────
     # CONFIG
@@ -1058,7 +1144,248 @@ class DB:
                     if last_run else None
                 ),
             })
+
+        # ── Enrichment pass: tags, proxy override, group membership ──
+        # Fetch all metadata in one query per table and merge by name.
+        # Profiles that only exist on disk / in runs still show up with
+        # empty tags and no proxy override (fall back to global config).
+        profile_meta_rows = conn.execute(
+            "SELECT * FROM profiles"
+        ).fetchall()
+        meta_by_name = {r["name"]: dict(r) for r in profile_meta_rows}
+
+        # Group membership — one row per (group, profile), collect group names
+        group_rows = conn.execute("""
+            SELECT m.profile_name, g.id AS group_id, g.name AS group_name
+              FROM profile_group_members m
+              JOIN profile_groups g ON g.id = m.group_id
+        """).fetchall()
+        groups_by_profile = {}
+        for r in group_rows:
+            groups_by_profile.setdefault(r["profile_name"], []).append({
+                "id":   r["group_id"],
+                "name": r["group_name"],
+            })
+
+        for row in result:
+            name = row["name"]
+            meta = meta_by_name.get(name, {})
+            tags_raw = meta.get("tags")
+            try:
+                row["tags"] = json.loads(tags_raw) if tags_raw else []
+            except Exception:
+                row["tags"] = []
+            row["proxy_url"]          = meta.get("proxy_url")
+            row["proxy_is_rotating"]  = meta.get("proxy_is_rotating")
+            row["rotation_api_url"]   = meta.get("rotation_api_url")
+            row["rotation_provider"]  = meta.get("rotation_provider")
+            row["notes"]              = meta.get("notes")
+            row["groups"]             = groups_by_profile.get(name, [])
+
         return result
+
+    # ──────────────────────────────────────────────────────────
+    # PROFILE METADATA — tags, per-profile proxy override, notes
+    # ──────────────────────────────────────────────────────────
+
+    def profile_meta_get(self, name: str) -> dict:
+        """Return the profiles row as a dict, or {} if no row exists yet.
+
+        Callers should use profile_effective_proxy() rather than reading
+        proxy_url directly — it handles the "inherit from global" case.
+        """
+        row = self._get_conn().execute(
+            "SELECT * FROM profiles WHERE name = ?", (name,)
+        ).fetchone()
+        if not row:
+            return {}
+        out = dict(row)
+        try:
+            out["tags"] = json.loads(out.get("tags") or "[]")
+        except Exception:
+            out["tags"] = []
+        return out
+
+    def profile_meta_upsert(self, name: str, **fields) -> None:
+        """Create-or-update a profiles row. Unknown columns are ignored
+        silently so callers don't have to care about schema drift.
+
+        Accepts: tags (list), proxy_url, proxy_is_rotating,
+        rotation_api_url, rotation_provider, rotation_api_key, notes.
+        """
+        allowed = {
+            "tags", "proxy_url", "proxy_is_rotating",
+            "rotation_api_url", "rotation_provider", "rotation_api_key",
+            "notes",
+        }
+        updates = {k: v for k, v in fields.items() if k in allowed}
+        if not updates:
+            return
+
+        if "tags" in updates and isinstance(updates["tags"], list):
+            updates["tags"] = json.dumps(updates["tags"], ensure_ascii=False)
+
+        conn = self._get_conn()
+        # INSERT OR IGNORE then UPDATE — sqlite3 < 3.24 doesn't support
+        # ON CONFLICT gracefully, and we need to keep created_at untouched.
+        conn.execute(
+            "INSERT OR IGNORE INTO profiles(name) VALUES(?)", (name,)
+        )
+        cols = ", ".join(f"{k} = ?" for k in updates)
+        vals = list(updates.values()) + [name]
+        conn.execute(
+            f"UPDATE profiles SET {cols}, updated_at = datetime('now') "
+            f"WHERE name = ?",
+            vals,
+        )
+        conn.commit()
+
+    def profile_meta_delete(self, name: str) -> None:
+        """Remove a profile's metadata row. Called when the whole
+        profile is being deleted — group memberships cascade via FK."""
+        conn = self._get_conn()
+        conn.execute("DELETE FROM profiles WHERE name = ?", (name,))
+        conn.execute(
+            "DELETE FROM profile_group_members WHERE profile_name = ?",
+            (name,),
+        )
+        conn.commit()
+
+    def profile_effective_proxy(self, name: str) -> dict:
+        """Return the proxy settings a run would actually use for this
+        profile. Per-profile overrides win over global config values.
+
+        Returns dict with keys: url, is_rotating, rotation_api_url,
+        rotation_provider, rotation_api_key.
+        """
+        meta = self.profile_meta_get(name)
+        def _pick(meta_key: str, cfg_key: str, default=None):
+            v = meta.get(meta_key)
+            if v is not None and v != "":
+                return v
+            cfg_v = self.config_get(cfg_key)
+            return cfg_v if cfg_v is not None else default
+
+        return {
+            "url":              _pick("proxy_url",        "proxy.url", ""),
+            "is_rotating":      bool(_pick("proxy_is_rotating", "proxy.is_rotating", True)),
+            "rotation_api_url": _pick("rotation_api_url", "proxy.rotation_api_url"),
+            "rotation_provider":_pick("rotation_provider","proxy.rotation_provider", "none"),
+            "rotation_api_key": _pick("rotation_api_key", "proxy.rotation_api_key"),
+        }
+
+    # ──────────────────────────────────────────────────────────
+    # PROFILE GROUPS
+    # ──────────────────────────────────────────────────────────
+
+    def group_list(self) -> list[dict]:
+        """All groups + profile-count per group. Ordered by most recently updated."""
+        conn = self._get_conn()
+        rows = conn.execute("""
+            SELECT g.id, g.name, g.description, g.script, g.max_parallel,
+                   g.created_at, g.updated_at,
+                   (SELECT COUNT(*) FROM profile_group_members m
+                     WHERE m.group_id = g.id) AS member_count
+              FROM profile_groups g
+          ORDER BY g.updated_at DESC
+        """).fetchall()
+        out = []
+        for r in rows:
+            item = dict(r)
+            try:
+                item["script"] = json.loads(item["script"]) if item["script"] else None
+            except Exception:
+                item["script"] = None
+            out.append(item)
+        return out
+
+    def group_get(self, group_id: int) -> Optional[dict]:
+        conn = self._get_conn()
+        row = conn.execute(
+            "SELECT * FROM profile_groups WHERE id = ?", (group_id,)
+        ).fetchone()
+        if not row:
+            return None
+        item = dict(row)
+        members = conn.execute("""
+            SELECT profile_name, position
+              FROM profile_group_members
+             WHERE group_id = ?
+          ORDER BY position, profile_name
+        """, (group_id,)).fetchall()
+        item["members"] = [r["profile_name"] for r in members]
+        try:
+            item["script"] = json.loads(item["script"]) if item["script"] else None
+        except Exception:
+            item["script"] = None
+        return item
+
+    def group_create(self, name: str, description: str = None,
+                     script: dict = None, max_parallel: int = None) -> int:
+        conn = self._get_conn()
+        script_json = json.dumps(script, ensure_ascii=False) if script else None
+        cur = conn.execute("""
+            INSERT INTO profile_groups(name, description, script, max_parallel)
+            VALUES(?, ?, ?, ?)
+        """, (name, description, script_json, max_parallel))
+        conn.commit()
+        return cur.lastrowid
+
+    def group_update(self, group_id: int, **fields) -> None:
+        allowed = {"name", "description", "script", "max_parallel"}
+        updates = {k: v for k, v in fields.items() if k in allowed}
+        if not updates: return
+        if "script" in updates and updates["script"] is not None \
+                               and not isinstance(updates["script"], str):
+            updates["script"] = json.dumps(updates["script"], ensure_ascii=False)
+        cols = ", ".join(f"{k} = ?" for k in updates)
+        vals = list(updates.values()) + [group_id]
+        conn = self._get_conn()
+        conn.execute(
+            f"UPDATE profile_groups SET {cols}, updated_at = datetime('now') "
+            f"WHERE id = ?",
+            vals,
+        )
+        conn.commit()
+
+    def group_delete(self, group_id: int) -> None:
+        conn = self._get_conn()
+        conn.execute("DELETE FROM profile_groups WHERE id = ?", (group_id,))
+        conn.commit()
+
+    def group_set_members(self, group_id: int, profile_names: list[str]) -> None:
+        """Replace the group's membership list wholesale."""
+        conn = self._get_conn()
+        conn.execute(
+            "DELETE FROM profile_group_members WHERE group_id = ?", (group_id,)
+        )
+        for i, name in enumerate(profile_names):
+            conn.execute("""
+                INSERT INTO profile_group_members(group_id, profile_name, position)
+                VALUES(?, ?, ?)
+            """, (group_id, name, i))
+        conn.execute(
+            "UPDATE profile_groups SET updated_at = datetime('now') WHERE id = ?",
+            (group_id,),
+        )
+        conn.commit()
+
+    def group_add_member(self, group_id: int, profile_name: str) -> None:
+        conn = self._get_conn()
+        conn.execute("""
+            INSERT OR IGNORE INTO profile_group_members(group_id, profile_name, position)
+            VALUES(?, ?, (SELECT COALESCE(MAX(position), -1) + 1
+                            FROM profile_group_members WHERE group_id = ?))
+        """, (group_id, profile_name, group_id))
+        conn.commit()
+
+    def group_remove_member(self, group_id: int, profile_name: str) -> None:
+        conn = self._get_conn()
+        conn.execute("""
+            DELETE FROM profile_group_members
+             WHERE group_id = ? AND profile_name = ?
+        """, (group_id, profile_name))
+        conn.commit()
 
     # ──────────────────────────────────────────────────────────
     # DAILY STATS

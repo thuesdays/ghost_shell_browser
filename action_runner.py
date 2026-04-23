@@ -61,6 +61,54 @@ Supported action types
   wait_for            Wait until a selector appears. Times out gracefully.
 
 ──────────────────────────────────────────────────────────────────
+Generic web automation (added for Facebook / Twitter / crypto /
+scraping / QA — not tied to Google Ads)
+──────────────────────────────────────────────────────────────────
+
+  open_url            Alias of `visit` with a clearer name. Supports
+                      {variable} substitution in the URL.
+
+  fill_form           Type into one field (`selector`+`value`) or many
+                      (`fields` JSON array). Human keystroke timing.
+
+  extract_text        Pull element.text or an attribute into
+                      ctx.vars[store_as]. Later steps reference it as
+                      {store_as}.
+
+  execute_js          Run arbitrary JS in the page context. Runs as a
+                      function body — use `return` to send a value back
+                      into ctx.vars[store_as]. Power tool; anti-bot
+                      defenses can fingerprint automated JS calls.
+
+  screenshot          Save a timestamped PNG to profiles/<n>/screenshots/.
+
+  wait_for_url        Block until the browser URL contains a substring
+                      (or matches a regex). Use after OAuth redirects,
+                      form submits, SPA route changes.
+
+──────────────────────────────────────────────────────────────────
+Variable substitution
+──────────────────────────────────────────────────────────────────
+
+  Every string param in an action flows through _subst(template, ctx),
+  which expands {var_name} placeholders. Variables come from three
+  sources, in precedence order:
+
+    1. ctx["vars"]    — written by extract_text / execute_js (store_as)
+    2. ctx top-level  — {ad}, {query}, {profile_name}, {item}, {index}
+    3. Literal match  — unknown {typo} is left as-is so errors are visible
+
+  Dotted paths walk nested dicts: {ad.clean_url}, {profile.tags.0}.
+
+  Example pipeline:
+
+    [
+      {"type": "open_url",     "url":      "https://shop.com/search?q=toys"},
+      {"type": "extract_text", "selector": ".product-title", "store_as": "first_title"},
+      {"type": "open_url",     "url":      "https://google.com/search?q={first_title}"}
+    ]
+
+──────────────────────────────────────────────────────────────────
 Usage
 ──────────────────────────────────────────────────────────────────
 
@@ -533,7 +581,236 @@ def _act_wait_for(driver, action: dict, ctx: dict):
 # DISPATCH TABLE + RUNNER
 # ──────────────────────────────────────────────────────────────
 
+# ──────────────────────────────────────────────────────────────
+# VARIABLE SUBSTITUTION
+#
+# Scripts can reference values collected during a run via {var_name}
+# placeholders in string parameters. For example:
+#
+#     {"type": "extract_text", "selector": "h1", "store_as": "title"}
+#     {"type": "visit",        "url": "https://google.com/search?q={title}"}
+#
+# The `ctx` dict is threaded through every action — we pull vars out of
+# ctx["vars"] and fall back to top-level ctx keys (so loop-scoped vars
+# like {item}/{index} still work without duplication).
+# ──────────────────────────────────────────────────────────────
+
+import re
+_VAR_PATTERN = re.compile(r"\{([a-zA-Z_][a-zA-Z0-9_.]*)\}")
+
+# Extra deps used by the generic-automation actions below.
+# Kept here (rather than at file top) to localize the diff; action_runner
+# already imports re, random, time — screenshot needs os+datetime.
+import os as _os_for_actions  # noqa: E402
+from datetime import datetime as _dt_for_actions  # noqa: E402
+# Alias so we don't shadow the top-level `datetime` module the rest of
+# the file might already import indirectly.
+os = _os_for_actions
+datetime = _dt_for_actions
+
+def _subst(template, ctx: dict):
+    """Expand {var_name} placeholders against ctx. Non-string inputs
+    are returned unchanged (caller shouldn't have to care about types).
+
+    Dotted paths (`ctx.ad.clean_url`) are resolved through nested dicts.
+    Missing vars are left as-is — gives a visible '{typo}' in logs
+    rather than silently producing empty strings.
+    """
+    if not isinstance(template, str):
+        return template
+
+    variables = dict(ctx or {})
+    # ctx["vars"] has priority over top-level ctx — explicit wins
+    if isinstance(variables.get("vars"), dict):
+        variables = {**variables, **variables["vars"]}
+
+    def _lookup(path: str):
+        # Dotted path: walk dicts
+        parts = path.split(".")
+        cur = variables
+        for p in parts:
+            if isinstance(cur, dict) and p in cur:
+                cur = cur[p]
+            else:
+                return None
+        return cur
+
+    def _replace(m):
+        val = _lookup(m.group(1))
+        return str(val) if val is not None else m.group(0)
+
+    return _VAR_PATTERN.sub(_replace, template)
+
+
+def _store_var(ctx: dict, name: str, value) -> None:
+    """Write an extracted value into the script's variable scope.
+    Always creates ctx['vars'] if missing — keeps action handlers
+    from having to check."""
+    if not name:
+        return
+    if not isinstance(ctx.get("vars"), dict):
+        ctx["vars"] = {}
+    ctx["vars"][name] = value
+
+
+# ──────────────────────────────────────────────────────────────
+# GENERIC WEB AUTOMATION ACTIONS
+#
+# These are the actions we hand to power-users building non-Google-Ads
+# scripts: Facebook multi-account, Twitter posting, crypto trading,
+# scraping, QA. Each handler does ONE thing and composes cleanly.
+# ──────────────────────────────────────────────────────────────
+
+def _act_open_url(driver, action: dict, ctx: dict):
+    """Navigate to a URL with optional variable substitution.
+    Alias of `visit` but with a clearer name for non-ads scripts."""
+    url = _subst(action.get("url", ""), ctx)
+    if not url:
+        log.warning("    open_url: no url given")
+        return
+    wait_sec = float(action.get("wait_after", 1.0))
+    log.info(f"    → open_url: {url}")
+    driver.get(url)
+    _random_sleep(wait_sec, wait_sec + 0.8)
+
+
+def _act_fill_form(driver, action: dict, ctx: dict):
+    """Type into one or more form fields. Accepts either:
+      {selector: "...", value: "..."}  — single field
+      {fields: [{selector, value, clear_first?}, ...]} — many
+    Values run through variable substitution, so {email} etc work.
+    """
+    fields = action.get("fields")
+    if fields is None and action.get("selector"):
+        fields = [{
+            "selector":    action["selector"],
+            "value":       action.get("value", ""),
+            "clear_first": action.get("clear_first", True),
+        }]
+
+    if not fields:
+        log.warning("    fill_form: no fields given")
+        return
+
+    for f in fields:
+        sel = f.get("selector")
+        val = _subst(f.get("value", ""), ctx)
+        if not sel:
+            continue
+        try:
+            el = driver.find_element(By.CSS_SELECTOR, sel)
+        except Exception:
+            log.warning(f"    fill_form: not found: {sel}")
+            continue
+        try:
+            if f.get("clear_first", True):
+                el.clear()
+            # Human-ish typing — small random delay per character
+            for ch in str(val):
+                el.send_keys(ch)
+                time.sleep(random.uniform(0.03, 0.12))
+            log.info(f"    → filled {sel} ({len(str(val))} chars)")
+        except Exception as e:
+            log.warning(f"    fill_form failed for {sel}: {e}")
+        _random_sleep(0.15, 0.45)
+
+
+def _act_extract_text(driver, action: dict, ctx: dict):
+    """Pull text from an element and store it in ctx['vars'][store_as].
+    Use `attribute` to pull an attribute instead of .text.
+    """
+    sel = action.get("selector")
+    store_as = action.get("store_as") or "last_extract"
+    attr = action.get("attribute")
+    if not sel:
+        log.warning("    extract_text: no selector")
+        return
+    try:
+        el = driver.find_element(By.CSS_SELECTOR, sel)
+    except Exception:
+        log.warning(f"    extract_text: not found: {sel}")
+        _store_var(ctx, store_as, None)
+        return
+
+    try:
+        value = el.get_attribute(attr) if attr else (el.text or "")
+        _store_var(ctx, store_as, value)
+        preview = (value or "")[:80].replace("\n", " ")
+        log.info(f"    → extract_text [{store_as}] = {preview!r}")
+    except Exception as e:
+        log.warning(f"    extract_text failed: {e}")
+        _store_var(ctx, store_as, None)
+
+
+def _act_execute_js(driver, action: dict, ctx: dict):
+    """Run arbitrary JavaScript. Supports variable substitution in the
+    code. Return value is stored in ctx['vars'][store_as] if set.
+    Power tool — use sparingly, and be aware that anti-bot defenses
+    can fingerprint automated JS execution."""
+    code = _subst(action.get("code") or "", ctx)
+    store_as = action.get("store_as")
+    if not code:
+        log.warning("    execute_js: no code given")
+        return
+    try:
+        result = driver.execute_script(code)
+        if store_as:
+            _store_var(ctx, store_as, result)
+        preview = str(result)[:80] if result is not None else "<no return>"
+        log.info(f"    → execute_js ok ({len(code)} chars) — {preview!r}")
+    except Exception as e:
+        log.warning(f"    execute_js failed: {e}")
+
+
+def _act_screenshot(driver, action: dict, ctx: dict):
+    """Save a screenshot to profiles/<n>/screenshots/<name>.png.
+    The filename gets a timestamp suffix automatically to avoid clobbering
+    prior shots."""
+    name = _subst(action.get("name") or "shot", ctx)
+    profile_dir = ctx.get("profile_dir") or "profiles/_shared"
+    shot_dir = os.path.join(profile_dir, "screenshots")
+    os.makedirs(shot_dir, exist_ok=True)
+    # Sanitize filename — strip path separators and weird chars
+    safe = re.sub(r"[^A-Za-z0-9_.-]", "_", name)[:60] or "shot"
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    path = os.path.join(shot_dir, f"{safe}_{ts}.png")
+    try:
+        driver.save_screenshot(path)
+        log.info(f"    → screenshot saved: {path}")
+        _store_var(ctx, "last_screenshot_path", path)
+    except Exception as e:
+        log.warning(f"    screenshot failed: {e}")
+
+
+def _act_wait_for_url(driver, action: dict, ctx: dict):
+    """Pause until the browser URL matches a substring or regex.
+    Useful after OAuth redirects, form submits, SPA route changes."""
+    target = _subst(action.get("contains") or action.get("regex") or "", ctx)
+    if not target:
+        log.warning("    wait_for_url: no pattern given")
+        return
+    timeout = float(action.get("timeout", 15.0))
+    use_regex = bool(action.get("regex"))
+
+    pattern = re.compile(target) if use_regex else None
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            cur = driver.current_url or ""
+        except Exception:
+            cur = ""
+        if use_regex and pattern.search(cur):
+            log.info(f"    → url matched: {cur}")
+            return
+        if not use_regex and target in cur:
+            log.info(f"    → url matched: {cur}")
+            return
+        time.sleep(0.4)
+    log.warning(f"    wait_for_url timed out after {timeout}s (wanted {target!r})")
+
+
 ACTION_HANDLERS: dict[str, Callable] = {
+    # Ads-specific (original catalog)
     "click_ad":           _act_click_ad,
     "click_selector":     _act_click_selector,
     "visit":              _act_visit,
@@ -551,6 +828,14 @@ ACTION_HANDLERS: dict[str, Callable] = {
     "close_tab":          _act_close_tab,
     "switch_tab":         _act_switch_tab,
     "wait_for":           _act_wait_for,
+
+    # Generic web automation (Feature #3) — Facebook, Twitter, crypto, etc.
+    "open_url":           _act_open_url,
+    "fill_form":          _act_fill_form,
+    "extract_text":       _act_extract_text,
+    "execute_js":         _act_execute_js,
+    "screenshot":         _act_screenshot,
+    "wait_for_url":       _act_wait_for_url,
 }
 
 
@@ -1323,6 +1608,141 @@ def _action_catalog_raw() -> list[dict]:
                          "hammer F5 — a 3-8s range looks organic."},
                 {"name": "delay_max_sec", "type": "number", "default": 8,
                  "label": "Max delay (s)"},
+            ],
+        },
+
+        # ─── Generic web automation (Feature #3) ────────────────
+        # These are the actions power-users build Facebook / Twitter /
+        # crypto / scraping scripts with. All string params support
+        # {var_name} substitution — see _subst() in this file.
+        {
+            "type":        "open_url",
+            "label":       "Open URL",
+            "category":    "navigation",
+            "scope":       "per_ad",
+            "description": "Navigate the browser to a URL. Supports "
+                           "{variable} substitution so you can chain "
+                           "extract_text → open_url.",
+            "params": [
+                {"name": "url", "type": "text", "required": True,
+                 "placeholder": "https://example.com/login",
+                 "hint": "Template string. Use {var} placeholders to "
+                         "reference values stored by extract_text."},
+                {"name": "wait_after", "type": "number", "default": 1.0,
+                 "label": "Wait after (s)",
+                 "hint": "Pause after navigation before the next step."},
+            ],
+        },
+        {
+            "type":        "fill_form",
+            "label":       "Fill form field(s)",
+            "category":    "input",
+            "scope":       "per_ad",
+            "description": "Type into one or more form fields with human-"
+                           "like keystroke timing. For multiple fields, use "
+                           "the `fields` array param (raw JSON).",
+            "params": [
+                {"name": "selector", "type": "text",
+                 "placeholder": "input[name='email']",
+                 "hint": "CSS selector for a single field. For multiple, "
+                         "leave empty and use `fields` below."},
+                {"name": "value", "type": "text",
+                 "placeholder": "{email}  or  any literal string",
+                 "hint": "Text to type. {variable} substitution supported."},
+                {"name": "clear_first", "type": "bool", "default": True,
+                 "label": "Clear field before typing"},
+                {"name": "fields", "type": "json",
+                 "label": "Multiple fields (JSON array)",
+                 "placeholder":
+                    '[{"selector":"#email","value":"{email}"},'
+                    '{"selector":"#pwd","value":"{password}"}]',
+                 "hint": "Alternative: array of {selector, value, "
+                         "clear_first} objects. Overrides the single-"
+                         "field params above when set."},
+            ],
+        },
+        {
+            "type":        "extract_text",
+            "label":       "Extract text / attribute",
+            "category":    "data",
+            "scope":       "per_ad",
+            "description": "Pull the text (or an attribute) of an element "
+                           "and store it in a variable. Later steps can "
+                           "reference it with {var_name}.",
+            "params": [
+                {"name": "selector", "type": "text", "required": True,
+                 "placeholder": "h1.product-title"},
+                {"name": "attribute", "type": "text",
+                 "placeholder": "href   (optional — default: element text)",
+                 "hint": "Leave empty to grab element.text. Common attrs: "
+                         "href, value, data-id, src."},
+                {"name": "store_as", "type": "text", "required": True,
+                 "default": "last_extract",
+                 "label": "Store as variable",
+                 "hint": "Name used to reference this value later, e.g. "
+                         "{title} in a subsequent fill_form or open_url."},
+            ],
+        },
+        {
+            "type":        "execute_js",
+            "label":       "Run JavaScript",
+            "category":    "power",
+            "scope":       "per_ad",
+            "description": "Execute arbitrary JS in the page context. "
+                           "Advanced — anti-bot systems can fingerprint "
+                           "automated JS calls, so use sparingly.",
+            "params": [
+                {"name": "code", "type": "textarea", "required": True,
+                 "placeholder":
+                    "// Return a value from the page\n"
+                    "return document.querySelector('.price').innerText;",
+                 "hint": "Runs as a function body — use `return` to send a "
+                         "value back. {var} substitution applies before "
+                         "execution, so you can interpolate values in."},
+                {"name": "store_as", "type": "text",
+                 "label": "Store return as",
+                 "hint": "If set, the JS return value goes into "
+                         "ctx.vars[store_as]. Omit to discard."},
+            ],
+        },
+        {
+            "type":        "screenshot",
+            "label":       "Take a screenshot",
+            "category":    "data",
+            "scope":       "per_ad",
+            "description": "Save a PNG of the current viewport into the "
+                           "profile's screenshots/ folder. Timestamped "
+                           "automatically so shots never overwrite.",
+            "params": [
+                {"name": "name", "type": "text", "default": "shot",
+                 "label": "Filename prefix",
+                 "placeholder": "login_success",
+                 "hint": "A timestamp is appended automatically. "
+                         "Supports {var} substitution — e.g. "
+                         "\"step1_{profile_name}\"."},
+            ],
+        },
+        {
+            "type":        "wait_for_url",
+            "label":       "Wait until URL matches",
+            "category":    "flow",
+            "scope":       "per_ad",
+            "description": "Block until the current URL contains a "
+                           "substring (or matches a regex). Essential "
+                           "after OAuth redirects or SPA route changes.",
+            "params": [
+                {"name": "contains", "type": "text",
+                 "placeholder": "/dashboard",
+                 "hint": "Substring match (simpler). Either this or "
+                         "`regex` must be set."},
+                {"name": "regex", "type": "text",
+                 "placeholder": r"/user/\d+/profile",
+                 "hint": "Regex alternative to `contains`. Takes "
+                         "precedence when both are given."},
+                {"name": "timeout", "type": "number", "default": 15.0,
+                 "label": "Timeout (s)",
+                 "hint": "Give up and log a warning after this many "
+                         "seconds. The script continues either way."},
             ],
         },
     ]

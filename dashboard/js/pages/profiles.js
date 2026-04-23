@@ -9,21 +9,26 @@
 const Profiles = {
   // Available columns (rendered in order)
   ALL_COLUMNS: [
-    { key: "name",        label: "Name",       default: true },
-    { key: "status",      label: "Status",     default: true },
-    { key: "template",    label: "Template",   default: true },
-    { key: "searches24h", label: "Searches 24h", default: true },
-    { key: "captchas24h", label: "Captchas 24h", default: true },
-    { key: "selfcheck",   label: "Self-check", default: true },
+    { key: "select",      label: "",           default: true  },   // checkbox
+    { key: "name",        label: "Name",       default: true  },
+    { key: "status",      label: "Status",     default: true  },
+    { key: "tags",        label: "Tags",       default: true  },
+    { key: "template",    label: "Template",   default: true  },
+    { key: "proxy",       label: "Proxy",      default: false },
+    { key: "searches24h", label: "Searches 24h", default: true  },
+    { key: "captchas24h", label: "Captchas 24h", default: true  },
+    { key: "selfcheck",   label: "Self-check", default: true  },
     { key: "fingerprint", label: "Fingerprint", default: false },
     { key: "languages",   label: "Languages",  default: false },
-    { key: "lastRun",     label: "Last run",   default: true },
-    { key: "actions",     label: "Actions",    default: true },
+    { key: "lastRun",     label: "Last run",   default: true  },
+    { key: "actions",     label: "Actions",    default: true  },
   ],
 
   visibleColumns: null,
-  allProfiles: [],
-  searchFilter: "",
+  allProfiles:   [],
+  searchFilter:  "",
+  tagFilter:     null,     // if set, only rows containing this tag show
+  selectedNames: new Set(),   // multi-selection for bulk actions
 
   async init() {
     // Load visible columns preference from localStorage
@@ -51,6 +56,33 @@ const Profiles = {
       this.searchFilter = e.target.value.toLowerCase();
       this.renderTable();
     });
+
+    // Tag-filter clear button
+    const clearTagBtn = $("#btn-clear-tag-filter");
+    if (clearTagBtn) {
+      clearTagBtn.addEventListener("click", () => this.clearTagFilter());
+    }
+
+    // Bulk toolbar buttons
+    $("#btn-bulk-clear")?.addEventListener("click",  () => this.clearSelection());
+    $("#btn-bulk-start")?.addEventListener("click",  () => this.bulkStart());
+    $("#btn-bulk-stop")?.addEventListener("click",   () => this.bulkStop());
+    $("#btn-bulk-delete")?.addEventListener("click", () => this.bulkDelete());
+    $("#btn-bulk-tag")?.addEventListener("click",    () => this.bulkTag());
+    $("#btn-bulk-group")?.addEventListener("click",  () => this.bulkAddToGroup());
+
+    // Tag editor modal wiring — shared between single-row edit and
+    // bulk-tag-add. All modal close buttons use data-close="tag-editor-modal".
+    document.querySelectorAll('[data-close="tag-editor-modal"]').forEach(el => {
+      el.addEventListener("click", () => this._closeTagEditor());
+    });
+    $("#tag-editor-add-btn")?.addEventListener("click",
+      () => this._tagEditorAdd());
+    $("#tag-editor-input")?.addEventListener("keydown", (e) => {
+      if (e.key === "Enter") { e.preventDefault(); this._tagEditorAdd(); }
+    });
+    $("#tag-editor-save-btn")?.addEventListener("click",
+      () => this._tagEditorSave());
 
     this.renderColumnPicker();
     await this.reload();
@@ -108,38 +140,146 @@ const Profiles = {
   renderTable() {
     const visibleCols = this.ALL_COLUMNS.filter(c => this.visibleColumns.includes(c.key));
 
-    // Head
+    // Head — select column gets a "select all" checkbox instead of label
     const thead = $("#profiles-thead");
-    thead.innerHTML = "<tr>" +
-      visibleCols.map(c => `<th>${escapeHtml(c.label)}</th>`).join("") +
-      "</tr>";
+    thead.innerHTML = "<tr>" + visibleCols.map(c => {
+      if (c.key === "select") {
+        // Indeterminate when SOME but not ALL visible are selected
+        return `<th style="width:28px">
+          <input type="checkbox" id="profiles-select-all">
+        </th>`;
+      }
+      return `<th>${escapeHtml(c.label)}</th>`;
+    }).join("") + "</tr>";
 
-    // Rows
-    const filtered = this.allProfiles.filter(p =>
-      !this.searchFilter || p.name.toLowerCase().includes(this.searchFilter)
-    );
+    // Rows — search + tag filter
+    const filtered = this.allProfiles.filter(p => {
+      if (this.searchFilter && !p.name.toLowerCase().includes(this.searchFilter)) {
+        return false;
+      }
+      if (this.tagFilter) {
+        const tags = Array.isArray(p.tags) ? p.tags : [];
+        if (!tags.map(t => t.toLowerCase()).includes(this.tagFilter.toLowerCase())) {
+          return false;
+        }
+      }
+      return true;
+    });
 
     const tbody = $("#profiles-tbody");
     if (!filtered.length) {
       tbody.innerHTML = `<tr><td colspan="${visibleCols.length}" class="empty-state">
         No profiles found
       </td></tr>`;
+      this._updateBulkBar();
+      this._updateSelectAllState();
       return;
     }
 
     tbody.innerHTML = filtered.map(p => "<tr>" +
       visibleCols.map(c => `<td>${this.renderCell(p, c.key)}</td>`).join("") +
       "</tr>").join("");
+
+    // Wire row-level checkboxes — change event flips selectedNames
+    // and triggers bulk-bar visibility + header select-all state refresh.
+    tbody.querySelectorAll(".profile-select-cb").forEach(cb => {
+      cb.addEventListener("change", (e) => {
+        const name = e.target.dataset.name;
+        if (e.target.checked) this.selectedNames.add(name);
+        else                  this.selectedNames.delete(name);
+        this._updateBulkBar();
+        this._updateSelectAllState();
+      });
+    });
+
+    // Header "select all visible" — toggles every currently-rendered row
+    const selectAll = $("#profiles-select-all");
+    if (selectAll) {
+      selectAll.addEventListener("change", (e) => {
+        const visibleNames = filtered.map(p => p.name);
+        if (e.target.checked) {
+          visibleNames.forEach(n => this.selectedNames.add(n));
+        } else {
+          visibleNames.forEach(n => this.selectedNames.delete(n));
+        }
+        this.renderTable();     // re-render to sync checkboxes
+      });
+    }
+
+    this._updateBulkBar();
+    this._updateSelectAllState();
+  },
+
+  /** Sync the header checkbox's state to the currently-rendered rows.
+   *  Three states: none / all / indeterminate (some). */
+  _updateSelectAllState() {
+    const cb = $("#profiles-select-all");
+    if (!cb) return;
+    const visibleNames = this.allProfiles
+      .filter(p =>
+        (!this.searchFilter || p.name.toLowerCase().includes(this.searchFilter))
+        && (!this.tagFilter
+            || (p.tags || []).map(t => t.toLowerCase()).includes(this.tagFilter.toLowerCase()))
+      )
+      .map(p => p.name);
+    const chosen = visibleNames.filter(n => this.selectedNames.has(n));
+    cb.checked       = chosen.length > 0 && chosen.length === visibleNames.length;
+    cb.indeterminate = chosen.length > 0 && chosen.length <  visibleNames.length;
+  },
+
+  /** Show/hide the bulk action bar based on how many profiles are selected. */
+  _updateBulkBar() {
+    const bar = $("#bulk-bar");
+    const cnt = $("#bulk-selected-count");
+    if (!bar || !cnt) return;
+    const n = this.selectedNames.size;
+    bar.style.display = n > 0 ? "" : "none";
+    cnt.textContent = String(n);
   },
 
   renderCell(p, key) {
     switch (key) {
+      case "select": {
+        const checked = this.selectedNames.has(p.name) ? "checked" : "";
+        return `<input type="checkbox" class="profile-select-cb"
+                       data-name="${escapeHtml(p.name)}" ${checked}>`;
+      }
       case "name":
         return `<strong>${escapeHtml(p.name)}</strong>`;
       case "status":
         return `<span class="pill pill-${p.status}">${p.status}</span>`;
+      case "tags": {
+        const tags = Array.isArray(p.tags) ? p.tags : [];
+        if (!tags.length) {
+          return `<span class="tag-add-inline"
+                        onclick="Profiles.openTagEditor('${escapeHtml(p.name)}')">
+            + add tags
+          </span>`;
+        }
+        const visible = tags.slice(0, 3).map(t =>
+          `<span class="profile-tag-chip"
+                 onclick="event.stopPropagation(); Profiles.filterByTag('${escapeHtml(t)}')">
+             ${escapeHtml(t)}
+           </span>`
+        ).join("");
+        const more = tags.length > 3
+          ? `<span class="profile-tag-more">+${tags.length - 3}</span>`
+          : "";
+        return `<span class="profile-tags"
+                      onclick="Profiles.openTagEditor('${escapeHtml(p.name)}')">
+          ${visible}${more}
+        </span>`;
+      }
       case "template":
         return `<span class="muted">${escapeHtml(p.fingerprint?.template || "—")}</span>`;
+      case "proxy": {
+        const url = p.proxy_url;
+        if (!url) return `<span class="muted">global</span>`;
+        // Show first 30 chars of the proxy URL so users can distinguish
+        // different endpoints at a glance without leaking the whole token
+        const short = url.length > 30 ? url.slice(0, 27) + "…" : url;
+        return `<code class="proxy-cell" title="${escapeHtml(url)}">${escapeHtml(short)}</code>`;
+      }
       case "searches24h":
         return p.searches_24h ?? 0;
       case "captchas24h":
@@ -158,9 +298,8 @@ const Profiles = {
             : "—"}</span>`;
       case "lastRun": {
         if (!p.last_run_at) return `<span class="muted">never</span>`;
-        // If this profile is the one currently running, show live marker
-        const running = this._runStatus?.is_running
-                        && this._runStatus?.profile_name === p.name;
+        // If this profile is one of the currently-running slots, show live marker
+        const running = this._runningProfiles?.has(p.name);
         if (running) {
           return `<span class="run-status-live">
             <span class="run-dot"></span> running now
@@ -174,38 +313,26 @@ const Profiles = {
         </span>`;
       }
       case "actions": {
-        // If a run is in progress AND it's for THIS profile, show Stop
-        // instead of Start. The runStatus cache is refreshed by
-        // runner.js every 3s — we just read it here.
-        const running = !!(this._runStatus && this._runStatus.is_running);
-        const runningThis = running && this._runStatus.profile_name === p.name;
+        // Multi-run: each profile is its own slot. Show Stop if THIS
+        // profile is running; Start otherwise. No disabling based on
+        // other runs — the backend enforces the concurrency cap.
+        const runningThis = this._runningProfiles?.has(p.name);
         const isDefault = this._defaultProfileName === p.name;
 
-        // Show a subtle marker if this is the default profile
         const defaultMark = isDefault
           ? `<span class="profile-default-star"
                    title="Default profile — the sidebar Start button launches this">★</span>`
           : "";
 
-        let mainBtn;
-        if (runningThis) {
-          mainBtn = `<button class="profile-row-btn stop"
-                             onclick="Profiles.stopThis('${escapeHtml(p.name)}')">
-                       ■ Stop
-                     </button>`;
-        } else if (running) {
-          // Another profile is running. Disable start on this row —
-          // the runner is single-slot.
-          mainBtn = `<button class="profile-row-btn start" disabled
-                             title="Another profile (${escapeHtml(this._runStatus.profile_name || '?')}) is running. Stop it first.">
-                       ▶ Start
-                     </button>`;
-        } else {
-          mainBtn = `<button class="profile-row-btn start"
-                             onclick="Profiles.startProfile('${escapeHtml(p.name)}')">
-                       ▶ Start
-                     </button>`;
-        }
+        const mainBtn = runningThis
+          ? `<button class="profile-row-btn stop"
+                     onclick="Profiles.stopThis('${escapeHtml(p.name)}')">
+               ■ Stop
+             </button>`
+          : `<button class="profile-row-btn start"
+                     onclick="Profiles.startProfile('${escapeHtml(p.name)}')">
+               ▶ Start
+             </button>`;
 
         return `
           <div class="profile-row-actions">
@@ -222,16 +349,17 @@ const Profiles = {
   },
 
   async startProfile(name) {
-    // First set as active in config, then start
+    // Multi-run world: each row spawns its own slot via /api/runs with
+    // an explicit profile_name. We DO NOT mutate browser.profile_name
+    // anymore — that's the "sidebar default", and changing it just
+    // because the user clicked a row Start button would surprise them.
     try {
-      configCache.browser = configCache.browser || {};
-      configCache.browser.profile_name = name;
-      await api("/api/config", {
+      await api("/api/runs", {
         method: "POST",
-        body: JSON.stringify(configCache),
+        body:   JSON.stringify({ profile_name: name }),
       });
-      await startRun();
-      // Immediately bump status — don't wait for the 3s poll tick so
+      toast(`✓ Started "${name}"`);
+      // Immediately bump status — don't wait for the 2s poll tick so
       // the user sees the Start button flip to Stop right away.
       setTimeout(() => this.refreshRunStatus(), 500);
     } catch (e) {
@@ -240,9 +368,22 @@ const Profiles = {
   },
 
   async stopThis(name) {
-    // Use the shared stopRun() — it has the confirm dialog + kill logic.
-    await stopRun();
-    setTimeout(() => this.refreshRunStatus(), 500);
+    // Find the specific run for this profile and stop only that one —
+    // legacy stopRun() targets the most-recent active slot, which may
+    // not be what the user clicked on when multiple profiles are active.
+    try {
+      const active = await api("/api/runs/active");
+      const slot = (active.runs || []).find(r => r.profile_name === name);
+      if (!slot) {
+        toast("Not running anymore");
+        setTimeout(() => this.refreshRunStatus(), 300);
+        return;
+      }
+      await stopSpecificRun(slot.run_id, name);
+      setTimeout(() => this.refreshRunStatus(), 500);
+    } catch (e) {
+      toast("Error: " + e.message, true);
+    }
   },
 
   /** Pull the latest run status + default profile name, then re-render
@@ -250,15 +391,26 @@ const Profiles = {
    *  timer while the user is looking at the Profiles page. */
   async refreshRunStatus() {
     try {
-      const status = await api("/api/run/status");
-      this._runStatus = status;
-      // Default profile is read from the already-cached config — no need
-      // to hit the backend every 2s. setActive() below mutates the cache
-      // in place, so this stays in sync with UI actions.
-      this._defaultProfileName = configCache?.browser?.profile_name || null;
-      // Light refresh — only rebuild if there's a meaningful change,
-      // to avoid flashing the table every 3s.
-      const snapshot = `${status.is_running}|${status.profile_name}|${this._defaultProfileName}`;
+      // Multi-run aware: we need the full list of currently-active
+      // profiles, not just "most recent". Each row checks membership
+      // in this set.
+      const [active] = await Promise.all([
+        api("/api/runs/active"),
+      ]);
+      const runs = active.runs || [];
+      this._activeRuns          = runs;
+      this._runningProfiles     = new Set(runs.map(r => r.profile_name));
+      this._runningProfileToId  = {};
+      runs.forEach(r => this._runningProfileToId[r.profile_name] = r.run_id);
+      this._defaultProfileName  = configCache?.browser?.profile_name || null;
+
+      // Rebuild only when something meaningful changed — avoid flashing
+      // the table every 2s.
+      const snapshot = [
+        runs.length,
+        runs.map(r => `${r.profile_name}#${r.run_id}`).sort().join(","),
+        this._defaultProfileName,
+      ].join("|");
       if (snapshot !== this._lastStatusSnapshot) {
         this._lastStatusSnapshot = snapshot;
         this.renderTable();
@@ -346,6 +498,287 @@ const Profiles = {
     try {
       await api(`/api/profiles/${encodeURIComponent(name)}`, { method: "DELETE" });
       toast(`✓ Deleted "${name}"`);
+      await this.reload();
+    } catch (e) {
+      toast("Error: " + e.message, true);
+    }
+  },
+
+  // ─── BULK ACTIONS ───────────────────────────────────────────
+
+  clearSelection() {
+    this.selectedNames.clear();
+    this.renderTable();
+  },
+
+  /** Start every selected profile. Backend enforces max_parallel —
+   *  we just send requests in parallel and let it reject overflows. */
+  async bulkStart() {
+    const names = Array.from(this.selectedNames);
+    if (!names.length) return;
+
+    // Warn if starting more than the configured comfort threshold
+    const warnAt = Number(getByPath(configCache, "runner.warn_at_parallel") || 3);
+    if (names.length > warnAt) {
+      const ok = await confirmDialog({
+        title: "Lots of runs",
+        message:
+          `You're about to start ${names.length} Chrome instances. ` +
+          `Each uses roughly 500 MB–1 GB RAM + a CPU core. ` +
+          `Backend cap is runner.max_parallel (overflow will be rejected).\n\n` +
+          `Continue?`,
+        confirmText: "Start all",
+      });
+      if (!ok) return;
+    }
+
+    // Fire requests in parallel — collect outcomes for the toast summary.
+    const results = await Promise.allSettled(names.map(n =>
+      api("/api/runs", {
+        method: "POST",
+        body:   JSON.stringify({ profile_name: n }),
+      })
+    ));
+    const ok  = results.filter(r => r.status === "fulfilled").length;
+    const err = results.length - ok;
+    toast(err
+      ? `Started ${ok}/${results.length} — ${err} rejected (cap or already running)`
+      : `✓ Started ${ok} run${ok === 1 ? "" : "s"}`,
+      err > 0
+    );
+    setTimeout(() => this.refreshRunStatus(), 600);
+  },
+
+  async bulkStop() {
+    const names = Array.from(this.selectedNames);
+    if (!names.length) return;
+    // Find active run_ids matching these profiles
+    try {
+      const active = await api("/api/runs/active");
+      const toStop = (active.runs || []).filter(r => names.includes(r.profile_name));
+      if (!toStop.length) {
+        toast("None of the selected profiles are currently running");
+        return;
+      }
+      await Promise.allSettled(toStop.map(r =>
+        api(`/api/runs/${r.run_id}/stop`, { method: "POST" })
+      ));
+      toast(`✓ Stopped ${toStop.length} run${toStop.length === 1 ? "" : "s"}`);
+      setTimeout(() => this.refreshRunStatus(), 600);
+    } catch (e) {
+      toast("Error: " + e.message, true);
+    }
+  },
+
+  async bulkDelete() {
+    const names = Array.from(this.selectedNames);
+    if (!names.length) return;
+    const ok = await confirmDialog({
+      title: `Delete ${names.length} profile${names.length === 1 ? "" : "s"}`,
+      message:
+        `This removes folders on disk AND purges DB records for ` +
+        `events, fingerprints, self-checks.\n\n` +
+        names.slice(0, 10).join(", ") +
+        (names.length > 10 ? `, … +${names.length - 10} more` : "") +
+        `\n\nRun history is kept. This cannot be undone.`,
+      confirmText:  "Delete all",
+      confirmStyle: "danger",
+    });
+    if (!ok) return;
+    const results = await Promise.allSettled(names.map(n =>
+      api(`/api/profiles/${encodeURIComponent(n)}`, { method: "DELETE" })
+    ));
+    const done = results.filter(r => r.status === "fulfilled").length;
+    toast(`✓ Deleted ${done}/${names.length}`, done < names.length);
+    this.selectedNames.clear();
+    await this.reload();
+  },
+
+  /** Open the tag editor seeded with tags from the first selected
+   *  profile, or (if selection is empty) from the given name. On save,
+   *  new tags are APPENDED to every selected profile — i.e. bulk-tag
+   *  means "add these tags to everyone", not "replace". */
+  async bulkTag() {
+    const names = Array.from(this.selectedNames);
+    if (!names.length) return;
+    this._openTagEditorBulk(names);
+  },
+
+  async bulkAddToGroup() {
+    const names = Array.from(this.selectedNames);
+    if (!names.length) return;
+
+    // Load groups list, show a picker modal
+    let groups;
+    try {
+      groups = await api("/api/groups");
+    } catch (e) {
+      toast("Failed to load groups: " + e.message, true);
+      return;
+    }
+
+    if (!groups.length) {
+      const createNow = await confirmDialog({
+        title: "No groups yet",
+        message: "You haven't created any profile groups. Go to the Groups page to create one?",
+        confirmText: "Open Groups",
+      });
+      if (createNow) navigate("groups");
+      return;
+    }
+
+    // Simple prompt-style picker — one group at a time
+    const groupList = groups.map((g, i) =>
+      `${i + 1}. ${g.name} (${g.member_count} member${g.member_count === 1 ? "" : "s"})`
+    ).join("\n");
+    const pick = prompt(
+      `Add ${names.length} profile${names.length === 1 ? "" : "s"} to which group?\n\n${groupList}\n\nEnter group number:`
+    );
+    if (!pick) return;
+    const idx = parseInt(pick, 10) - 1;
+    if (isNaN(idx) || idx < 0 || idx >= groups.length) {
+      toast("Invalid selection", true);
+      return;
+    }
+    const group = groups[idx];
+
+    // Merge existing members + new names
+    try {
+      const full = await api(`/api/groups/${group.id}`);
+      const merged = Array.from(new Set([...(full.members || []), ...names]));
+      await api(`/api/groups/${group.id}`, {
+        method: "POST",
+        body:   JSON.stringify({ members: merged }),
+      });
+      toast(`✓ Added ${names.length} to "${group.name}"`);
+      this.selectedNames.clear();
+      await this.reload();
+    } catch (e) {
+      toast("Error: " + e.message, true);
+    }
+  },
+
+  // ─── TAG FILTER ─────────────────────────────────────────────
+
+  filterByTag(tag) {
+    this.tagFilter = tag;
+    const el = $("#profiles-tag-filter");
+    if (el) {
+      el.style.display = "";
+      $("#active-tag-label").textContent = tag;
+    }
+    this.renderTable();
+  },
+
+  clearTagFilter() {
+    this.tagFilter = null;
+    const el = $("#profiles-tag-filter");
+    if (el) el.style.display = "none";
+    this.renderTable();
+  },
+
+  // ─── TAG EDITOR MODAL ───────────────────────────────────────
+  // Two modes:
+  //  a) single-profile edit — seeded with that profile's tags,
+  //     save REPLACES the list.
+  //  b) bulk edit — starts empty, save APPENDS to each selected.
+
+  openTagEditor(name) {
+    const profile = this.allProfiles.find(p => p.name === name);
+    if (!profile) return;
+    this._tagEditorMode      = "single";
+    this._tagEditorTargets   = [name];
+    this._tagEditorWorkingSet = new Set(profile.tags || []);
+    $("#tag-editor-profile-name").textContent = name;
+    this._renderTagEditorChips();
+    $("#tag-editor-input").value = "";
+    $("#tag-editor-modal").style.display = "flex";
+    setTimeout(() => $("#tag-editor-input").focus(), 50);
+  },
+
+  _openTagEditorBulk(names) {
+    this._tagEditorMode      = "bulk";
+    this._tagEditorTargets   = names.slice();
+    this._tagEditorWorkingSet = new Set();
+    $("#tag-editor-profile-name").textContent =
+      `${names.length} profile${names.length === 1 ? "" : "s"} (bulk-append)`;
+    this._renderTagEditorChips();
+    $("#tag-editor-input").value = "";
+    $("#tag-editor-modal").style.display = "flex";
+    setTimeout(() => $("#tag-editor-input").focus(), 50);
+  },
+
+  _closeTagEditor() {
+    const m = $("#tag-editor-modal");
+    if (m) m.style.display = "none";
+  },
+
+  _renderTagEditorChips() {
+    const container = $("#tag-editor-chips");
+    if (!container) return;
+    const tags = Array.from(this._tagEditorWorkingSet || []);
+    if (!tags.length) {
+      container.innerHTML = `<span class="muted" style="font-size: 12px;">
+        No tags yet — add some below.
+      </span>`;
+      return;
+    }
+    container.innerHTML = tags.map(t => `
+      <span class="profile-tag-chip editor">
+        ${escapeHtml(t)}
+        <span class="profile-tag-chip-x" data-tag="${escapeHtml(t)}">×</span>
+      </span>
+    `).join("");
+    container.querySelectorAll(".profile-tag-chip-x").forEach(x => {
+      x.addEventListener("click", (e) => {
+        this._tagEditorWorkingSet.delete(e.target.dataset.tag);
+        this._renderTagEditorChips();
+      });
+    });
+  },
+
+  _tagEditorAdd() {
+    const inp = $("#tag-editor-input");
+    const raw = (inp?.value || "").trim();
+    if (!raw) return;
+    // Allow comma-separated batch: "a, b, c"
+    raw.split(",").forEach(t => {
+      const clean = t.trim();
+      if (clean) this._tagEditorWorkingSet.add(clean);
+    });
+    inp.value = "";
+    this._renderTagEditorChips();
+  },
+
+  async _tagEditorSave() {
+    const tags = Array.from(this._tagEditorWorkingSet || []);
+    const targets = this._tagEditorTargets || [];
+    if (!targets.length) {
+      this._closeTagEditor();
+      return;
+    }
+
+    try {
+      if (this._tagEditorMode === "single") {
+        // Single-profile edit — REPLACE tag list
+        await api(`/api/profiles/${encodeURIComponent(targets[0])}/tags`, {
+          method: "POST",
+          body:   JSON.stringify({ tags }),
+        });
+      } else {
+        // Bulk edit — APPEND to existing tags on each profile.
+        // Do this sequentially to avoid racing the upserts.
+        for (const name of targets) {
+          const existing = (this.allProfiles.find(p => p.name === name)?.tags) || [];
+          const merged = Array.from(new Set([...existing, ...tags]));
+          await api(`/api/profiles/${encodeURIComponent(name)}/tags`, {
+            method: "POST",
+            body:   JSON.stringify({ tags: merged }),
+          });
+        }
+      }
+      toast(`✓ Saved tags for ${targets.length} profile${targets.length === 1 ? "" : "s"}`);
+      this._closeTagEditor();
       await this.reload();
     } catch (e) {
       toast("Error: " + e.message, true);

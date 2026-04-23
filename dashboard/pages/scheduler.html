@@ -64,6 +64,41 @@
     </div>
   </div>
 
+  <!-- Group trigger (overrides "Profiles to cycle through" when set) -->
+  <div class="card">
+    <div class="card-title">Run as group (optional)</div>
+    <div class="form-hint" style="margin-bottom: 12px;">
+      Launch a whole Profile Group at once per iteration, instead of
+      cycling through profiles one at a time. Useful for "run all 20
+      Facebook profiles every 3 hours" style campaigns.
+      <br><br>
+      <strong>When set, this overrides the "Profiles to cycle through"
+      list above.</strong> Leave empty for the old single-profile-per-iteration
+      behavior.
+    </div>
+    <div class="input-row">
+      <div class="form-group">
+        <label class="form-label">Group to run</label>
+        <select class="select" id="sched-group-select"
+                data-config="scheduler.group_id">
+          <option value="">— none (cycle profiles instead) —</option>
+          <!-- populated by JS with groups list -->
+        </select>
+      </div>
+      <div class="form-group">
+        <label class="form-label">Launch mode</label>
+        <select class="select" data-config="scheduler.group_mode">
+          <option value="parallel">Parallel — spawn all at once, wait together</option>
+          <option value="serial">Serial — run one by one</option>
+        </select>
+        <div class="form-hint">
+          Parallel fires all N Chrome instances simultaneously —
+          faster but needs N× RAM. Serial is gentler on resources.
+        </div>
+      </div>
+    </div>
+  </div>
+
   <!-- Schedule settings -->
   <div class="card">
     <div class="card-title">Schedule</div>

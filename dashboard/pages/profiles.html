@@ -20,16 +20,81 @@
     <div class="profiles-toolbar">
       <input type="text" class="profiles-search" id="profiles-search"
              placeholder="Search profile name…">
+      <div class="profiles-tag-filter" id="profiles-tag-filter" style="display:none">
+        Filter: <span class="profile-tag-chip active" id="active-tag-label">—</span>
+        <button class="btn-tag-clear" id="btn-clear-tag-filter">✕</button>
+      </div>
       <div style="margin-left: auto; color: var(--text-muted); font-size: 12px;">
         <span id="profiles-count">0</span> profile(s)
       </div>
     </div>
+
+    <!-- Bulk action bar — shown only when ≥1 profile is checked. -->
+    <div class="bulk-bar" id="bulk-bar" style="display:none">
+      <div class="bulk-bar-info">
+        <span id="bulk-selected-count">0</span> selected
+        <button class="btn-link" id="btn-bulk-clear">clear</button>
+      </div>
+      <div class="bulk-bar-actions">
+        <button class="btn btn-primary" id="btn-bulk-start">
+          ▶ Start selected
+        </button>
+        <button class="btn btn-secondary" id="btn-bulk-stop">
+          ■ Stop selected
+        </button>
+        <button class="btn btn-secondary" id="btn-bulk-tag">
+          🏷 Tag…
+        </button>
+        <button class="btn btn-secondary" id="btn-bulk-group">
+          📁 Add to group…
+        </button>
+        <button class="btn btn-secondary" id="btn-bulk-delete" style="color: var(--critical)">
+          🗑 Delete
+        </button>
+      </div>
+    </div>
+
     <table>
       <thead id="profiles-thead"></thead>
       <tbody id="profiles-tbody"></tbody>
     </table>
   </div>
 </section>
+
+<!-- ─── TAG EDITOR MODAL ─────────────────────────────────────── -->
+<div class="profile-modal" id="tag-editor-modal" style="display: none;">
+  <div class="profile-modal-backdrop" data-close="tag-editor-modal"></div>
+  <div class="profile-modal-content" style="max-width: 480px;">
+    <div class="profile-modal-header">
+      <div class="profile-modal-title">🏷 Edit tags — <span id="tag-editor-profile-name">?</span></div>
+      <button class="profile-modal-close" data-close="tag-editor-modal">×</button>
+    </div>
+    <div class="profile-modal-body">
+      <div class="form-group">
+        <label class="form-label">Current tags</label>
+        <div class="tag-editor-chips" id="tag-editor-chips">
+          <!-- populated by JS -->
+        </div>
+      </div>
+      <div class="form-group">
+        <label class="form-label">Add a tag</label>
+        <div style="display: flex; gap: 8px;">
+          <input type="text" class="input" id="tag-editor-input"
+                 placeholder="e.g. facebook-ads, us-east, test">
+          <button class="btn btn-primary" id="tag-editor-add-btn">+ Add</button>
+        </div>
+        <div class="form-hint">
+          Tags are lowercase, free-form labels. Use them to filter profiles,
+          select for bulk actions, or group campaigns.
+        </div>
+      </div>
+    </div>
+    <div class="profile-modal-footer">
+      <button class="btn btn-secondary" data-close="tag-editor-modal">Close</button>
+      <button class="btn btn-primary" id="tag-editor-save-btn">Save tags</button>
+    </div>
+  </div>
+</div>
 
 <!-- ─── CREATE PROFILE MODAL ──────────────────────────────────── -->
 <div class="profile-modal" id="profile-create-modal" style="display: none;">

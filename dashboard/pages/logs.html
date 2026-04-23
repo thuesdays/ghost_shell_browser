@@ -8,11 +8,30 @@
         <div class="page-subtitle" id="logs-subtitle">Running monitor output (SSE)</div>
       </div>
     </div>
-    <div style="display: flex; gap: 8px;">
+    <div style="display: flex; gap: 8px; flex-wrap: wrap; align-items: center;">
+      <!-- Filter controls — multi-run aware -->
+      <select class="select" id="logs-filter-profile" style="min-width: 160px;">
+        <option value="">All profiles</option>
+        <!-- populated by JS with unique profile names seen in the buffer -->
+      </select>
+      <select class="select" id="logs-filter-level" style="min-width: 120px;">
+        <option value="">All levels</option>
+        <option value="info">Info</option>
+        <option value="warning">Warning</option>
+        <option value="error">Error</option>
+      </select>
+      <input type="text" class="input" id="logs-filter-text"
+             placeholder="grep text…" style="min-width: 160px; max-width: 220px;">
       <button class="btn btn-secondary" id="switch-to-live-btn"
               style="display:none;">● Switch to live</button>
       <button class="btn btn-secondary" id="clear-logs-btn">Clear</button>
     </div>
+  </div>
+
+  <!-- Selected-filter chip strip — shown when filters are active -->
+  <div class="logs-filter-summary" id="logs-filter-summary" style="display:none;">
+    Filtering: <span id="logs-filter-chips"></span>
+    <button class="btn-link" id="logs-filter-reset">reset filters</button>
   </div>
 
   <div class="card">

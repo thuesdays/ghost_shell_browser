@@ -5,6 +5,7 @@
 const PAGES = {
   overview:    { html: "/pages/overview.html",    init: () => Overview.init() },
   profiles:    { html: "/pages/profiles.html",    init: () => Profiles.init(),    teardown: () => Profiles.teardown?.() },
+  groups:      { html: "/pages/groups.html",      init: () => Groups.init(),      teardown: () => Groups.teardown?.() },
   // "Domains" page (was "Search") — queries + my-domains + target-domains
   domains:     { html: "/pages/domains.html",     init: () => Domains.init() },
   proxy:       { html: "/pages/proxy.html",       init: () => ProxyPage.init() },
@@ -15,7 +16,7 @@ const PAGES = {
   scripts:     { html: "/pages/scripts.html",     init: () => ScriptsPage.init() },
   runs:        { html: "/pages/runs.html",        init: () => Runs.init() },
   scheduler:   { html: "/pages/scheduler.html",   init: () => Scheduler.init() },
-  logs:        { html: "/pages/logs.html",        init: () => Logs.init() },
+  logs:        { html: "/pages/logs.html",        init: () => Logs.init(),        teardown: () => Logs.teardown?.() },
   settings:    { html: "/pages/settings.html",    init: () => Settings.init() },
 
   // Legacy aliases — redirect old bookmarks to new page names.

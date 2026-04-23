@@ -58,20 +58,73 @@ SEARCH_QUERIES       = CFG.get("search.queries")
 MY_DOMAINS           = CFG.get("search.my_domains", [])
 TARGET_DOMAINS       = CFG.get("search.target_domains", [])
 
-# Proxy selection — pool with random pick or single URL
+# ──────────────────────────────────────────────────────────────
+# PROFILE RESOLUTION — figure out which profile we're running for
+# ──────────────────────────────────────────────────────────────
+PROFILE_NAME         = (
+    os.environ.get("GHOST_SHELL_PROFILE_NAME")   # new canonical name (set by dashboard_server pool)
+    or os.environ.get("GHOST_SHELL_PROFILE")     # legacy alias — kept so manual CLI launches still work
+    or CFG.get("browser.profile_name")
+)
+
+# ──────────────────────────────────────────────────────────────
+# PROXY SELECTION — priority order:
+#   1. GHOST_SHELL_PROXY_URL env (dashboard pool per-run override)
+#   2. Per-profile proxy override in the profiles table
+#   3. Global proxy.use_pool + random pick from proxy.pool_urls
+#   4. Global proxy.url (single endpoint)
+# This matches the effective-proxy logic in db.profile_effective_proxy()
+# so behavior is consistent whether run from dashboard or CLI.
+# ──────────────────────────────────────────────────────────────
 PROXY_USE_POOL       = CFG.get("proxy.use_pool", False)
 PROXY_POOL_URLS      = CFG.get("proxy.pool_urls", []) or []
 PROXY_SINGLE         = CFG.get("proxy.url", "")
 
-if PROXY_USE_POOL and PROXY_POOL_URLS:
+_env_proxy = os.environ.get("GHOST_SHELL_PROXY_URL", "").strip()
+_profile_proxy = None
+if PROFILE_NAME:
+    try:
+        _meta = DB.profile_meta_get(PROFILE_NAME)
+        _profile_proxy = (_meta.get("proxy_url") or "").strip() or None
+    except Exception:
+        _profile_proxy = None
+
+if _env_proxy:
+    PROXY = _env_proxy
+    logging.info(f"[main] Proxy from GHOST_SHELL_PROXY_URL env: {PROXY[:50]}...")
+elif _profile_proxy:
+    PROXY = _profile_proxy
+    logging.info(f"[main] Proxy from profile override: {PROXY[:50]}...")
+elif PROXY_USE_POOL and PROXY_POOL_URLS:
     PROXY = random.choice([p for p in PROXY_POOL_URLS if p.strip()])
     logging.info(f"[main] Picked random proxy from pool: {PROXY[:50]}...")
 else:
     PROXY = PROXY_SINGLE
 
-PROFILE_NAME         = os.environ.get("GHOST_SHELL_PROFILE") or CFG.get("browser.profile_name")
-IS_ROTATING_PROXY    = CFG.get("proxy.is_rotating", True)
-ROTATION_API_URL     = CFG.get("proxy.rotation_api_url")
+# Also resolve rotation settings with per-profile overrides
+def _resolve_rotation():
+    """Returns (is_rotating, rotation_url, rotation_provider, rotation_api_key).
+    Per-profile values in the profiles table take precedence over globals."""
+    is_rot = CFG.get("proxy.is_rotating", True)
+    url    = CFG.get("proxy.rotation_api_url")
+    prov   = CFG.get("proxy.rotation_provider", "none")
+    key    = CFG.get("proxy.rotation_api_key")
+    if PROFILE_NAME:
+        try:
+            meta = DB.profile_meta_get(PROFILE_NAME)
+            if meta.get("proxy_is_rotating") is not None:
+                is_rot = bool(meta["proxy_is_rotating"])
+            if meta.get("rotation_api_url"):
+                url = meta["rotation_api_url"]
+            if meta.get("rotation_provider"):
+                prov = meta["rotation_provider"]
+            if meta.get("rotation_api_key"):
+                key = meta["rotation_api_key"]
+        except Exception:
+            pass
+    return is_rot, url, prov, key
+
+IS_ROTATING_PROXY, ROTATION_API_URL, _ROT_PROVIDER, _ROT_KEY = _resolve_rotation()
 PREFERRED_LANGUAGE   = CFG.get("browser.preferred_language", "uk-UA")
 EXPECTED_COUNTRY     = CFG.get("browser.expected_country",    "Ukraine")
 EXPECTED_TIMEZONE    = CFG.get("browser.expected_timezone",   "Europe/Kyiv")
@@ -147,7 +200,29 @@ if RUN_ID is None:
 COMPETITOR_URLS_FILE = "competitor_urls.txt"
 
 
+# ──────────────────────────────────────────────────────────────
 # Logging
+# ──────────────────────────────────────────────────────────────
+#
+# Windows quirk: the default terminal encoding is cp1252 / cp866 / cp1251
+# depending on regional settings, and Python's StreamHandler writes to
+# sys.stdout with that codec. Any emoji (🌱, ✓, ✗, arrows →) or
+# Cyrillic text we log crashes with UnicodeEncodeError — not fatal
+# (Python recovers) but it pollutes the console with 20-line tracebacks
+# every time.
+#
+# Fix: force stdout/stderr into UTF-8 mode BEFORE any logging call.
+# Python 3.7+ has reconfigure(). `errors='replace'` gives us a fallback
+# character (?) rather than an exception if even UTF-8 fails for some
+# exotic codepoint — so logging becomes crash-proof for the whole run.
+try:
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+except (AttributeError, Exception):
+    # Some terminals (older Windows Python, pipes to non-TTY) don't
+    # support reconfigure — ignore and fall through to ASCII-safe text.
+    pass
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
