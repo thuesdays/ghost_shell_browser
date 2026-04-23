@@ -376,6 +376,16 @@ DEFAULT_CONFIG = {
     # Without this, subsequent runs in the same session can reuse the same IP
     # which is a detection signal for Google.
     "proxy.auto_rotate_on_start": True,
+    # Rotate once every N runs instead of every run. Set to 1 for
+    # "rotate every run" (old behavior), 10 for "rotate every 10th run".
+    # Rationale: rotating on every run makes the profile look like a
+    # different user each time, which erases "returning visitor" signal
+    # Google uses as a trust marker. Rotating less often lets a good
+    # IP ripen into a trusted one. Detection risk is managed at run
+    # time (captcha triggers unconditional rotation regardless of this
+    # setting). Default 10 = about 5-15 min of ripening per IP in a
+    # typical scheduler cadence.
+    "proxy.rotate_every_n_runs":  10,
 
     "captcha.twocaptcha_key":     "",
 
@@ -393,6 +403,25 @@ DEFAULT_CONFIG = {
     "behavior.bg_tabs_count":     [2, 4],
     "behavior.idle_pauses":       False,
     "behavior.pre_target_warmup": False,
+
+    # ── SERP engagement behavior (serp_behavior.py) ──────────────
+    # Post-ads-collection human-shaped behavior on the SERP. Without
+    # this the monitor looks like a scraper — land, grab, leave in
+    # under 2 seconds — and Google downgrades ad load on subsequent
+    # queries (fewer ads → lower hit rate). Each step is independently
+    # toggleable; the organic-click step is probabilistic (expensive
+    # signal, don't want to do it on every query).
+    "behavior.serp_scroll_enabled":      True,
+    "behavior.serp_dwell_enabled":       True,
+    "behavior.organic_click_enabled":    True,
+    # 25% of queries end with a real organic-result click. Higher is
+    # more engagement signal but slower runs; lower is closer to pure
+    # scraping. 20-40% matches observed CTRs for commercial queries.
+    "behavior.organic_click_probability": 0.25,
+    # Time spent on the clicked organic result (new tab dwell).
+    # 8-25s brackets p10-p75 of real commercial-query dwell times.
+    "behavior.organic_dwell_min_sec":    8,
+    "behavior.organic_dwell_max_sec":    25,
 
     # ── Behavior timing (seconds) — configured from dashboard ───
     # Delay after initial page load before we start reading the SERP
@@ -688,6 +717,20 @@ class DB:
     def run_latest(self, profile_name: str = None) -> Optional[dict]:
         runs = self.runs_list(limit=1, profile_name=profile_name)
         return runs[0] if runs else None
+
+    def runs_count_for_profile(self, profile_name: str) -> int:
+        """Total number of runs ever recorded for a profile — used by
+        main.py to decide whether the current run should rotate IP,
+        given a "rotate every N runs" throttle. Cheap query (indexed
+        on profile_name).
+
+        Returns the count INCLUDING the currently-starting run, so on
+        a profile's very first run this returns 1."""
+        row = self._get_conn().execute(
+            "SELECT COUNT(*) AS n FROM runs WHERE profile_name = ?",
+            (profile_name,)
+        ).fetchone()
+        return row["n"] if row else 0
 
     # ──────────────────────────────────────────────────────────
     # EVENTS

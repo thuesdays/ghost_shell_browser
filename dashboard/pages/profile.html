@@ -8,7 +8,10 @@
   </div>
 
   <div class="card">
-    <div class="card-title">Main settings (active profile)</div>
+    <div class="card-title">
+      Main settings
+      <span class="muted">— active profile, language, session</span>
+    </div>
     <div class="input-row">
       <div class="form-group">
         <label class="form-label">Active profile name</label>
@@ -39,75 +42,177 @@
   <div class="card">
     <div class="card-title">
       Per-profile overrides
-      <span class="muted" style="font-size: 11px; font-weight: 400;">
-        — tags, custom proxy, notes
-      </span>
+      <span class="muted">— tags, custom proxy, notes</span>
     </div>
-    <div class="form-hint" style="margin-bottom: 12px;">
+    <div class="form-hint" style="margin-bottom: 16px;">
       These settings apply ONLY to the selected profile and override the
       global values. Leave proxy empty to inherit the global
       <code>proxy.url</code>. Useful for running many profiles through
       different exit IPs simultaneously (e.g. Facebook multi-account).
     </div>
 
-    <div class="form-group">
-      <label class="form-label">Tags</label>
-      <div class="tag-editor-chips" id="pp-tags-chips">
-        <span class="muted" style="font-size: 12px;">Loading…</span>
+    <!-- ── Tags (metadata) ─────────────────────────────────── -->
+    <div class="override-row override-row-tags">
+      <div class="override-row-header">
+        <span class="override-icon">🏷️</span>
+        <div class="override-row-titles">
+          <div class="override-title">Tags</div>
+          <div class="override-desc">
+            Label this profile so you can filter it on the Profiles
+            page (e.g. <code>us-accounts</code>, <code>test</code>).
+          </div>
+        </div>
       </div>
-      <div style="display: flex; gap: 8px; margin-top: 8px; align-items: stretch;">
-        <input type="text" class="input" id="pp-tag-input"
-               placeholder="add a tag and press Enter"
-               style="flex: 1;">
-        <button class="btn btn-primary btn-add-tag" id="pp-tag-add-btn">
-          <span style="font-weight: 600;">+</span>
-          <span>Add</span>
-        </button>
+      <div class="override-row-body">
+        <div class="tag-editor-chips" id="pp-tags-chips">
+          <span class="muted" style="font-size: 12px;">Loading…</span>
+        </div>
+        <div style="display: flex; gap: 8px; margin-top: 10px; align-items: stretch;">
+          <input type="text" class="input" id="pp-tag-input"
+                 placeholder="add a tag and press Enter"
+                 style="flex: 1;">
+          <button class="btn btn-primary btn-add-tag" id="pp-tag-add-btn">
+            <span style="font-weight: 600;">+</span>
+            <span>Add</span>
+          </button>
+        </div>
       </div>
     </div>
 
+    <!-- ── Proxy URL (network) ─────────────────────────────── -->
+    <div class="override-row override-row-proxy">
+      <div class="override-row-header">
+        <span class="override-icon">🌐</span>
+        <div class="override-row-titles">
+          <div class="override-title">Proxy URL</div>
+          <div class="override-desc">
+            Dedicated exit for this profile. Empty = use the global
+            <code>proxy.url</code> from the Proxy page.
+          </div>
+        </div>
+      </div>
+      <div class="override-row-body">
+        <input type="text" class="input" id="pp-proxy-url"
+               placeholder="http://user:pass@host:port">
+      </div>
+    </div>
+
+    <!-- ── Rotation override (network / advanced) ─────────── -->
+    <div class="override-row override-row-rotation">
+      <div class="override-row-header">
+        <span class="override-icon">🔄</span>
+        <div class="override-row-titles">
+          <div class="override-title">Rotation override</div>
+          <div class="override-desc">
+            Custom rotation endpoint just for this profile. Leave
+            blank on both fields to inherit the global rotation config.
+          </div>
+        </div>
+      </div>
+      <div class="override-row-body">
+        <div class="input-row">
+          <div class="form-group" style="margin-bottom: 0;">
+            <label class="form-label">Rotation API URL</label>
+            <input type="text" class="input" id="pp-rotation-url"
+                   placeholder="empty = inherit global">
+          </div>
+          <div class="form-group" style="margin-bottom: 0;">
+            <label class="form-label">Rotation provider</label>
+            <select class="select" id="pp-rotation-provider">
+              <option value="">— inherit global —</option>
+              <option value="none">None</option>
+              <option value="asocks">asocks</option>
+              <option value="brightdata">Bright Data</option>
+              <option value="generic">Generic</option>
+            </select>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- ── Notes (info) ────────────────────────────────────── -->
+    <div class="override-row override-row-notes">
+      <div class="override-row-header">
+        <span class="override-icon">📝</span>
+        <div class="override-row-titles">
+          <div class="override-title">Notes</div>
+          <div class="override-desc">
+            Free-form notes for your own reference — not used by the
+            runner anywhere.
+          </div>
+        </div>
+      </div>
+      <div class="override-row-body">
+        <textarea class="input" id="pp-notes" rows="2"
+                  placeholder="e.g. 'main Facebook for US account'"></textarea>
+      </div>
+    </div>
+
+    <div style="display: flex; gap: 10px; margin-top: 16px; align-items: center;">
+      <button class="btn btn-primary" id="pp-save-btn">💾 Save overrides</button>
+      <span class="muted" style="font-size: 12px;" id="pp-save-status"></span>
+    </div>
+  </div>
+
+  <!-- ─── CHROME HISTORY IMPORT (profile warm-up) ────────────── -->
+  <!-- Copies history/bookmarks/preferences from a REAL Chrome install
+       into this profile. Gives Google's ad auction "this is a lived-in
+       browser" signal, which raises ad load on subsequent queries. No
+       browsing happens — we just drag files across while both sides are
+       closed. Scrubs PII (signed-in Google account, autofill, banking
+       domains by default) on the way through. -->
+  <div class="card">
+    <div class="card-title">
+      🧠 Warm up from real Chrome
+      <span class="muted">— import history, bookmarks &amp; preferences</span>
+    </div>
+    <div class="form-hint" style="margin-bottom: 12px;">
+      Copy real browsing history from your own Chrome install into this
+      profile. Fresh Ghost Shell profiles look synthetic to Google;
+      filling them with actual history raises the ad load you'll see.
+      <br><br>
+      <strong>Safe to run while your Chrome is open</strong> — we read
+      a WAL-consistent live snapshot. The only requirement is that
+      this Ghost Shell profile itself isn't mid-run.
+    </div>
+
     <div class="form-group">
-      <label class="form-label">Proxy URL (this profile only)</label>
-      <input type="text" class="input" id="pp-proxy-url"
-             placeholder="http://user:pass@host:port  — empty = use global">
-      <div class="form-hint">
-        Each running profile gets its own proxy. If empty, this profile
-        uses the global <code>proxy.url</code> from the Proxy page.
+      <label class="form-label">Source Chrome profile path</label>
+      <input type="text" class="input" id="chrome-import-source"
+             placeholder="(auto-detecting…)">
+      <div class="form-hint" id="chrome-import-source-hint">
+        Usually <code>%LOCALAPPDATA%\Google\Chrome\User Data\Default</code>
+        on Windows. Leave blank to auto-detect.
       </div>
     </div>
 
     <div class="input-row">
       <div class="form-group">
-        <label class="form-label">Rotation API URL (override)</label>
-        <input type="text" class="input" id="pp-rotation-url"
-               placeholder="empty = inherit global">
-        <div class="form-hint">
-          Per-profile rotation endpoint. Empty = use global.
-        </div>
+        <label class="form-label">History window (days)</label>
+        <input type="number" class="input" id="chrome-import-days"
+               value="90" min="1" max="365">
+        <div class="form-hint">Only URLs visited in the last N days.</div>
       </div>
       <div class="form-group">
-        <label class="form-label">Rotation provider (override)</label>
-        <select class="select" id="pp-rotation-provider">
-          <option value="">— inherit global —</option>
-          <option value="none">None</option>
-          <option value="asocks">asocks</option>
-          <option value="brightdata">Bright Data</option>
-          <option value="generic">Generic</option>
-        </select>
+        <label class="form-label">Max URLs</label>
+        <input type="number" class="input" id="chrome-import-maxurls"
+               value="5000" min="100" max="50000">
+        <div class="form-hint">Top-N by visit count. Drops the long tail.</div>
       </div>
     </div>
 
-    <div class="form-group">
-      <label class="form-label">Notes</label>
-      <textarea class="input" id="pp-notes" rows="2"
-                placeholder="Free-form notes for yourself — e.g. 'main Facebook for US account'"></textarea>
+    <div class="checkbox-row">
+      <input type="checkbox" id="chrome-import-sensitive" checked>
+      <label for="chrome-import-sensitive">
+        Skip sensitive domains (banking, health, signed-in social)
+      </label>
     </div>
 
-    <div style="display: flex; gap: 8px; margin-top: 8px;">
-      <button class="btn btn-primary" id="pp-save-btn">💾 Save overrides</button>
-      <div class="form-hint" style="margin: 0; align-self: center;">
-        <span id="pp-save-status"></span>
-      </div>
+    <div style="margin-top: 16px; display: flex; gap: 8px; align-items: center;">
+      <button class="btn btn-primary" id="chrome-import-run-btn">
+        📥 Import from Chrome
+      </button>
+      <span class="muted" id="chrome-import-status" style="font-size: 12px;"></span>
     </div>
   </div>
 
@@ -115,6 +220,7 @@
   <div class="card">
     <div class="card-title">
       Cookies & session
+      <span class="muted">— persisted between runs</span>
       <span class="badge" id="cookies-count-badge">0</span>
       <div style="margin-left: auto; display: flex; gap: 6px; flex-wrap: wrap;">
         <button class="btn btn-secondary btn-small" id="cookies-reload-btn">↻ Reload</button>
@@ -215,7 +321,9 @@
 
   <div class="card">
     <div class="card-title">
-      Self-check <span class="badge" id="selfcheck-badge">—</span>
+      Self-check
+      <span class="muted">— runtime fingerprint validation</span>
+      <span class="badge" id="selfcheck-badge">—</span>
       <div style="margin-left: auto; display: flex; gap: 8px;">
         <button class="btn btn-secondary" id="reset-health-btn"
                 style="font-size: 11px; padding: 6px 12px;">Reset blocks</button>
@@ -231,7 +339,8 @@
 
   <div class="card">
     <div class="card-title">
-      Current fingerprint (payload)
+      Current fingerprint
+      <span class="muted">— payload applied to Chromium at launch</span>
       <div style="margin-left: auto;">
         <button class="btn btn-primary btn-small" id="regen-fp-btn">
           🎲 Regenerate fingerprint

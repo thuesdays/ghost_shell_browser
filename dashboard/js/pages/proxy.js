@@ -35,6 +35,13 @@ const ProxyPage = {
     });
     this.refreshRotationStatus();
 
+    // ── Master switch → show/hide rotation body ────────────────
+    // The checkbox "Force enable rotation" reveals the whole API-config
+    // block below it when on. Implemented via a generic data-show-when
+    // attribute pointing at a checkbox id — could be re-used later for
+    // other collapsible sections if we want.
+    this._wireShowWhenToggles();
+
     // asocks builder — two separate fields that auto-assemble into the
     // real rotation_api_url. Matches the GET /v2/proxy/refresh/{portId}?apiKey={key}
     // endpoint shape per https://api.asocks.com/api/docs/
@@ -83,6 +90,25 @@ const ProxyPage = {
       this.loadIps(),
       this.refreshCurrentIp(),   // show current IP right away
     ]);
+  },
+
+  /** Wires up data-show-when="checkbox-id" on any element — that
+   *  element is only visible (.visible class) while the referenced
+   *  checkbox is ticked. Used for the rotation-body inline block so
+   *  users don't see the API config until they've opted in to rotation.
+   *  Pure DOM wiring — no persistence, the checkbox itself drives state.
+   */
+  _wireShowWhenToggles() {
+    document.querySelectorAll("[data-show-when]").forEach(panel => {
+      const cbId = panel.getAttribute("data-show-when");
+      const cb = document.getElementById(cbId);
+      if (!cb) return;
+      const apply = () => {
+        panel.classList.toggle("visible", !!cb.checked);
+      };
+      cb.addEventListener("change", apply);
+      apply();   // initial state matches checkbox on page load
+    });
   },
 
   /** Updates the chip in the Rotation-API card header and the warning
@@ -134,14 +160,10 @@ const ProxyPage = {
       banner.style.display = effective ? "none" : "";
     }
 
-    // Warn if there's a conflict — user ticked "Force enable" but
-    // didn't configure an API. Rotation will turn on but the tracker
-    // will have nothing to call, leading to silent no-ops.
-    const conflictBox = document.getElementById("rotation-conflict-warning");
-    if (conflictBox) {
-      const conflict = override === true && !configured;
-      conflictBox.style.display = conflict ? "" : "none";
-    }
+    // Old conflict-warning box was removed when we consolidated the
+    // rotation UI — "force enable without API" still a valid bad state
+    // but the master switch is the only thing in that state that's
+    // visible now, so the status chip above communicates it adequately.
   },
 
   /** Show the asocks simple-fields block when provider=asocks, the

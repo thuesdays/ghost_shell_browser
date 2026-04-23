@@ -236,18 +236,61 @@ html, body {
 .page-subtitle { font-size: 13px; color: var(--text-muted); margin-top: 4px; }
 
 /* ─── CARDS ─── */
+/*
+ * Every card gets a subtle left-edge accent bar. It's 2px wide and
+ * uses a softened accent colour so it reads as "this is a distinct
+ * section" without looking demanding. The accent lights up on hover
+ * to give interactive-looking feedback even for read-only cards.
+ *
+ * Card titles support an inline subtitle via <span class="muted">,
+ * styled to look like a dash-separated description e.g.
+ *   "Per-profile overrides  — tags, custom proxy, notes"
+ * The subtitle is slightly dimmer + non-bold so the main title reads
+ * first when eye-scanning the page.
+ */
 .card {
-  background: var(--card); border: 1px solid var(--border);
-  border-radius: 12px; padding: 20px; margin-bottom: 20px;
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-left: 3px solid var(--border);
+  border-radius: 12px;
+  padding: 20px;
+  margin-bottom: 18px;
+  position: relative;
+  transition: border-left-color .2s ease, box-shadow .2s ease;
+}
+.card:hover {
+  border-left-color: var(--accent-dim, var(--accent));
 }
 .card-title {
-  font-size: 13px; font-weight: 600; color: var(--text-dim);
-  text-transform: uppercase; letter-spacing: .6px; margin-bottom: 16px;
-  display: flex; align-items: center; gap: 10px;
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--text);
+  text-transform: uppercase;
+  letter-spacing: .7px;
+  margin-bottom: 16px;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding-bottom: 12px;
+  border-bottom: 1px solid var(--border-soft);
 }
 .card-title .badge {
-  background: var(--border); color: var(--text);
-  padding: 2px 8px; border-radius: 10px; font-size: 11px; font-weight: 500;
+  background: var(--border);
+  color: var(--text);
+  padding: 2px 8px;
+  border-radius: 10px;
+  font-size: 11px;
+  font-weight: 500;
+}
+/* Inline subtitle inside a card-title — the "— description" part.
+ * Lowercase, muted, non-bold, no letter-spacing jitter.
+ */
+.card-title .muted {
+  font-size: 12px;
+  font-weight: 400;
+  color: var(--text-muted);
+  text-transform: none;
+  letter-spacing: 0;
 }
 
 /* ─── STATS ─── */
@@ -520,15 +563,43 @@ html, body {
 }
 
 /* ─── TABLES ─── */
-table { width: 100%; border-collapse: collapse; font-size: 13px; }
-th {
-  text-align: left; padding: 10px 14px; color: var(--text-muted);
-  font-weight: 500; font-size: 11px; text-transform: uppercase;
-  letter-spacing: .5px; border-bottom: 1px solid var(--border);
+/* Compact-by-default. Vertical padding 8px instead of 12px gives
+ * ~30% more rows visible without scrolling. The accent on hover is
+ * subtle — just enough to track the cursor row, not a big blue block.
+ * Row borders are barely-there so the eye follows content, not the grid.
+ */
+table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 13px;
 }
-td { padding: 12px 14px; border-bottom: 1px solid var(--border-soft); }
-tr:last-child td { border-bottom: none; }
-tr:hover td { background: var(--card-alt); }
+th {
+  text-align: left;
+  padding: 10px 14px;
+  color: var(--text-muted);
+  font-weight: 500;
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: .5px;
+  border-bottom: 1px solid var(--border);
+  background: var(--card-alt, transparent);
+  position: sticky;
+  top: 0;
+  z-index: 1;
+}
+td {
+  padding: 8px 14px;
+  border-bottom: 1px solid var(--border-soft);
+  line-height: 1.45;
+}
+tbody tr { transition: background-color .12s ease; }
+tbody tr:last-child td { border-bottom: none; }
+tbody tr:hover td { background: rgba(99, 102, 241, 0.05); }
+/* Zebra-ish: the very subtle alt row makes long tables scannable
+ * without being visually noisy.
+ */
+tbody tr:nth-child(even) td { background: rgba(255, 255, 255, 0.015); }
+tbody tr:nth-child(even):hover td { background: rgba(99, 102, 241, 0.06); }
 .muted { color: var(--text-muted); font-size: 12px; }
 
 /* ─── PILLS ─── */
@@ -618,6 +689,86 @@ tr:hover td { background: var(--card-alt); }
   color: var(--accent-dim);
   border-bottom-style: solid;
 }
+
+/* ─── OVERRIDE ROWS (Dolphin-style profile settings) ─────────
+   Each per-profile override renders as its own mini-card with a
+   coloured left stripe that hints at category (metadata / network /
+   advanced / info). Gives the panel a scannable "list of settings"
+   feel instead of one long form. Stripe colours are per-category
+   so the eye can jump to the right section quickly. */
+.override-row {
+  background: rgba(255, 255, 255, 0.02);
+  border: 1px solid var(--border);
+  border-left: 3px solid var(--accent);
+  border-radius: 8px;
+  padding: 14px 16px 16px;
+  margin-bottom: 12px;
+  transition: background .15s ease, border-color .15s ease;
+}
+.override-row:hover {
+  background: rgba(255, 255, 255, 0.035);
+  border-color: #2e344a;
+}
+.override-row-header {
+  display: flex;
+  align-items: flex-start;
+  gap: 12px;
+  margin-bottom: 12px;
+}
+.override-icon {
+  font-size: 18px;
+  line-height: 1;
+  flex-shrink: 0;
+  margin-top: 1px;
+  /* Soft glow so icons read even on the dim backdrop */
+  filter: drop-shadow(0 0 4px rgba(90, 159, 237, 0.15));
+}
+.override-row-titles {
+  flex: 1;
+  min-width: 0;
+}
+.override-title {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text);
+  text-transform: uppercase;
+  letter-spacing: 0.6px;
+}
+.override-desc {
+  font-size: 11.5px;
+  color: var(--text-dim);
+  margin-top: 3px;
+  line-height: 1.45;
+}
+.override-row-body {
+  /* Pulled slightly left to align with the stripe edge for visual
+     balance — the body content isn't under the icon, it's its own
+     column. */
+  padding-left: 0;
+}
+.override-row-body .input,
+.override-row-body .select,
+.override-row-body textarea.input {
+  /* Override rows already have their own contrast layer; inputs
+     inside should sit on a slightly darker base so they're clearly
+     interactive. */
+  background: rgba(0, 0, 0, 0.25);
+}
+
+/* Per-category stripe colours. Matches "visual taxonomy" Dolphin
+   uses — metadata is purple-ish, network green, advanced amber,
+   informational grey. Easy to re-skin by changing just these. */
+.override-row-tags     { border-left-color: #8b5cf6; }   /* violet */
+.override-row-proxy    { border-left-color: #10b981; }   /* emerald */
+.override-row-rotation { border-left-color: #f59e0b; }   /* amber */
+.override-row-notes    { border-left-color: #6b7280; }   /* slate */
+
+/* Matching icon glows so the visual category reads even before the
+   user parses the text label. Very subtle — just enough tinting. */
+.override-row-tags     .override-icon { filter: drop-shadow(0 0 5px rgba(139, 92, 246, 0.35)); }
+.override-row-proxy    .override-icon { filter: drop-shadow(0 0 5px rgba(16, 185, 129, 0.35)); }
+.override-row-rotation .override-icon { filter: drop-shadow(0 0 5px rgba(245, 158, 11, 0.35)); }
+.override-row-notes    .override-icon { filter: drop-shadow(0 0 4px rgba(107, 114, 128, 0.30)); }
 
 /* ─── CHART ─── */
 canvas { max-height: 280px !important; }
@@ -3171,4 +3322,158 @@ a:hover { text-decoration: underline; }
   background: rgba(245, 158, 11, 0.15);
   color: #fcd34d;
   border: 1px solid rgba(245, 158, 11, 0.4);
+}
+
+/* ─── TABLE-WRAP + COMPETITORS TABLE ─────────────────────────
+ *
+ * .table-wrap wraps long tables so they can scroll horizontally on
+ * narrow screens without breaking card layout. Inside a card it has
+ * negative margins so the table edges align flush with the card edges
+ * (tables-in-cards always look better edge-to-edge than padded).
+ *
+ * .competitors-table is the dense-row variant used on Competitors
+ * page — 6-column-wide tables look cramped with the default row
+ * height, so we trim vertical padding to 6px and use monospace for
+ * timestamps to keep columns aligned.
+ */
+.table-wrap {
+  overflow-x: auto;
+  margin: 0 -20px -20px;       /* flush with card edges */
+  border-top: 1px solid var(--border-soft);
+}
+.table-wrap::-webkit-scrollbar { height: 8px; }
+.table-wrap::-webkit-scrollbar-thumb {
+  background: var(--border);
+  border-radius: 4px;
+}
+
+.competitors-table {
+  font-size: 12.5px;
+  border-collapse: collapse;
+  width: 100%;
+}
+.competitors-table thead th {
+  padding: 8px 16px;
+  font-size: 10px;
+  letter-spacing: .6px;
+  background: var(--card-alt, rgba(255,255,255,0.02));
+  border-bottom: 1px solid var(--border);
+  white-space: nowrap;
+}
+.competitors-table tbody td {
+  padding: 6px 16px;            /* 6px vertical = dense but still scannable */
+  border-bottom: 1px solid var(--border-soft);
+  vertical-align: middle;
+  line-height: 1.4;
+}
+.competitors-table tbody tr:last-child td { border-bottom: none; }
+
+/* Right-align numeric columns so the digit columns line up. */
+.competitors-table th.num, .competitors-table td.num {
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+  font-family: var(--font-mono, ui-monospace, monospace);
+}
+
+/* Domain cell — make it feel link-ish (clickable). */
+.competitors-table td.domain-cell {
+  font-weight: 500;
+  color: var(--text);
+}
+.competitors-table td.domain-cell a {
+  color: inherit;
+  text-decoration: none;
+  border-bottom: 1px dotted var(--border);
+}
+.competitors-table td.domain-cell a:hover {
+  color: var(--accent);
+  border-bottom-color: var(--accent);
+}
+
+/* Query / URL cells — truncate with ellipsis rather than wrapping,
+ * so each row stays a single line. Tooltip (title=) shows full text.
+ */
+.competitors-table td.truncate {
+  max-width: 280px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* Timestamp cell — muted + monospace so dates don't dominate. */
+.competitors-table td.ts-cell {
+  color: var(--text-muted);
+  font-family: var(--font-mono, ui-monospace, monospace);
+  font-size: 11.5px;
+  white-space: nowrap;
+}
+
+/* Counter chip for big numbers in the Mentions column — makes a
+ * Mentions: 42 row visually distinct from Mentions: 1 at a glance.
+ */
+.competitors-table .count-chip {
+  display: inline-block;
+  min-width: 28px;
+  padding: 1px 7px;
+  border-radius: 4px;
+  font-weight: 600;
+  text-align: center;
+  font-size: 11px;
+  background: rgba(99, 102, 241, 0.12);
+  color: var(--accent);
+}
+.competitors-table .count-chip.zero {
+  background: rgba(107, 114, 128, 0.12);
+  color: var(--text-muted);
+}
+
+/* ─── ROTATION BODY (collapsed-by-default inline block) ─────────
+ * Shown only when the "Force enable rotation" master switch is on.
+ * Visually indented + left-bordered so it reads as "these settings
+ * apply inside that switch" rather than looking like siblings.
+ * JS in proxy.js toggles the .visible class based on the checkbox.
+ */
+.rotation-body {
+  display: none;
+  margin-top: 4px;
+  margin-left: 30px;                 /* aligns under the checkbox label */
+  padding: 16px 18px;
+  border-left: 2px solid var(--accent);
+  border-radius: 0 8px 8px 0;
+  background: rgba(99, 102, 241, 0.03);
+  animation: rotation-body-fade-in .18s ease;
+}
+.rotation-body.visible {
+  display: block;
+}
+@keyframes rotation-body-fade-in {
+  from { opacity: 0; transform: translateY(-4px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+
+/* Inner "API config" subsection — distinguishes the call-the-provider
+ * machinery from the cadence field directly under the master switch.
+ */
+.rotation-api-inline {
+  margin-top: 20px;
+  padding-top: 16px;
+  border-top: 1px dashed var(--border);
+}
+.rotation-api-inline-title {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text);
+  text-transform: uppercase;
+  letter-spacing: .5px;
+  margin-bottom: 10px;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+.rotation-api-inline-title .muted {
+  font-size: 11.5px;
+  font-weight: 400;
+  text-transform: none;
+  letter-spacing: 0;
+  color: var(--text-muted);
 }

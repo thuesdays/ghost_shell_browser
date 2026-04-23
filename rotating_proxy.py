@@ -112,19 +112,24 @@ class RotatingProxyTracker:
     # ──────────────────────────────────────────────────────────
 
     def get_current_ip(self, driver=None) -> Optional[str]:
-        """
-        Return the outgoing IP as observed through the proxy.
+        """Return the outgoing IP as observed through the proxy.
 
-        If `driver` is given we use it (same path real requests will take).
-        Otherwise falls back to `requests` with the proxy URL.
+        Uses `requests` through the proxy — NEVER routes through the
+        browser. This was a deliberate change: navigating Chrome to
+        ipify on every run created an unmistakable bot fingerprint
+        (real users never visit ipify.org first thing in a session),
+        and dumped that domain into Chrome's history/cookies for
+        Google to observe. Using requests keeps the IP check entirely
+        invisible to the browser — goes directly through our local
+        proxy_forwarder to the same exit, just on a separate TCP
+        connection.
+
+        The `driver` parameter is kept for backwards compatibility
+        with older callers but is now ignored.
         """
+        if not self.proxy_url:
+            return None
         try:
-            if driver:
-                driver.get(IP_CHECK_URL)
-                time.sleep(1.5)
-                body = driver.execute_script("return document.body.innerText;")
-                return json.loads(body).get("ip")
-
             proxies = {
                 "http":  f"http://{self.proxy_url}",
                 "https": f"http://{self.proxy_url}",
@@ -132,13 +137,18 @@ class RotatingProxyTracker:
             r = requests.get(IP_CHECK_URL, proxies=proxies, timeout=15)
             return r.json().get("ip")
         except Exception as e:
-            logging.warning(f"[RotatingProxy] get_current_ip: {e}")
+            logging.debug(f"[RotatingProxy] get_current_ip: {e}")
             return None
 
     def enrich_ip(self, ip: str, driver=None):
-        """
-        Look up country / city / ASN / ISP and store them in ip_history.
-        Called once per IP — subsequent calls are a no-op.
+        """Look up country / city / ASN / ISP and store them in
+        ip_history. Called once per IP — subsequent calls are a no-op.
+
+        Like get_current_ip, we NEVER route through the browser. Using
+        driver.get(ipapi) would surface the meta-service in Chrome's
+        history and add a unique fingerprint (real users never hit
+        ipapi first thing). `driver` kept for backwards compat but
+        ignored.
         """
         if not ip:
             return
@@ -147,19 +157,16 @@ class RotatingProxyTracker:
         if existing and existing.get("country"):
             return
 
+        if not self.proxy_url:
+            return
+
         try:
-            if driver:
-                driver.get(IP_INFO_URL)
-                time.sleep(1.5)
-                body = driver.execute_script("return document.body.innerText;")
-                data = json.loads(body)
-            else:
-                proxies = {
-                    "http":  f"http://{self.proxy_url}",
-                    "https": f"http://{self.proxy_url}",
-                }
-                r = requests.get(IP_INFO_URL, proxies=proxies, timeout=15)
-                data = r.json()
+            proxies = {
+                "http":  f"http://{self.proxy_url}",
+                "https": f"http://{self.proxy_url}",
+            }
+            r = requests.get(IP_INFO_URL, proxies=proxies, timeout=15)
+            data = r.json()
 
             self.db.ip_update_meta(
                 ip       = ip,
@@ -297,22 +304,36 @@ class RotatingProxyTracker:
     def wait_for_rotation(
         self, driver, old_ip: str, timeout: int = 60
     ) -> Optional[str]:
-        """
-        Poll the exit IP until it changes or the timeout hits.
+        """Poll the exit IP until it changes or the timeout hits.
 
-        Used after force_rotate() (in case the API is async) OR when no
-        rotation API is available and we want to verify the provider did
-        auto-rotate on its own.
+        Used after force_rotate() (providers may be async) OR when no
+        rotation API is available and we're verifying auto-rotate on
+        TCP reconnect.
+
+        `driver` is unused — we check IP via requests to keep ipify
+        invisible to Chrome (see get_current_ip for rationale). Kept
+        in the signature for backwards compatibility.
+
+        Polling cadence: start fast (500ms) since asocks typically
+        rotates in 1-3s, then back off to avoid hammering ipify if
+        the provider is genuinely slow. Total hits for a fast rotate:
+        2-4 requests instead of the previous 5-8.
         """
         logging.info(f"[RotatingProxy] waiting for IP to change from {old_ip}...")
         started = time.time()
+        # Exponential-ish backoff: 0.5s, 1s, 2s, 3s, 5s, 5s, ...
+        intervals = [0.5, 1.0, 2.0, 3.0, 5.0]
+        i = 0
 
         while time.time() - started < timeout:
-            time.sleep(5)
-            current = self.get_current_ip(driver)
+            wait = intervals[min(i, len(intervals) - 1)]
+            time.sleep(wait)
+            current = self.get_current_ip()
             if current and current != old_ip:
-                logging.info(f"[RotatingProxy] ✓ IP changed: {old_ip} → {current}")
+                logging.info(f"[RotatingProxy] ✓ IP changed: {old_ip} → {current} "
+                             f"(in {time.time() - started:.1f}s)")
                 return current
+            i += 1
 
         logging.warning(f"[RotatingProxy] IP did not change within {timeout}s")
         return None

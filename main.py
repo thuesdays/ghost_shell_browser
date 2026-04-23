@@ -812,6 +812,18 @@ def search_query(browser, query: str, sqm: SessionQualityMonitor,
             except Exception:
                 pass
             logging.info(f"  ✓ {len(ads)} ads on attempt {attempt}")
+
+            # ── SERP behavior — make us look like a real user who read
+            # the results before moving on. Without this, Google sees a
+            # scrape pattern (land → grab → leave in 1-2s) and downgrades
+            # ad load on the next query. Configurable via Settings; all
+            # parts are independently toggleable, exceptions swallowed.
+            try:
+                from serp_behavior import post_ads_behavior
+                post_ads_behavior(driver, DB, watchdog=watchdog)
+            except Exception as e:
+                logging.debug(f"  SERP behavior failed: {e}")
+
             return ads
 
         if attempt >= REFRESH_MAX_ATTEMPTS:
@@ -975,19 +987,54 @@ def run_monitor():
         # ipapi for diagnostics) went through the OLD IP. If that IP
         # was already burned, we'd waste a captcha before learning it.
         # Now: rotate → everything after uses the fresh IP.
+        #
+        # Throttle: rotate_every_n_runs lets the user trade "fresh IP
+        # every run" (looks like a new user — erases trust signal) for
+        # "IP ripens over several runs" (looks like a returning user —
+        # Google's trust model rewards this). Captcha-triggered rotation
+        # still fires unconditionally regardless of this throttle.
         current_ip = None
         auto_rotate = CFG.get("proxy.auto_rotate_on_start", True)
+        rotate_every = int(CFG.get("proxy.rotate_every_n_runs", 10) or 10)
+        if rotate_every < 1:
+            rotate_every = 1
+
+        # Count includes the current run (run_start() already inserted
+        # our row). So first run returns 1, which rotates (1 % N == 1).
+        # Run 11 also rotates (11 % 10 == 1). Run 2-10 skip.
+        try:
+            profile_run_n = DB.runs_count_for_profile(PROFILE_NAME)
+        except Exception:
+            profile_run_n = 1
+
+        should_rotate = auto_rotate and (
+            rotate_every == 1 or profile_run_n % rotate_every == 1
+        )
+
         if IS_ROTATING_PROXY:
-            if auto_rotate:
+            if should_rotate:
                 try:
-                    log_step("rotating IP", "auto_rotate_on_start=True")
+                    log_step(
+                        "rotating IP",
+                        f"run #{profile_run_n} for {PROFILE_NAME} "
+                        f"(rotate_every_n_runs={rotate_every})"
+                    )
                     new_ip = browser.force_rotate_ip()
                     if new_ip:
                         current_ip = new_ip
                         logging.info(f"🌐 rotated to IP: {current_ip}")
                 except Exception as e:
                     logging.warning(f"  auto-rotate failed: {e}")
-            # Regardless of auto-rotate: check health + unburn stale IPs
+            elif auto_rotate:
+                # Throttle skipped this run — log it so ops can see the
+                # reasoning in history without digging through config.
+                wait = rotate_every - (profile_run_n % rotate_every)
+                logging.info(
+                    f"⏸ skipping rotation — run #{profile_run_n} of "
+                    f"{PROFILE_NAME}, next rotate in {wait} run(s) "
+                    f"(rotate_every_n_runs={rotate_every})"
+                )
+            # Regardless of rotate decision: check health + unburn stale IPs
             try:
                 if current_ip is None:
                     current_ip = browser.check_and_rotate_if_burned()

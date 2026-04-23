@@ -96,6 +96,74 @@
     </div>
   </div>
 
+  <!-- ─── SERP engagement behavior ──────────────────────────────── -->
+  <!-- Tuning knobs for post-ads-collection human-shape simulation on
+       the SERP. Without these toggles the monitor looks like a scraper
+       to Google's ad auction (land → grab → leave), which suppresses
+       ad load on subsequent queries. Each behaviour is independently
+       switchable; the organic-click step is probabilistic because it's
+       an expensive signal we don't want to fire every time. -->
+  <div class="card">
+    <div class="card-title">🧑 SERP engagement behavior</div>
+    <div class="form-hint" style="margin-bottom: 14px;">
+      After ads are found on the SERP, Ghost Shell can simulate
+      realistic user behavior (scroll, dwell, click an organic result)
+      before moving on. This is the biggest lever for raising your
+      <strong>ads/search hit rate</strong> — raw scraping triggers
+      Google's anti-bot heuristics and cuts ad load on following
+      queries. All settings here apply to every profile.
+    </div>
+
+    <div class="checkbox-row">
+      <input type="checkbox" id="cfg-serp-scroll"
+             data-config="behavior.serp_scroll_enabled">
+      <label for="cfg-serp-scroll">
+        Scroll the SERP — 3-6 steps with reading pauses
+      </label>
+    </div>
+    <div class="checkbox-row">
+      <input type="checkbox" id="cfg-serp-dwell"
+             data-config="behavior.serp_dwell_enabled">
+      <label for="cfg-serp-dwell">
+        Dwell on SERP (3-9s with micro-scrolls)
+      </label>
+    </div>
+    <div class="checkbox-row">
+      <input type="checkbox" id="cfg-organic-click"
+             data-config="behavior.organic_click_enabled">
+      <label for="cfg-organic-click">
+        Occasionally click an organic result and read it
+      </label>
+    </div>
+
+    <div class="input-row" style="margin-top: 12px;">
+      <div class="form-group">
+        <label class="form-label">Click probability</label>
+        <input type="number" class="input" step="0.05" min="0" max="1"
+               data-config="behavior.organic_click_probability">
+        <div class="form-hint">
+          0.0 = never, 1.0 = after every query. 0.20-0.40 is realistic
+          for commercial queries.
+        </div>
+      </div>
+      <div class="form-group">
+        <label class="form-label">Organic dwell min (sec)</label>
+        <input type="number" class="input" min="1"
+               data-config="behavior.organic_dwell_min_sec">
+      </div>
+      <div class="form-group">
+        <label class="form-label">Organic dwell max (sec)</label>
+        <input type="number" class="input" min="1"
+               data-config="behavior.organic_dwell_max_sec">
+      </div>
+    </div>
+    <div class="form-hint" style="margin-top: 8px;">
+      Organic dwell is how long we stay on the opened result. 8-25s
+      matches p10-p75 of real click-through dwell times. Shorter looks
+      like a bounce; longer is rare for quick scans.
+    </div>
+  </div>
+
   <!-- ─── Performance / resource blocking ─────────────────────── -->
   <div class="card">
     <div class="card-title">⚡ Performance — resource blocking</div>

@@ -63,6 +63,12 @@ const ProfileDetail = {
       regenBtn.addEventListener("click", () => this.regenerateFingerprint());
     }
 
+    // ── Chrome history importer ──
+    // Auto-detect the source path on page load so the input is pre-filled.
+    this._populateChromeImportSource();
+    document.getElementById("chrome-import-run-btn")
+      ?.addEventListener("click", () => this._runChromeImport());
+
     // Pre-load for current active profile
     this.currentProfile = configCache?.browser?.profile_name;
     if (this.currentProfile) {
@@ -217,6 +223,121 @@ const ProfileDetail = {
       if (btn) {
         btn.disabled = false;
         btn.textContent = "🎲 Regenerate fingerprint";
+      }
+    }
+  },
+
+  // ─── CHROME HISTORY IMPORT ───────────────────────────────────
+  //
+  // Populates the source-path input with whatever discover_source()
+  // found on this machine. Shows the full candidate list in the hint
+  // so users on multi-Chrome setups (work + personal) can see where
+  // else to point the field.
+
+  async _populateChromeImportSource() {
+    const input = document.getElementById("chrome-import-source");
+    const hint  = document.getElementById("chrome-import-source-hint");
+    if (!input) return;
+    try {
+      const r = await api("/api/chrome-import/discover");
+      if (r.source) {
+        input.placeholder = r.source;
+      } else {
+        input.placeholder = "No Chrome found — paste path manually";
+      }
+      if (hint && Array.isArray(r.candidates) && r.candidates.length) {
+        // Show other likely locations too. Useful on Windows where
+        // Chrome vs Edge vs Brave vs Chromium all have different paths.
+        const cList = r.candidates
+          .map(c => `<code style="font-size:11px;">${escapeHtml(c)}</code>`)
+          .join("<br>");
+        hint.innerHTML =
+          `Leave blank to use auto-detected path. Known locations on this OS:<br>${cList}`;
+      }
+    } catch (e) {
+      console.warn("chrome-import discover:", e);
+    }
+  },
+
+  async _runChromeImport() {
+    if (!this.currentProfile) {
+      toast("No profile selected", true);
+      return;
+    }
+    const btn     = document.getElementById("chrome-import-run-btn");
+    const status  = document.getElementById("chrome-import-status");
+    const srcEl   = document.getElementById("chrome-import-source");
+    const daysEl  = document.getElementById("chrome-import-days");
+    const maxEl   = document.getElementById("chrome-import-maxurls");
+    const sensEl  = document.getElementById("chrome-import-sensitive");
+
+    // "Source" may be either typed explicitly or we let backend auto-detect.
+    // We send an empty string as null so the server uses discover_source().
+    const source = (srcEl?.value || "").trim() || null;
+    const days   = parseInt(daysEl?.value, 10) || 90;
+    const maxUrls = parseInt(maxEl?.value, 10) || 5000;
+
+    if (!await confirmDialog({
+      title: "🧠 Import Chrome history?",
+      message:
+        `Copy real browsing history from Chrome into <strong>${escapeHtml(this.currentProfile)}</strong>.<br><br>` +
+        `Your Chrome can stay open — we read a live snapshot.<br>` +
+        `Will import URLs from last <strong>${days}</strong> days, up to ` +
+        `<strong>${maxUrls}</strong> URLs, ${sensEl?.checked ? "skipping" : "<strong>keeping</strong>"} ` +
+        `sensitive domains (banking/health/signed-in social).`,
+      confirmText: "Import",
+    })) return;
+
+    if (btn) {
+      btn.disabled = true;
+      btn.textContent = "importing…";
+    }
+    if (status) {
+      status.textContent = "reading source DB…";
+      status.style.color = "";
+    }
+
+    try {
+      const r = await api(
+        `/api/profiles/${encodeURIComponent(this.currentProfile)}/chrome-import`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            source,
+            days,
+            max_urls:       maxUrls,
+            skip_sensitive: !!sensEl?.checked,
+          }),
+        }
+      );
+      if (r.ok) {
+        const s = r.summary || {};
+        const parts = [];
+        if (s.history)     parts.push(`${s.history} URLs`);
+        if (s.bookmarks)   parts.push(`${s.bookmarks} bookmarks`);
+        if (s.preferences) parts.push("prefs");
+        if (s.top_sites)   parts.push("top sites");
+        const msg = parts.length ? parts.join(" · ") : "nothing found to import";
+        if (status) {
+          status.textContent = "✓ imported: " + msg;
+          status.style.color = "var(--ok, #10b981)";
+        }
+        toast(`Chrome data imported: ${msg}`);
+      } else {
+        throw new Error(r.error || "import failed");
+      }
+    } catch (e) {
+      const msg = e.message || "import failed";
+      if (status) {
+        status.textContent = "✗ " + msg;
+        status.style.color = "var(--critical)";
+      }
+      toast(msg, true);
+    } finally {
+      if (btn) {
+        btn.disabled = false;
+        btn.textContent = "📥 Import from Chrome";
       }
     }
   },

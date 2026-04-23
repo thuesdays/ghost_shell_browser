@@ -27,39 +27,15 @@ class ProxyDiagnostics:
         self.proxy_url = proxy_url
 
     # ──────────────────────────────────────────────────────────
+    # ──────────────────────────────────────────────────────────
     # IP CHECK
     # ──────────────────────────────────────────────────────────
-
-    def get_browser_ip(self) -> dict:
-        """Получаем IP via requests (бесшумно)"""
-        import requests
-        # Добавляем протокол if его no (need for requests)
-        p_url = self.proxy_url
-        if p_url and not p_url.startswith("http"):
-            p_url = f"http://{p_url}"
-        proxies = {"http": p_url, "https": p_url} if p_url else None
-        # Try multiple IP services — any single one may be blocked / rate-limited
-        # through datacenter proxies (very common for asocks-style endpoints).
-        services = [
-            "https://api.ipify.org?format=json",
-            "https://ifconfig.co/json",
-            "https://api.myip.com",
-        ]
-        last_err = None
-        for url in services:
-            try:
-                r = requests.get(url, proxies=proxies, timeout=10)
-                r.raise_for_status()
-                data = r.json()
-                ip = data.get("ip") or data.get("IP")
-                if ip:
-                    return {"ok": True, "ip": ip}
-            except Exception as e:
-                last_err = str(e)
-                continue
-        import logging
-        logging.debug(f"[ProxyDiag] all IP services failed: {last_err}")
-        return {"ok": False, "error": last_err or "no service responded"}
+    #
+    # NOTE: We used to have a separate `get_browser_ip()` method that
+    # hit api.ipify.org to just get the IP. It was dead code — no
+    # caller used it — and each call was a wasted proxy roundtrip.
+    # Deleted. `get_ip_info()` below returns IP + geo in one shot
+    # via ipapi, which is what full_check() actually needs.
 
     def get_ip_info(self) -> dict:
         """Fetch geo info via proxy. Tries ipapi.co then ipwhois.app as fallback."""

@@ -1874,6 +1874,85 @@ def api_profile_create():
         return jsonify({"error": str(e)}), 500
 
 
+# ──────────────────────────────────────────────────────────────
+# CHROME HISTORY IMPORT
+# ──────────────────────────────────────────────────────────────
+
+@app.route("/api/chrome-import/discover", methods=["GET"])
+def api_chrome_import_discover():
+    """Look for a Chrome profile on this machine and return its path.
+    Used by the Edit Profile page to pre-fill the "source" field with
+    a sensible default so users don't have to navigate to the Chrome
+    User Data dir manually."""
+    try:
+        from chrome_importer import (
+            discover_source, _DEFAULT_SOURCES_WIN,
+            _DEFAULT_SOURCES_MAC, _DEFAULT_SOURCES_LINUX,
+        )
+        found = discover_source()
+        if sys.platform == "win32":
+            candidates = _DEFAULT_SOURCES_WIN
+        elif sys.platform == "darwin":
+            candidates = _DEFAULT_SOURCES_MAC
+        else:
+            candidates = _DEFAULT_SOURCES_LINUX
+        return jsonify({
+            "source":     found,
+            "candidates": candidates,
+            "platform":   sys.platform,
+        })
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/profiles/<name>/chrome-import", methods=["POST"])
+def api_profile_chrome_import(name: str):
+    """Import real browsing history from a host Chrome profile into
+    this Ghost Shell profile. Body:
+      {
+        "source":         "C:/Users/.../Chrome/User Data/Default",
+        "days":           90,
+        "max_urls":       5000,
+        "skip_sensitive": true
+      }
+
+    Preconditions:
+      - Source Chrome MUST be closed (we verify via SQLite lock probe).
+      - Destination Ghost Shell profile MUST NOT be running.
+
+    Returns a summary dict with counts per category imported."""
+    data = request.get_json(silent=True) or {}
+
+    if RUNNER_POOL.is_profile_running(name):
+        return jsonify({
+            "error": "Profile is currently running - stop it first, "
+                     "then retry import."
+        }), 409
+
+    try:
+        from chrome_importer import ChromeImporter, discover_source
+        source = data.get("source") or discover_source()
+        if not source:
+            return jsonify({
+                "error": "No Chrome profile found on this machine - "
+                         "pass an explicit 'source' path."
+            }), 400
+
+        imp = ChromeImporter(source_dir=source, dest_profile=name)
+        summary = imp.import_all(
+            days           = int(data.get("days") or 90),
+            max_urls       = int(data.get("max_urls") or 5000),
+            skip_sensitive = bool(data.get("skip_sensitive", True)),
+        )
+        return jsonify({"ok": True, "source": source, "summary": summary})
+    except FileNotFoundError as e:
+        return jsonify({"error": str(e)}), 404
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        return jsonify({"error": str(e)}), 500
+
+
 @app.route("/api/profiles/<name>/regenerate-fingerprint", methods=["POST"])
 def api_profile_regenerate_fingerprint(name):
     """
