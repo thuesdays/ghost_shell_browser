@@ -420,12 +420,35 @@ def main():
     db = get_db()
     now_iso = datetime.now().isoformat(timespec="seconds")
     db.config_set("scheduler.started_at", now_iso)
-    # Also record OUR PID in config. The dashboard's .scheduler.pid file
-    # is the primary source of truth — but in case it gets deleted, the
-    # UI can still detect a running scheduler through config + heartbeat
-    # freshness.
     db.config_set("scheduler.pid", os.getpid())
     heartbeat()
+
+    # Background heartbeat ticker — writes scheduler.heartbeat_at every
+    # 15 seconds REGARDLESS of main-loop position. Previously we only
+    # pinged at the top of each iteration, and iterations with long
+    # runs (5-10 min) caused the dashboard to think scheduler was wedged
+    # when it was just waiting for a run to complete. This thread also
+    # continues pinging when the main loop is in sleep_interruptible(),
+    # so "sleeping 4h until morning window" doesn't flip scheduler into
+    # "crashed (stale state)" on the UI.
+    import threading as _th
+    def _hb_ticker():
+        while not _shutdown:
+            try:
+                db2 = get_db()
+                db2.config_set(
+                    "scheduler.heartbeat_at",
+                    datetime.now().isoformat(timespec="seconds")
+                )
+            except Exception:
+                pass
+            # 15-sec sleep in small slices for responsive shutdown
+            for _ in range(15):
+                if _shutdown:
+                    return
+                time.sleep(1)
+    _hb_thread = _th.Thread(target=_hb_ticker, daemon=True, name="sched-heartbeat")
+    _hb_thread.start()
 
     cfg = load_cfg()
     logging.info("═" * 60)
@@ -515,9 +538,34 @@ def main():
                         ec, dur = run_one_iteration(name)
                         logging.info(f"  • {name}: exit={ec} ({dur:.0f}s)")
                 else:
-                    # Parallel — start all then wait for them to finish together
-                    procs = []
+                    # Parallel — spawn all via dashboard so runs appear
+                    # in the UI and their logs stream. Previously we did
+                    # raw Popen here which bypassed the dashboard's log
+                    # pipe AND RunnerPool registration — same class of
+                    # bug as the /api/run/start 404 we fixed earlier.
+                    #
+                    # If the dashboard is offline, fall back to raw
+                    # Popen per profile (each will print to its own
+                    # stdout but the main.py heartbeat still reaches
+                    # the DB so the UI shows them in active-runs).
+                    run_ids = []
                     for name in batch:
+                        if _shutdown:
+                            break
+                        rid = _spawn_via_dashboard(name)
+                        if rid is not None:
+                            run_ids.append((name, rid, "dashboard"))
+                            logging.info(f"  ▶ spawned {name} (run #{rid}) via dashboard")
+                            continue
+                        # Fallback: direct Popen with pre-spawn guard
+                        try:
+                            from process_reaper import ensure_no_live_run_for_profile
+                            err = ensure_no_live_run_for_profile(get_db(), name)
+                            if err:
+                                logging.warning(f"  ✗ {name}: skipped — {err}")
+                                continue
+                        except Exception:
+                            pass
                         env = os.environ.copy()
                         env["GHOST_SHELL_PROFILE_NAME"] = name
                         try:
@@ -526,20 +574,31 @@ def main():
                                 cwd=os.path.dirname(os.path.abspath(__file__)),
                                 env=env,
                             )
-                            procs.append((name, p))
-                            logging.info(f"  ▶ spawned {name} (pid {p.pid})")
+                            run_ids.append((name, p, "popen"))
+                            logging.info(f"  ▶ spawned {name} (pid {p.pid}) direct")
                         except Exception as e:
                             logging.error(f"  ✗ {name}: spawn failed — {e}")
 
-                    # Wait — with a generous timeout per process
-                    for name, p in procs:
-                        try:
-                            rc = p.wait(timeout=30 * 60)
-                            logging.info(f"  • {name}: exit={rc}")
-                        except subprocess.TimeoutExpired:
-                            logging.error(f"  ✗ {name}: timed out, killing")
-                            try: p.kill()
-                            except Exception: pass
+                    # Wait — with a generous timeout per process. Entries
+                    # are (name, handle, kind) where handle is either a
+                    # run_id int (dashboard) or a Popen object (direct).
+                    for name, handle, kind in run_ids:
+                        if kind == "dashboard":
+                            rc, _dur = _wait_for_run_via_dashboard(handle)
+                            logging.info(f"  • {name} (run #{handle}): exit={rc}")
+                        else:
+                            try:
+                                rc = handle.wait(timeout=30 * 60)
+                                logging.info(f"  • {name}: exit={rc}")
+                            except subprocess.TimeoutExpired:
+                                logging.error(f"  ✗ {name}: timed out, killing")
+                                try:
+                                    from process_reaper import kill_process_tree
+                                    kill_process_tree(handle.pid,
+                                                      reason="batch 30-min timeout")
+                                except Exception:
+                                    try: handle.kill()
+                                    except Exception: pass
                 logging.info(f"✓ Batch #{run_num} done ({len(batch)} profiles)")
 
             if _shutdown:

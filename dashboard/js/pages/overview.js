@@ -5,6 +5,7 @@
 
 const Overview = {
   chart: null,
+  _pollTimer: null,
 
   async init() {
     // Load everything in parallel
@@ -26,6 +27,35 @@ const Overview = {
       card.addEventListener("keydown", (e) => {
         if (e.key === "Enter" || e.key === " ") { e.preventDefault(); go(); }
       });
+    }
+
+    // ── Auto-refresh loop ───────────────────────────────────────
+    // Previously Overview loaded once on mount and never refreshed.
+    // If a run completed while the user was looking at Overview, they
+    // had to navigate away and back to see updated totals. Now we
+    // re-pull stats every 15s while the page is active. The interval
+    // clears itself as soon as the user moves to a different page
+    // (currentPage !== "overview") to avoid wasted requests.
+    clearInterval(this._pollTimer);
+    this._pollTimer = setInterval(() => {
+      if (currentPage !== "overview") {
+        clearInterval(this._pollTimer);
+        this._pollTimer = null;
+        return;
+      }
+      // Only refresh the cheap bits — headline stats, traffic card and
+      // recent activity. Top competitors / profile health rarely change
+      // fast enough to matter; skipping them halves the DB load.
+      this.loadHeadlineStats();
+      this.loadRecentActivity();
+      this.loadTrafficCard();
+    }, 15000);
+  },
+
+  teardown() {
+    if (this._pollTimer) {
+      clearInterval(this._pollTimer);
+      this._pollTimer = null;
     }
   },
 
@@ -75,7 +105,7 @@ const Overview = {
                     hour < 22 ? "Good evening" : "Good night";
       $("#ov-hero-title").textContent = `${greet}!`;
       $("#ov-hero-sub").textContent =
-        `${stats.total_profiles || 0} profile(s) active · ` +
+        `${stats.active_profiles ?? stats.total_profiles ?? 0} profile(s) active · ` +
         `${stats.total_competitors || 0} competitors tracked`;
 
       // Hero stats (24h)
@@ -134,11 +164,15 @@ const Overview = {
       this._renderTrend("hero-rate-trend",
                         rateToday, rateYday, false, "%");
 
-      // Totals block
-      $("#stat-searches").textContent    = stats.total_searches;
-      $("#stat-ads").textContent         = stats.total_ads ?? stats.total_searches;
-      $("#stat-competitors").textContent = stats.total_competitors;
-      $("#stat-profiles").textContent    = stats.total_profiles;
+      // Totals block — field names match what /api/stats returns.
+      // total_searches / total_ads / total_captchas come from the runs
+      // table now (previously from events, which silently undercounted).
+      $("#stat-searches").textContent    = stats.total_searches ?? 0;
+      $("#stat-ads").textContent         = stats.total_ads ?? 0;
+      $("#stat-competitors").textContent = stats.total_competitors ?? 0;
+      // "Active profiles" card — label says "active", so show distinct
+      // profiles that had a run in the last 7 days, not total-ever-seen.
+      $("#stat-profiles").textContent    = stats.active_profiles ?? 0;
 
       // All-time actions performed
       const at = stats.actions_total || {};

@@ -9,15 +9,6 @@
 
   <div class="card">
     <div class="card-title">Main settings (active profile)</div>
-    <div class="form-group">
-      <label class="form-label">Chromium binary path</label>
-      <input type="text" class="input" data-config="browser.binary_path"
-             placeholder="chrome-win64/chrome.exe">
-      <div class="form-hint">
-        Relative or absolute path to your Chromium build with C++ patches.
-        Default: <code>chrome-win64/chrome.exe</code> (looks in the project folder).
-      </div>
-    </div>
     <div class="input-row">
       <div class="form-group">
         <label class="form-label">Active profile name</label>
@@ -36,6 +27,11 @@
     <div class="checkbox-row">
       <input type="checkbox" id="cfg-enrich" data-config="browser.enrich_on_create">
       <label for="cfg-enrich">Enrich new profiles with fake history/bookmarks</label>
+    </div>
+    <div class="form-hint" style="margin-top: 10px;">
+      The Chromium binary path is a global install-level setting — configure it once
+      in <a href="#" data-nav="settings" class="inline-link">Settings</a>,
+      not per profile.
     </div>
   </div>
 
@@ -59,10 +55,14 @@
       <div class="tag-editor-chips" id="pp-tags-chips">
         <span class="muted" style="font-size: 12px;">Loading…</span>
       </div>
-      <div style="display: flex; gap: 8px; margin-top: 8px;">
+      <div style="display: flex; gap: 8px; margin-top: 8px; align-items: stretch;">
         <input type="text" class="input" id="pp-tag-input"
-               placeholder="add a tag and press Enter">
-        <button class="btn btn-primary" id="pp-tag-add-btn">+ Add</button>
+               placeholder="add a tag and press Enter"
+               style="flex: 1;">
+        <button class="btn btn-primary btn-add-tag" id="pp-tag-add-btn">
+          <span style="font-weight: 600;">+</span>
+          <span>Add</span>
+        </button>
       </div>
     </div>
 

@@ -177,6 +177,51 @@ html, body {
 .run-btn.running  { background: var(--warning); }
 .run-btn.stop-btn { background: var(--critical); }
 .run-btn.stop-btn:hover { background: #dc2626; }
+
+/* Dimmed state — shown when something is already running so the user
+   doesn't fire off a duplicate. Visually "greyed out but present" — the
+   button is disabled, colour fades to border-grey, and the label under-
+   neath tells the user WHY (scheduler active, N other runs). */
+.run-btn.run-btn-dim {
+  background: var(--surface-2, #262b3a);
+  color: var(--text-muted);
+  box-shadow: none;
+  opacity: 0.75;
+}
+.run-btn.run-btn-dim:hover {
+  background: var(--surface-2, #262b3a);  /* don't brighten on hover */
+  cursor: not-allowed;
+}
+
+/* Small dot on a sidebar nav item — used to indicate the scheduler
+   is active even when the user's on a different page. Positioned to
+   the right of the label so it doesn't push text. */
+.sidebar-item {
+  position: relative;
+}
+.sidebar-nav-dot {
+  display: inline-block;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  margin-left: auto;
+  background: var(--healthy, #10b981);
+  box-shadow: 0 0 0 2px rgba(16, 185, 129, 0.25);
+  animation: sidebar-nav-dot-pulse 2.4s ease-in-out infinite;
+}
+.sidebar-nav-dot[data-health="stale"] {
+  background: var(--warning, #f59e0b);
+  box-shadow: 0 0 0 2px rgba(245, 158, 11, 0.3);
+}
+.sidebar-nav-dot[data-health="crashed"] {
+  background: var(--critical, #ef4444);
+  box-shadow: 0 0 0 2px rgba(239, 68, 68, 0.35);
+  animation: sidebar-nav-dot-pulse 1.2s ease-in-out infinite;  /* faster */
+}
+@keyframes sidebar-nav-dot-pulse {
+  0%, 100% { opacity: 1; }
+  50%      { opacity: 0.45; }
+}
 .run-status     { font-size: 11px; color: var(--text-muted); margin-top: 8px; text-align: center; }
 .run-status-sub { font-size: 10px; color: var(--text-dim); margin-top: 2px; text-align: center;
                   font-family: var(--font-mono, monospace);
@@ -544,6 +589,35 @@ tr:hover td { background: var(--card-alt); }
 .btn-sm.btn-primary { background: var(--accent); color: white; border-color: var(--accent); }
 .btn-sm.btn-primary:hover { background: var(--accent-dim); border-color: var(--accent-dim); }
 .btn-group { display: inline-flex; gap: 6px; }
+
+/* Add-tag button — horizontal layout so "+" icon and "Add" label sit
+   on one line. Previously the narrow width forced "+ Add" to wrap and
+   looked like a cramped 2-line label. min-width keeps it consistent
+   when the label is short. */
+.btn-add-tag {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  white-space: nowrap;
+  flex-shrink: 0;
+  min-width: 78px;
+  justify-content: center;
+  padding: 9px 16px;
+}
+
+/* Inline cross-page link (appears in form-hint text — e.g. "configure
+   it once in Settings"). Styled as the accent colour to invite clicks
+   without looking like a huge button. */
+.inline-link {
+  color: var(--accent);
+  text-decoration: none;
+  border-bottom: 1px dashed var(--accent);
+  cursor: pointer;
+}
+.inline-link:hover {
+  color: var(--accent-dim);
+  border-bottom-style: solid;
+}
 
 /* ─── CHART ─── */
 canvas { max-height: 280px !important; }

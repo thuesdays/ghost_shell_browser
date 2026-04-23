@@ -3,7 +3,7 @@
 // ═══════════════════════════════════════════════════════════════
 
 const PAGES = {
-  overview:    { html: "/pages/overview.html",    init: () => Overview.init() },
+  overview:    { html: "/pages/overview.html",    init: () => Overview.init(),    teardown: () => Overview.teardown?.() },
   profiles:    { html: "/pages/profiles.html",    init: () => Profiles.init(),    teardown: () => Profiles.teardown?.() },
   groups:      { html: "/pages/groups.html",      init: () => Groups.init(),      teardown: () => Groups.teardown?.() },
   // "Domains" page (was "Search") — queries + my-domains + target-domains
@@ -71,6 +71,16 @@ async function navigate(page) {
 // Sidebar click handlers
 $$(".sidebar-item").forEach(item => {
   item.addEventListener("click", () => navigate(item.dataset.page));
+});
+
+// Inline cross-page links — anchor tags with data-nav="page" become
+// in-app navigations instead of full reloads. Useful for "configure it
+// once in Settings" hints inside card bodies.
+document.addEventListener("click", (e) => {
+  const link = e.target.closest("[data-nav]");
+  if (!link) return;
+  e.preventDefault();
+  navigate(link.dataset.nav);
 });
 
 // Brand click → Overview (treat brand like a nav item)

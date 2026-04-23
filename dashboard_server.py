@@ -116,9 +116,13 @@ class RunnerPool:
     def __init__(self):
         self._lock        = threading.RLock()
         self._slots       = {}   # run_id -> RunnerSlot
-        # Merged stream for the dashboard — one queue everyone can subscribe to.
-        # Per-slot queues still exist for targeted consumers.
-        self.broadcast_queue = queue.Queue(maxsize=5000)
+        # Pub/sub broadcast — each SSE subscriber gets its own queue.
+        # Previously there was ONE queue that every subscriber pulled
+        # from, which meant two open tabs would see each log message
+        # alternating between them (Queue.get() removes the item).
+        # Now broadcast_log() fans out to every subscriber's queue.
+        self._subscribers    = set()   # set of queue.Queue
+        self._subs_lock      = threading.Lock()
 
     # ── Lifecycle ───────────────────────────────────────────────
     def add(self, slot: RunnerSlot) -> None:
@@ -172,17 +176,35 @@ class RunnerPool:
     def is_profile_running(self, profile_name: str) -> bool:
         return self.get_by_profile(profile_name) is not None
 
-    # ── Broadcast logging (for the merged /api/logs/live stream) ─
+    # ── Broadcast logging (fan-out to every SSE subscriber) ─────
+    def subscribe(self) -> queue.Queue:
+        """Called by an SSE endpoint to open its own pipe. Caller MUST
+        call unsubscribe() (or guarantee the queue goes out of scope)
+        when done, otherwise we leak one queue per disconnected client."""
+        q = queue.Queue(maxsize=1000)
+        with self._subs_lock:
+            self._subscribers.add(q)
+        return q
+
+    def unsubscribe(self, q: queue.Queue) -> None:
+        with self._subs_lock:
+            self._subscribers.discard(q)
+
     def broadcast_log(self, entry: dict) -> None:
-        try:
-            self.broadcast_queue.put_nowait(entry)
-        except queue.Full:
-            # Drop oldest so newer messages reach subscribers
+        # Fan out to a snapshot of subscribers — capture under the lock
+        # so adding/removing subscribers during iteration is safe.
+        with self._subs_lock:
+            subs = list(self._subscribers)
+        for q in subs:
             try:
-                self.broadcast_queue.get_nowait()
-                self.broadcast_queue.put_nowait(entry)
-            except Exception:
-                pass
+                q.put_nowait(entry)
+            except queue.Full:
+                # Drop oldest so slow subscribers don't starve others
+                try:
+                    q.get_nowait()
+                    q.put_nowait(entry)
+                except Exception:
+                    pass
 
     # ── Helpers ─────────────────────────────────────────────────
     def _slot_to_dict(self, slot: RunnerSlot) -> dict:
@@ -360,9 +382,23 @@ def api_config_set():
 @app.route("/api/stats", methods=["GET"])
 def api_stats():
     db = get_db()
-    total_summary = db.events_summary(hours=24 * 365)  # all события
+
+    # HEADLINE STATS — sourced from the runs table, NOT the events
+    # table. The runs table is written authoritatively by run_finish()
+    # at the end of every run. The events table is optional telemetry
+    # written by session_quality.py — when session_quality writes fail
+    # (captcha-only runs, early errors, log-encoding issues), events
+    # stayed empty and the Overview appeared frozen. By totalling runs
+    # directly we show numbers that always match what actually happened.
+    totals_all = db.runs_totals()               # all-time
+    # Keep events_summary for "blocked" and other niche counters that
+    # don't have a runs column. The key-name mapping below maps legacy
+    # frontend field names to the new data shape.
+    events_summary = db.events_summary(hours=24 * 365)
+
     total_comp, unique_domains = db.competitors_count()
-    profiles = db.profiles_list()
+    all_profiles = db.profiles_list()
+    active_profiles = db.active_profiles_count(days=7)
 
     # Post-click action counters — rolled up from action_events
     actions_24h = db.action_events_summary(hours=24)
@@ -372,13 +408,12 @@ def api_stats():
     try:
         from device_templates import CHROMIUM_BUILD, CHROMIUM_BUILD_FULL, CHROME_VERSIONS
         stable_chrome = CHROME_VERSIONS[0]["major"] if CHROME_VERSIONS else "?"
-        # User-configurable spoof range (major version bounds)
         spoof_min = db.config_get("browser.spoof_chrome_min") or None
         spoof_max = db.config_get("browser.spoof_chrome_max") or None
         build_info = {
             "chromium_build":      CHROMIUM_BUILD,
             "chromium_build_full": CHROMIUM_BUILD_FULL,
-            "chrome_spoof":        stable_chrome,     # top of the pool
+            "chrome_spoof":        stable_chrome,
             "chrome_pool":         [v["major"] for v in CHROME_VERSIONS],
             "chrome_pool_full":    [v["full"]  for v in CHROME_VERSIONS],
             "spoof_min":           spoof_min,
@@ -388,15 +423,22 @@ def api_stats():
         build_info = {}
 
     return jsonify({
-        "total_profiles":    len(profiles),
-        "total_searches":    total_summary.get("search_ok", 0),
-        "total_captchas":    total_summary.get("captcha", 0),
-        "total_blocks":      total_summary.get("blocked", 0),
+        "total_profiles":    len(all_profiles),     # all profiles ever seen
+        "active_profiles":   active_profiles,       # distinct profiles with a run in last 7d
+        # Run-table-sourced headline counters (authoritative)
+        "total_searches":    totals_all["searches"],
+        "total_ads":         totals_all["ads"],
+        "total_captchas":    totals_all["captchas"],
+        "total_runs":        totals_all["runs"],
+        "runs_completed":    totals_all["completed"],
+        "runs_failed":       totals_all["failed"],
+        # Events-sourced (telemetry — may be missing if sqm failed)
+        "total_blocks":      events_summary.get("blocked", 0),
+        # Competitor data — independent table, unaffected by events issue
         "total_competitors": total_comp,
         "unique_domains":    unique_domains,
         "daily":             db.daily_stats(days=14),
         "run_status":        get_run_status_dict(),
-        # Post-click action stats (24h and all-time)
         "actions_24h":       actions_24h,
         "actions_total":     actions_all,
         "build_info":        build_info,
@@ -527,7 +569,7 @@ def api_profile_clear_session_quality(name: str):
         return jsonify({"error": str(e)}), 500
 
 
-@app.route("/api/profiles/<n>/meta", methods=["GET"])
+@app.route("/api/profiles/<name>/meta", methods=["GET"])
 def api_profile_meta_get(name: str):
     """Dashboard-level metadata for a profile: tags, per-profile proxy
     override, rotation config override, notes, group memberships."""
@@ -535,7 +577,7 @@ def api_profile_meta_get(name: str):
     return jsonify(meta)
 
 
-@app.route("/api/profiles/<n>/meta", methods=["POST"])
+@app.route("/api/profiles/<name>/meta", methods=["POST"])
 def api_profile_meta_set(name: str):
     """Partial update of profile metadata. Only keys in the body are
     touched — pass {} to get current state without changes."""
@@ -551,7 +593,7 @@ def api_profile_meta_set(name: str):
     return jsonify(get_db().profile_meta_get(name))
 
 
-@app.route("/api/profiles/<n>/tags", methods=["POST"])
+@app.route("/api/profiles/<name>/tags", methods=["POST"])
 def api_profile_set_tags(name: str):
     """Convenience endpoint for the tag editor — replaces the whole
     tag list for this profile."""
@@ -576,21 +618,34 @@ def api_profile_set_tags(name: str):
 # API: COOKIES / SESSION (per profile)
 # ──────────────────────────────────────────────────────────────
 
-@app.route("/api/profiles/<n>/cookies", methods=["GET"])
+@app.route("/api/profiles/<name>/cookies", methods=["GET"])
 def api_profile_cookies_list(name: str):
     """Return all stored cookies for this profile as Selenium-shape
-    dicts. Read from profiles/<n>/ghostshell_session/cookies.json —
-    Chrome's live DB is not touched.
+    dicts. Merges TWO sources:
+
+      1. profiles/<n>/ghostshell_session/cookies.json
+         — snapshot written by Ghost Shell at the end of the last run.
+      2. profiles/<n>/Default/Network/Cookies
+         — Chrome's own live SQLite cookies DB. Chrome writes to this
+         while the profile is running and keeps it on disk after exit.
+
+    Source #2 is what users actually care about: if they logged into
+    Google during a run and expect the cookies to persist, they want to
+    SEE them right now, not wait for another run. Previously we only
+    read source #1 which was stale by design.
+
+    Each cookie dict has `_source` = "session" / "chrome_live" / "both"
+    so the UI can visualise provenance.
     """
     import cookie_manager
-    cookies = cookie_manager.list_cookies(name)
+    cookies = cookie_manager.list_cookies_merged(name)
     return jsonify({
         "count":   len(cookies),
         "cookies": cookies,
     })
 
 
-@app.route("/api/profiles/<n>/cookies/export", methods=["GET"])
+@app.route("/api/profiles/<name>/cookies/export", methods=["GET"])
 def api_profile_cookies_export(name: str):
     """Download cookies as a JSON or Netscape file.
     Query params:
@@ -598,7 +653,7 @@ def api_profile_cookies_export(name: str):
       ?format=netscape       — classic cookies.txt (curl/wget)
     """
     import cookie_manager
-    cookies = cookie_manager.list_cookies(name)
+    cookies = cookie_manager.list_cookies_merged(name)
     fmt = (request.args.get("format") or "json").lower()
 
     if fmt == "netscape":
@@ -626,7 +681,7 @@ def api_profile_cookies_export(name: str):
     )
 
 
-@app.route("/api/profiles/<n>/cookies/import", methods=["POST"])
+@app.route("/api/profiles/<name>/cookies/import", methods=["POST"])
 def api_profile_cookies_import(name: str):
     """Import cookies from a JSON or Netscape blob.
 
@@ -673,7 +728,7 @@ def api_profile_cookies_import(name: str):
     })
 
 
-@app.route("/api/profiles/<n>/cookies/clear", methods=["POST"])
+@app.route("/api/profiles/<name>/cookies/clear", methods=["POST"])
 def api_profile_cookies_clear(name: str):
     """Delete all cookies for this profile. Note: if the profile is
     currently running, Chrome's live DB still holds them until shutdown.
@@ -683,7 +738,7 @@ def api_profile_cookies_clear(name: str):
     return jsonify({"ok": True})
 
 
-@app.route("/api/profiles/<n>/cookies/<path:cookie_name>", methods=["DELETE"])
+@app.route("/api/profiles/<name>/cookies/<path:cookie_name>", methods=["DELETE"])
 def api_profile_cookie_delete(name: str, cookie_name: str):
     """Delete a single cookie by its name (across all domains the
     profile has for it). Used by the row-level delete button in the UI."""
@@ -695,7 +750,7 @@ def api_profile_cookie_delete(name: str, cookie_name: str):
     return jsonify({"ok": True, "removed": before - len(filtered)})
 
 
-@app.route("/api/profiles/<n>/storage", methods=["GET"])
+@app.route("/api/profiles/<name>/storage", methods=["GET"])
 def api_profile_storage_list(name: str):
     """Return stored localStorage map (per-origin JSON dict)."""
     import cookie_manager
@@ -906,6 +961,42 @@ def get_run_status_dict():
 
 @app.route("/api/run/status", methods=["GET"])
 def api_run_status():
+    """Sidebar polls this to render its "N running" widget.
+    Also used by scheduler.py to poll status of a specific run it
+    spawned — in that case it passes ?run_id=N. Without the run_id
+    param, returns the "most recent active" shape (legacy behaviour)."""
+    run_id = request.args.get("run_id", type=int)
+    if run_id is not None:
+        slot = RUNNER_POOL.get(run_id)
+        if slot is None:
+            # Not in the in-memory pool — look at the DB as fallback.
+            # This matters when the run finished N minutes ago and was
+            # garbage-collected from RUNNER_POOL but scheduler is still
+            # polling for its exit code.
+            try:
+                row = get_db()._get_conn().execute(
+                    "SELECT * FROM runs WHERE id = ?", (run_id,)
+                ).fetchone()
+                if row:
+                    return jsonify({
+                        "running":     row["finished_at"] is None,
+                        "exit_code":   row["exit_code"],
+                        "run_id":      row["id"],
+                        "profile_name": row["profile_name"],
+                        "started_at":  row["started_at"],
+                        "finished_at": row["finished_at"],
+                    })
+            except Exception:
+                pass
+            return jsonify({"running": False, "run_id": run_id, "exit_code": None})
+        return jsonify({
+            "running":     slot.is_running,
+            "exit_code":   slot.last_exit_code,
+            "run_id":      slot.run_id,
+            "profile_name": slot.profile_name,
+            "started_at":  slot.started_at,
+            "finished_at": slot.finished_at,
+        })
     return jsonify(get_run_status_dict())
 
 
@@ -923,77 +1014,46 @@ def api_runs_active():
     })
 
 
-def _spawn_run(profile_name: str) -> dict:
-    """
-    Shared launch path — used by /api/run (legacy default) and
-    /api/runs (explicit per-profile). Enforces:
-      - one-run-per-profile rule (prevents user-data-dir corruption)
-      - global max_parallel cap from config
-    Returns {"ok": True, "run_id": N} on success, or raises ValueError
-    with an HTTP-friendly message on cap violation.
-    """
-    if RUNNER_POOL.is_profile_running(profile_name):
-        raise ValueError(
-            f"Profile {profile_name!r} is already running — one run per "
-            f"profile at a time (they'd corrupt each other's user-data-dir)"
-        )
+# Serialises the check-and-reserve window inside _spawn_run. Flask's
+# threaded=True means multiple HTTP requests land in parallel worker
+# threads; without this lock two concurrent POSTs for the same profile
+# could both pass is_profile_running() check before either registers
+# a slot. Held only briefly — released before the actual subprocess
+# Popen, which is the slow step.
+_SPAWN_LOCK = threading.Lock()
 
-    db = get_db()
 
-    # ── Cross-process guard ─────────────────────────────────────
-    # RunnerPool only knows about runs spawned by THIS dashboard
-    # instance. If dashboard was restarted while a run was alive,
-    # or if another tool started main.py directly, the pool is empty
-    # but Chrome/main.py might still be running. Check the DB (shared
-    # source of truth) and reap any stale entries automatically.
-    try:
-        from process_reaper import ensure_no_live_run_for_profile
-        err = ensure_no_live_run_for_profile(db, profile_name)
-        if err:
-            raise ValueError(err)
-    except ValueError:
-        raise
-    except Exception as e:
-        logging.warning(f"[api_run] pre-spawn guard failed (ignoring): {e}")
+def _launch_run_thread(slot: "RunnerSlot", proxy_url: str) -> None:
+    """Spawn the main.py subprocess for a reserved slot and start its
+    stdout-reader + chrome-watcher threads. Called OUTSIDE _SPAWN_LOCK
+    so concurrent spawns for different profiles don't serialise on
+    Popen latency.
 
-    max_parallel = int(db.config_get("runner.max_parallel", 4) or 4)
-    if RUNNER_POOL.active_count() >= max_parallel:
-        raise ValueError(
-            f"Concurrent-run cap reached ({max_parallel}). Stop one "
-            f"or raise runner.max_parallel in Settings."
-        )
-
-    # Effective proxy for THIS profile — respects per-profile overrides.
-    proxy_cfg = db.profile_effective_proxy(profile_name)
-    proxy_url = proxy_cfg["url"]
-
-    run_id = db.run_start(profile_name, proxy_url)
-    slot = RunnerSlot(run_id=run_id, profile_name=profile_name)
-    RUNNER_POOL.add(slot)
+    The heavy lifting is in the inner `run_thread` closure which stays
+    alive for the whole lifetime of the run — it owns the Popen, pipes
+    stdout into per-slot logs + broadcast, runs the chrome-tree
+    watcher, and updates DB when the process exits."""
+    run_id       = slot.run_id
+    profile_name = slot.profile_name
+    db           = get_db()
 
     def run_thread():
         slot.log(
-            f"Overпуск #{run_id} мониторинга (profile: {profile_name})...",
+            f"Starting run #{run_id} (profile: {profile_name})...",
             "info",
         )
-        # Fan out this log into the broadcast stream so the global SSE
-        # subscribers still see it.
+        # Fan out to every SSE subscriber so all open tabs see this line.
         RUNNER_POOL.broadcast_log({
-            "ts": datetime.now().strftime("%H:%M:%S"),
-            "level": "info",
-            "message": f"▶ #{run_id} {profile_name} — starting",
-            "run_id": run_id,
+            "ts":           datetime.now().strftime("%H:%M:%S"),
+            "level":        "info",
+            "message":      f"▶ #{run_id} {profile_name} — starting",
+            "run_id":       run_id,
             "profile_name": profile_name,
         })
         try:
             env = os.environ.copy()
             env["GHOST_SHELL_RUN_ID"]       = str(run_id)
-            # Tell main.py which profile to run — it used to read
-            # browser.profile_name from DB, but with multi-run we
-            # need to override per-subprocess.
             env["GHOST_SHELL_PROFILE_NAME"] = profile_name
-            # Per-profile proxy override plumbed through env so main.py
-            # doesn't need to re-resolve effective config itself.
             if proxy_url:
                 env["GHOST_SHELL_PROXY_URL"] = proxy_url
 
@@ -1008,15 +1068,16 @@ def _spawn_run(profile_name: str) -> dict:
             )
             slot.process = proc
 
-            # Record the PID in the DB so if this dashboard dies or
-            # restarts while the run is active, the next startup can
-            # find and kill this process tree via process_reaper.
+            # Record PID so reap_stale_runs can find this tree if the
+            # dashboard is restarted mid-run.
             try:
                 db.run_set_pid(run_id, proc.pid)
             except Exception as e:
                 logging.warning(f"[api_run] run_set_pid failed: {e}")
 
-            # Chrome-tree monitor — same logic as before, scoped to this slot.
+            # Chrome-tree watcher — detects user-closed-the-window,
+            # terminates main.py so we don't keep its python wrapper
+            # alive after Chrome died.
             chrome_ever_seen = {"value": False}
             monitor_stop     = threading.Event()
 
@@ -1059,7 +1120,8 @@ def _spawn_run(profile_name: str) -> dict:
             mon_thread = threading.Thread(target=_chrome_monitor, daemon=True)
             mon_thread.start()
 
-            # Route stdout into this slot's log + broadcast
+            # Route stdout into slot.log + broadcast to SSE subscribers.
+            # Reading line-by-line blocks until the child prints or exits.
             try:
                 for line in proc.stdout:
                     line = line.rstrip()
@@ -1070,10 +1132,10 @@ def _spawn_run(profile_name: str) -> dict:
                     elif "WARN" in line:  lvl = "warning"
                     slot.log(line, lvl)
                     RUNNER_POOL.broadcast_log({
-                        "ts":      datetime.now().strftime("%H:%M:%S"),
-                        "level":   lvl,
-                        "message": line,
-                        "run_id":  run_id,
+                        "ts":           datetime.now().strftime("%H:%M:%S"),
+                        "level":        lvl,
+                        "message":      line,
+                        "run_id":       run_id,
                         "profile_name": profile_name,
                     })
             except Exception as e:
@@ -1083,6 +1145,7 @@ def _spawn_run(profile_name: str) -> dict:
             proc.wait()
             exit_code = proc.returncode
 
+            # Run-end stats — aggregate events written by this run.
             total = db.events_summary(hours=24)
             db.run_finish(
                 run_id,
@@ -1099,11 +1162,11 @@ def _spawn_run(profile_name: str) -> dict:
 
         except Exception as e:
             db.run_finish(run_id, exit_code=-1, error=str(e))
-            slot.log(f"Error запуска: {e}", "error")
+            slot.log(f"Error during run: {e}", "error")
             RUNNER_POOL.mark_finished(run_id, exit_code=-1, error=str(e))
         finally:
-            # Keep the slot around for 60s so the UI can read the final
-            # status, then GC.
+            # Keep the slot around for 60s so the UI can show final
+            # status in active_runs queries, then GC.
             def _gc():
                 time.sleep(60)
                 RUNNER_POOL.remove(run_id)
@@ -1113,6 +1176,63 @@ def _spawn_run(profile_name: str) -> dict:
     slot.thread = t
     t.start()
 
+
+def _spawn_run(profile_name: str) -> dict:
+    """
+    Shared launch path — used by /api/run (legacy default) and
+    /api/runs (explicit per-profile). Enforces:
+      - one-run-per-profile rule (prevents user-data-dir corruption)
+      - global max_parallel cap from config
+    Returns {"ok": True, "run_id": N} on success, or raises ValueError
+    with an HTTP-friendly message on cap violation.
+
+    Flask runs with threaded=True, so two concurrent POSTs to the same
+    URL land in two worker threads simultaneously. Without the lock
+    below, both could pass the is_profile_running() check (reading
+    false) before either one registers a slot — resulting in two
+    main.py processes on the same profile, both trashing the same
+    user-data-dir. The lock serialises the "check → reserve" window.
+    """
+    with _SPAWN_LOCK:
+        if RUNNER_POOL.is_profile_running(profile_name):
+            raise ValueError(
+                f"Profile {profile_name!r} is already running — one run per "
+                f"profile at a time (they'd corrupt each other's user-data-dir)"
+            )
+
+        db = get_db()
+
+        # Cross-process guard (separate from RunnerPool check)
+        try:
+            from process_reaper import ensure_no_live_run_for_profile
+            err = ensure_no_live_run_for_profile(db, profile_name)
+            if err:
+                raise ValueError(err)
+        except ValueError:
+            raise
+        except Exception as e:
+            logging.warning(f"[api_run] pre-spawn guard failed (ignoring): {e}")
+
+        max_parallel = int(db.config_get("runner.max_parallel", 4) or 4)
+        if RUNNER_POOL.active_count() >= max_parallel:
+            raise ValueError(
+                f"Concurrent-run cap reached ({max_parallel}). Stop one "
+                f"or raise runner.max_parallel in Settings."
+            )
+
+        # Reserve a slot — creates the run_id and registers the slot
+        # BEFORE we leave the lock. Everything after the lock is
+        # per-slot and doesn't interfere with another profile's spawn.
+        proxy_cfg = db.profile_effective_proxy(profile_name)
+        proxy_url = proxy_cfg["url"]
+        run_id = db.run_start(profile_name, proxy_url)
+        slot = RunnerSlot(run_id=run_id, profile_name=profile_name)
+        RUNNER_POOL.add(slot)
+
+    # Outside the lock from here — the actual subprocess spawn can
+    # take ~2 seconds (Popen + PID recording) which we don't want
+    # blocking other profiles' spawn paths.
+    _launch_run_thread(slot, proxy_url)
     return {"ok": True, "run_id": run_id, "profile_name": profile_name,
             "started_at": slot.started_at}
 
@@ -1125,6 +1245,26 @@ def api_run():
     payload = request.get_json(silent=True) or {}
     profile_name = payload.get("profile_name") or \
                    get_db().config_get("browser.profile_name", "profile_01")
+    try:
+        result = _spawn_run(profile_name)
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 409
+    return jsonify(result)
+
+
+@app.route("/api/run/start", methods=["POST"])
+def api_run_start():
+    """Scheduler-facing spawn endpoint. Identical behaviour to
+    /api/runs but accepts the same payload shape scheduler.py uses
+    ({profile_name: ...}). Previously scheduler posted to this URL
+    and silently 404'd — which sent it to the fallback Popen path,
+    bypassing the dashboard's log pipe AND the slot registry. Result:
+    the run happened, but its logs never appeared in the UI and the
+    active-runs panel showed nothing. This alias fixes both."""
+    payload = request.get_json(silent=True) or {}
+    profile_name = payload.get("profile_name")
+    if not profile_name:
+        return jsonify({"error": "profile_name required"}), 400
     try:
         result = _spawn_run(profile_name)
     except ValueError as e:
@@ -1152,8 +1292,16 @@ def api_runs_start():
 
 
 @app.route("/api/runs/<int:run_id>/stop", methods=["POST"])
+@app.route("/api/run/<int:run_id>/stop", methods=["POST"])
 def api_runs_stop_specific(run_id: int):
-    """Stop one specific run by its run_id. Leaves other active runs alone."""
+    """Stop one specific run by its run_id. Leaves other active runs alone.
+
+    Exposed under BOTH /api/runs/<id>/stop (canonical, plural) and
+    /api/run/<id>/stop (singular alias used by scheduler.py). The alias
+    is here for the same reason /api/run/start exists as an alias for
+    /api/runs — scheduler code uses the singular form and silently
+    404'd before this fix, which meant timeout-triggered kills were
+    never delivered and hung runs kept running until they self-healed."""
     slot = RUNNER_POOL.get(run_id)
     if not slot or not slot.is_running or not slot.process:
         return jsonify({"error": "Run not found or not active"}), 409
@@ -1485,14 +1633,18 @@ def api_logs_live():
     """SSE live logs stream — merged across all active runs.
 
     Each entry includes run_id and profile_name so the Logs page can
-    tag/filter lines by which run they came from.
+    tag/filter lines by which run they came from. Each browser tab gets
+    its own subscriber queue so open-in-two-tabs works without messages
+    alternating between them.
     """
+    my_queue = RUNNER_POOL.subscribe()
+
     def generate():
         last_heartbeat = time.time()
         try:
             while True:
                 try:
-                    entry = RUNNER_POOL.broadcast_queue.get(timeout=1)
+                    entry = my_queue.get(timeout=1)
                     yield f"data: {json.dumps(entry, ensure_ascii=False)}\n\n"
                     last_heartbeat = time.time()
                 except queue.Empty:
@@ -1503,6 +1655,12 @@ def api_logs_live():
                     continue
         except GeneratorExit:
             return
+        finally:
+            # Whether client closed cleanly or via exception, release
+            # our queue slot so broadcast_log() doesn't keep pushing
+            # into a dead queue forever (bounded by 1000 then FIFO-drop,
+            # but still wasteful).
+            RUNNER_POOL.unsubscribe(my_queue)
 
     return Response(generate(), mimetype="text/event-stream", headers={
         "Cache-Control":      "no-cache",
@@ -1716,8 +1874,8 @@ def api_profile_create():
         return jsonify({"error": str(e)}), 500
 
 
-@app.route("/api/profiles/<n>/regenerate-fingerprint", methods=["POST"])
-def api_profile_regenerate_fingerprint(n):
+@app.route("/api/profiles/<name>/regenerate-fingerprint", methods=["POST"])
+def api_profile_regenerate_fingerprint(name):
     """
     Re-roll the fingerprint for an existing profile. Useful if current
     fingerprint is getting flagged — new seed = new UA / screen / fonts.
@@ -1730,11 +1888,11 @@ def api_profile_regenerate_fingerprint(n):
     new_seed  = data.get("seed_suffix")   # optional: appended to profile name
 
     db = get_db()
-    if hasattr(db, "profile_get") and not db.profile_get(n):
+    if hasattr(db, "profile_get") and not db.profile_get(name):
         return jsonify({"error": "profile not found"}), 404
 
     if not language:
-        prof = db.profile_get(n) if hasattr(db, "profile_get") else {}
+        prof = db.profile_get(name) if hasattr(db, "profile_get") else {}
         language = (prof or {}).get("preferred_language") or "uk-UA"
 
     if template == "auto":
@@ -1743,13 +1901,13 @@ def api_profile_regenerate_fingerprint(n):
     try:
         # Use a variant of the profile name to get deterministic-but-different
         # fingerprint without losing the ability to re-roll deterministically.
-        seed_name = n
+        seed_name = name
         if new_seed:
-            seed_name = f"{n}#{new_seed}"
+            seed_name = f"{name}#{new_seed}"
         else:
             # Timestamp-based seed for one-shot "just give me something new"
             import time as _t
-            seed_name = f"{n}#{int(_t.time())}"
+            seed_name = f"{name}#{int(_t.time())}"
 
         builder = DeviceTemplateBuilder(
             profile_name       = seed_name,
@@ -1759,12 +1917,12 @@ def api_profile_regenerate_fingerprint(n):
         payload = builder.generate_payload_dict()
         # Save under the ORIGINAL profile name so the new fingerprint
         # becomes the active one.
-        payload["profile_name"] = n
-        db.fingerprint_save(n, payload)
+        payload["profile_name"] = name
+        db.fingerprint_save(name, payload)
 
         # Clear cached health state — old 13/13 no longer applies
         if hasattr(db, "reset_profile_health"):
-            db.reset_profile_health(n)
+            db.reset_profile_health(name)
 
         return jsonify({
             "ok":            True,
@@ -1777,8 +1935,8 @@ def api_profile_regenerate_fingerprint(n):
         traceback.print_exc()
         return jsonify({"error": str(e)}), 500
 
-@app.route("/api/profiles/<n>/clear-history", methods=["POST"])
-def api_profile_clear_history_new(n):
+@app.route("/api/profiles/<name>/clear-history", methods=["POST"])
+def api_profile_clear_history_new(name):
     """
     Clear profile history. Scope selects what to clear:
       events | runs | logs | selfchecks | all
@@ -1790,7 +1948,7 @@ def api_profile_clear_history_new(n):
 
     db = get_db()
     try:
-        result = db.clear_profile_history(n, scope=scope)
+        result = db.clear_profile_history(name, scope=scope)
         return jsonify({"ok": True, "cleared": result})
     except Exception as e:
         return jsonify({"error": str(e)}), 500

@@ -52,6 +52,20 @@ function startLogStream() {
 // ─── Start/Stop for the sidebar's "default profile" button ──────
 
 async function startRun(profileName) {
+  // Dimmed-button guard — the UI already disables the button via the
+  // `run-btn-dim` class when scheduler is active or other profiles are
+  // running, but the HTML click event still fires on some browsers
+  // (particularly when the user held the button focused from before
+  // dashboard update). Explain why nothing happens.
+  const btn = runBtn();
+  if (btn && btn.classList.contains("run-btn-dim")) {
+    toast(
+      "Can't start now — scheduler or another run is active. " +
+      "Stop them first (🧹 Clean zombies on Scheduler page if needed).",
+      true
+    );
+    return;
+  }
   try {
     const body = profileName ? JSON.stringify({ profile_name: profileName }) : "{}";
     await api("/api/run", { method: "POST", body });
@@ -136,15 +150,20 @@ function _elapsedShort(isoStr) {
 
 async function updateRunStatus() {
   try {
-    // Pull both endpoints in parallel — legacy default-profile state
-    // and the full active-runs list.
-    const [s, active] = await Promise.all([
+    // Pull three endpoints in parallel — legacy default-profile state,
+    // the full active-runs list, AND scheduler status so the sidebar
+    // Run button reflects reality (previously the big green "Run" stayed
+    // the same whether scheduler was spinning up profiles or not, which
+    // led users to click it and get confusing "already running" errors).
+    const [s, active, sched] = await Promise.all([
       api("/api/run/status"),
       api("/api/runs/active"),
+      api("/api/scheduler/status").catch(() => ({ is_running: false })),
     ]);
 
     const activeRuns = active?.runs || [];
     const activeCount = activeRuns.length;
+    const schedRunning = !!sched?.is_running;
 
     // Default-profile control (sidebar Start/Stop pair). It shows Stop
     // ONLY if the active-run list contains the default profile name.
@@ -161,23 +180,50 @@ async function updateRunStatus() {
       stopBtn().style.display = "flex";
       const match = activeRuns.find(r => r.profile_name === defaultProfile);
       runStatus().textContent = `Running (#${match?.run_id || "?"})`;
-    } else {
+    } else if (activeCount > 0 || schedRunning) {
+      // Something IS running — another profile, or the scheduler is
+      // orchestrating profiles on its own schedule. Either way, the
+      // big sidebar "Run default profile" button becomes misleading:
+      // clicking it would try to spawn ANOTHER run on top, which is
+      // almost never what the user wants. So we dim+disable it and
+      // show what's going on.
       runBtn().style.display = "flex";
+      runBtn().disabled      = true;
+      runBtn().classList.add("run-btn-dim");
       stopBtn().style.display = "none";
-      if (s.finished_at && !activeCount) {
+      if (schedRunning) {
+        const profPart = activeCount
+          ? ` · ${activeRuns[0].profile_name}`
+          : "";
+        runStatus().textContent = `Scheduler active${profPart}`;
+      } else {
+        runStatus().textContent =
+          `${activeCount} other run${activeCount === 1 ? "" : "s"} active`;
+      }
+    } else {
+      // Fully idle — restore the button to its pristine green state.
+      runBtn().style.display = "flex";
+      runBtn().disabled      = false;
+      runBtn().classList.remove("run-btn-dim");
+      stopBtn().style.display = "none";
+      if (s.finished_at) {
         const code = s.last_exit_code === 0 ? "ok" : `code ${s.last_exit_code}`;
         runStatus().textContent = `Finished (${code})`;
       } else {
-        runStatus().textContent = activeCount
-          ? `${activeCount} other run${activeCount === 1 ? "" : "s"} active`
-          : "Ready";
+        runStatus().textContent = "Ready";
       }
     }
 
     // Subtitle under the default button
     const sub = document.getElementById("run-status-sub");
     if (sub) {
-      if (defaultIsRunning) {
+      if (schedRunning && !defaultIsRunning) {
+        // Scheduler does its own profile picking; the default-profile
+        // label here would be misleading. Show runs-today progress
+        // instead — matches what the user set as their daily target.
+        const target = sched.target_runs_per_day || "?";
+        sub.textContent = `scheduler: ${sched.runs_today ?? 0}/${target} today`;
+      } else if (defaultIsRunning) {
         sub.textContent = `profile: ${defaultProfile}`;
       } else {
         sub.textContent = defaultProfile
@@ -189,7 +235,38 @@ async function updateRunStatus() {
     // Active runs panel — show only if there's at least one run.
     // Lists every active slot independent of default-profile logic.
     _renderActiveRunsPanel(activeRuns);
+
+    // Scheduler badge on the sidebar nav item — subtle dot on the
+    // Scheduler menu entry that turns green when scheduler is alive.
+    _paintSchedulerNavBadge(sched);
   } catch {}
+}
+
+function _paintSchedulerNavBadge(sched) {
+  // Find the Scheduler sidebar entry and toggle a dot on it. Keeps
+  // the user aware the scheduler is active even when they're on a
+  // different page.
+  const navItem = document.querySelector('.sidebar-item[data-page="scheduler"]');
+  if (!navItem) return;
+  let dot = navItem.querySelector(".sidebar-nav-dot");
+  const health = sched?.health || (sched?.is_running ? "ok" : "stopped");
+  if (health === "stopped") {
+    if (dot) dot.remove();
+    return;
+  }
+  if (!dot) {
+    dot = document.createElement("span");
+    dot.className = "sidebar-nav-dot";
+    dot.title     = "Scheduler is running";
+    navItem.appendChild(dot);
+  }
+  // Colour: ok=green, stale=amber, crashed=red.
+  dot.dataset.health = health;
+  dot.title = {
+    ok:      "Scheduler is running",
+    stale:   "Scheduler wedged — no recent heartbeat",
+    crashed: "Scheduler crashed — use 🧹 Clean zombies",
+  }[health] || "Scheduler is running";
 }
 
 function _renderActiveRunsPanel(activeRuns) {

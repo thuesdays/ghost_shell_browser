@@ -458,7 +458,15 @@ class DB:
         self._init_schema()
 
     def _get_conn(self) -> sqlite3.Connection:
-        """Коннекция for текущего потока"""
+        """Per-thread SQLite connection. WAL mode + busy_timeout together
+        let us safely have N writers from different threads/processes
+        without sporadic 'database is locked' errors.
+
+        Thread model:
+          - Each thread gets its own connection via threading.local
+          - WAL journal mode allows concurrent read+write without blocking
+          - busy_timeout=5000ms makes SQLite retry internally before raising
+            OperationalError when another writer holds the lock"""
         conn = getattr(self._local, "conn", None)
         if conn is None:
             conn = sqlite3.connect(self.path, isolation_level=None, check_same_thread=False)
@@ -466,6 +474,13 @@ class DB:
             conn.execute("PRAGMA journal_mode=WAL")
             conn.execute("PRAGMA synchronous=NORMAL")
             conn.execute("PRAGMA foreign_keys=ON")
+            # 5 seconds of internal retry when lock is held by another
+            # writer. Covers the worst-case burst: dashboard stats query
+            # + main.py heartbeat + traffic flush firing in the same
+            # instant. Without this we'd get "database is locked" at
+            # random and individual calls would fail — noisy and requires
+            # caller-side retry for every method in the class.
+            conn.execute("PRAGMA busy_timeout=5000")
             self._local.conn = conn
         return conn
 
@@ -677,6 +692,55 @@ class DB:
     # ──────────────────────────────────────────────────────────
     # EVENTS
     # ──────────────────────────────────────────────────────────
+
+    def runs_totals(self, hours: int = None) -> dict:
+        """Aggregate counters from the runs table itself. This is the
+        AUTHORITATIVE source for headline stats (total searches, total
+        ads, captchas) — the events table is optional telemetry that
+        may or may not be populated by session_quality, so relying on
+        it made the Overview look stuck at 3/3/0 even after many real
+        runs completed.
+
+        `runs.total_queries` / `runs.total_ads` / `runs.captchas` are
+        written by run_finish() at the end of every run, so they always
+        match reality.
+
+        `hours=None` = all-time. Pass an int for a rolling window."""
+        conn = self._get_conn()
+        where, params = [], []
+        if hours is not None:
+            cutoff = (datetime.now() - timedelta(hours=hours)).isoformat(timespec="seconds")
+            where.append("started_at >= ?")
+            params.append(cutoff)
+        sql = "SELECT COUNT(*) AS n, " \
+              "COALESCE(SUM(total_queries), 0) AS queries, " \
+              "COALESCE(SUM(total_ads), 0)     AS ads, " \
+              "COALESCE(SUM(captchas), 0)      AS captchas, " \
+              "SUM(CASE WHEN exit_code = 0 THEN 1 ELSE 0 END) AS completed, " \
+              "SUM(CASE WHEN exit_code IS NOT NULL AND exit_code != 0 THEN 1 ELSE 0 END) AS failed " \
+              "FROM runs"
+        if where:
+            sql += " WHERE " + " AND ".join(where)
+        row = conn.execute(sql, params).fetchone()
+        return {
+            "runs":      row["n"] or 0,
+            "searches":  row["queries"] or 0,
+            "ads":       row["ads"] or 0,
+            "captchas":  row["captchas"] or 0,
+            "completed": row["completed"] or 0,
+            "failed":    row["failed"] or 0,
+        }
+
+    def active_profiles_count(self, days: int = 7) -> int:
+        """Distinct profiles that had at least one run in the last N days.
+        'Active profiles' on Overview was showing 1 regardless of how
+        many profiles actually ran; this makes the count honest."""
+        cutoff = (datetime.now() - timedelta(days=days)).isoformat(timespec="seconds")
+        row = self._get_conn().execute(
+            "SELECT COUNT(DISTINCT profile_name) AS n FROM runs WHERE started_at >= ?",
+            (cutoff,)
+        ).fetchone()
+        return row["n"] if row else 0
 
     def event_record(self, run_id: Optional[int], profile_name: str, event_type: str,
                      query: str = None, details: str = None,
@@ -1690,36 +1754,50 @@ class DB:
     # ──────────────────────────────────────────────────────────
 
     def daily_stats(self, days: int = 14) -> list[dict]:
-        """Статистика по дням for графика"""
+        """Per-day rollup used by the Overview chart. Sourced from the
+        runs table because it's the same source of truth as runs_totals().
+        Previously we rolled up from events which meant the 7-day chart
+        would show blank days while the Recent Activity below listed
+        completed runs for those same days — very confusing.
+
+        One row per DAY that has at least one run. Days with no runs are
+        omitted (front-end can gap-fill with zeros if it wants a dense
+        timeline)."""
         conn = self._get_conn()
         cutoff = (datetime.now() - timedelta(days=days)).isoformat(timespec="seconds")
+
         rows = conn.execute("""
             SELECT
-                substr(timestamp, 1, 10) as date,
-                event_type,
-                COUNT(*) as n
-            FROM events
-            WHERE timestamp >= ?
-            GROUP BY date, event_type
+                substr(started_at, 1, 10) AS date,
+                COUNT(*)                   AS runs,
+                COALESCE(SUM(total_queries), 0) AS searches,
+                COALESCE(SUM(total_ads),     0) AS ads,
+                COALESCE(SUM(captchas),      0) AS captchas,
+                SUM(CASE WHEN exit_code = 0 THEN 1 ELSE 0 END) AS completed,
+                SUM(CASE WHEN exit_code IS NOT NULL AND exit_code != 0 THEN 1 ELSE 0 END) AS failed
+            FROM runs
+            WHERE started_at >= ?
+            GROUP BY date
             ORDER BY date
         """, (cutoff,)).fetchall()
 
-        by_day = {}
+        out = []
         for r in rows:
-            d = r["date"]
-            if d not in by_day:
-                by_day[d] = {"date": d, "searches": 0, "captchas": 0, "empty": 0, "blocks": 0}
-            et = r["event_type"]
-            if et == "search_ok":
-                by_day[d]["searches"] = r["n"]
-            elif et == "search_empty":
-                by_day[d]["empty"] = r["n"]
-            elif et == "captcha":
-                by_day[d]["captchas"] = r["n"]
-            elif et == "blocked":
-                by_day[d]["blocks"] = r["n"]
-
-        return list(by_day.values())
+            searches = r["searches"] or 0
+            empty    = max(0, (r["runs"] or 0) - (r["completed"] or 0))
+            out.append({
+                "date":      r["date"],
+                "runs":      r["runs"] or 0,
+                "searches":  searches,
+                "ads":       r["ads"] or 0,       # matches front-end field name
+                "captchas":  r["captchas"] or 0,
+                "completed": r["completed"] or 0,
+                "failed":    r["failed"] or 0,
+                # Legacy key "empty" for backwards-compat with existing chart JS.
+                # Now means "runs that didn't complete successfully".
+                "empty":     empty,
+            })
+        return out
 
     # ──────────────────────────────────────────────────────────
     # МИГРАЦИЯ ИЗ СТАРЫХ ФАЙЛОВ

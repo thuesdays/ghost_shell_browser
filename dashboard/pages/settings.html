@@ -31,6 +31,30 @@
     </div>
   </div>
 
+  <!-- ─── Install paths (moved here from Edit profile) ─────────── -->
+  <!-- This is a global install-level setting: every profile spawns the
+       same Chromium binary. Previously shown on the per-profile page,
+       which led users to believe each profile had its own binary —
+       which isn't how things worked. -->
+  <div class="card">
+    <div class="card-title">🔧 Install paths</div>
+    <div class="form-hint" style="margin-bottom: 16px;">
+      One Chromium install serves every profile. Change only if you moved
+      the binary or built a new tree.
+    </div>
+    <div class="form-group">
+      <label class="form-label">Chromium binary path</label>
+      <input type="text" class="input" data-config="browser.binary_path"
+             placeholder="chrome-win64/chrome.exe">
+      <div class="form-hint">
+        Relative (to project folder) or absolute. Examples:
+        <code>chrome-win64/chrome.exe</code> on Windows,
+        <code>chrome-linux64/chrome</code> on Linux,
+        <code>chrome-mac/Chromium.app/Contents/MacOS/Chromium</code> on macOS.
+      </div>
+    </div>
+  </div>
+
   <!-- ─── UA spoof range ─────────────────────────────────────── -->
   <div class="card">
     <div class="card-title">🎭 UA spoof range</div>

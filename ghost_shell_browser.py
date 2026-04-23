@@ -106,6 +106,17 @@ class GhostShellBrowser:
         self._rotating_tracker = None
         self._profile_log_handler = None   # set by setup_profile_logging
 
+        # Runtime subsystems — initialised to neutral defaults so close()
+        # can be called safely even if start() fails halfway through.
+        # Previously, failing BEFORE the watchdog init line meant close()
+        # would AttributeError on `self._watchdog_stop` and never reach
+        # the later cleanup lines → zombie Chrome leaked.
+        self._traffic_collector    = None
+        self._watchdog_thread      = None
+        self._watchdog_stop        = threading.Event()
+        self._watchdog_fail_count  = 0
+        self._gs_lock_path         = None
+
         # Profile Enrichment (Simulate an aged browser profile before creation).
         # Can be disabled via env (GHOST_SHELL_SKIP_ENRICH=1) for debugging.
         is_new_profile = not os.path.exists(self.user_data_path)
@@ -580,20 +591,34 @@ class GhostShellBrowser:
         self.driver = webdriver.Chrome(service=service, options=options)
         logging.info("[GhostShellBrowser] Chrome session established ✓")
 
-        # Increase urllib3 connection pool size for the driver's HTTP
-        # channel. Default is 1 — which means when main.py is mid-call
-        # (driver.get waiting 10s for DOMContentLoaded), the watchdog's
-        # driver.title ping competes for the same single connection and
-        # triggers "Connection pool is full, discarding connection"
-        # warnings + false-positive hang detection.
+        # Increase urllib3 connection pool size for Selenium's HTTP
+        # channel to chromedriver. Default is 1 — which means when main
+        # thread is mid-call (driver.get waiting for DOMContentLoaded),
+        # the watchdog's driver.title ping competes for the same single
+        # connection and triggers "Connection pool is full, discarding
+        # connection" warnings + false-positive hang detection.
         #
-        # Size 5 is enough for main-thread + watchdog ping + occasional
-        # CDP command without contention.
+        # urllib3 PoolManager creates HTTPConnectionPools lazily per host,
+        # so we have to either (a) set the defaults BEFORE any request
+        # lands, or (b) mutate each pool after creation. The old code did
+        # `pool.pool._maxsize = 5` — that's wrong: `command_executor._conn`
+        # is the PoolManager itself (no `.pool` attribute; `.pools` plural
+        # is the cache dict). Fix: set the pool_kw with maxsize, then
+        # additionally bump maxsize on any already-created pools (there
+        # shouldn't be any yet since we bump before the first probe).
         try:
-            pool = getattr(self.driver.command_executor, "_conn", None)
-            if pool is not None and hasattr(pool, "pool"):
-                # urllib3 >= 1.x connection manager
-                pool.pool._maxsize = 5
+            pm = getattr(self.driver.command_executor, "_conn", None)
+            if pm is not None and hasattr(pm, "connection_pool_kw"):
+                pm.connection_pool_kw["maxsize"] = 5
+                pm.connection_pool_kw["block"]  = False
+                # Clear any already-made pools so the new maxsize applies.
+                # .pools is either a RecentlyUsedContainer or dict — both
+                # have clear().
+                try:
+                    pm.pools.clear()
+                except Exception:
+                    pass
+                logging.debug("[GhostShellBrowser] urllib3 pool maxsize=5")
         except Exception as e:
             logging.debug(f"[GhostShellBrowser] pool size bump skipped: {e}")
 
@@ -606,45 +631,19 @@ class GhostShellBrowser:
         h = win_h - 120 + random.randint(-15, 15)
         self.driver.set_window_size(w, h)
 
-        # ── Traffic collector — optional, config-gated ──────────────
-        # Tracks bytes per domain for the dashboard's bandwidth charts.
-        # Lightweight (PerformanceObserver + polling every 5s), gated on
-        # traffic.enabled so users with tight disk / slow boxes can skip.
-        self._traffic_collector = None
-        try:
-            from db import get_db as _get_db
-            db = _get_db()
-            if db.config_get("traffic.enabled") is not False:  # default True
-                from traffic_collector import TrafficCollector
-                self._traffic_collector = TrafficCollector(
-                    driver             = self.driver,
-                    profile_name       = self.profile_name or "default",
-                    run_id             = self.run_id,
-                    db                 = db,
-                    flush_interval_sec = int(
-                        db.config_get("traffic.flush_interval_sec") or 30
-                    ),
-                )
-                self._traffic_collector.start()
-        except Exception as e:
-            logging.warning(f"[GhostShellBrowser] Traffic collector init failed: {e}")
-
-        # ── Hang watchdog ──────────────────────────────────────────
-        # Pokes driver.title every WATCHDOG_PROBE_SEC seconds. If N
-        # probes in a row time out or raise, assumes Chrome is wedged
-        # and kills the whole tree. Without this, selenium commands
-        # block indefinitely (default timeout is None for .get()
-        # followed by silent CDP hangs on page_load_strategy=eager).
-        self._watchdog_thread = None
-        self._watchdog_stop = threading.Event()
-        self._watchdog_fail_count = 0
-        try:
-            self._watchdog_thread = threading.Thread(
-                target=self._watchdog_loop, daemon=True, name="GSB-watchdog"
-            )
-            self._watchdog_thread.start()
-        except Exception as e:
-            logging.debug(f"[GhostShellBrowser] watchdog spawn skipped: {e}")
+        # ORDERING NOTE:
+        # We used to start TrafficCollector (bg thread, polls execute_script
+        # every 5s) and Watchdog (bg thread, polls driver.title every 30s)
+        # RIGHT HERE — before init navigation and before cookie restore.
+        # Two background threads pounding on Selenium's single urllib3
+        # connection during a fragile startup phase caused connection
+        # pool contention ("Connection pool size: 1" warnings) which,
+        # combined with multiple per-domain navigations during cookie
+        # restore, destabilised the session and produced random
+        # InvalidSessionIdException aborts.
+        #
+        # Now: start those bg threads AFTER session restore completes.
+        # Startup is serial on the main thread, no bg interference.
 
         # 5. Initialization Navigation (CRITICAL)
         # Bypasses the first-load visibility detection before actual targets are visited
@@ -660,6 +659,43 @@ class GhostShellBrowser:
                 self._auto_restore_session()
             except Exception as e:
                 logging.warning(f"[GhostShellBrowser] Session restoration failed: {e}")
+
+        # ── Background subsystems — start NOW, not earlier ─────────
+        # Now that session restore finished, there's no more startup-
+        # phase sensitivity. Both bg threads can safely poll without
+        # racing the main thread's fragile init operations.
+
+        # Traffic collector — bytes per domain via PerformanceObserver
+        try:
+            from db import get_db as _get_db
+            _db = _get_db()
+            if _db.config_get("traffic.enabled") is not False:  # default True
+                from traffic_collector import TrafficCollector
+                self._traffic_collector = TrafficCollector(
+                    driver             = self.driver,
+                    profile_name       = self.profile_name or "default",
+                    run_id             = self.run_id,
+                    db                 = _db,
+                    flush_interval_sec = int(
+                        _db.config_get("traffic.flush_interval_sec") or 30
+                    ),
+                )
+                self._traffic_collector.start()
+        except Exception as e:
+            logging.warning(f"[GhostShellBrowser] Traffic collector init failed: {e}")
+
+        # Hang watchdog — probes driver.title every 30s, kills tree
+        # after 3 consecutive failures. Safe to run concurrently with
+        # main thread now.
+        try:
+            self._watchdog_stop.clear()
+            self._watchdog_fail_count = 0
+            self._watchdog_thread = threading.Thread(
+                target=self._watchdog_loop, daemon=True, name="GSB-watchdog"
+            )
+            self._watchdog_thread.start()
+        except Exception as e:
+            logging.debug(f"[GhostShellBrowser] watchdog spawn skipped: {e}")
 
         logging.info(f"[GhostShellBrowser] Core launched successfully. Profile: {self.profile_name}")
         return self.driver
@@ -1804,26 +1840,33 @@ class GhostShellBrowser:
             # On our generate_204 page it should work. If WebGPU is not
             # available (older Chrome, or Linux without Vulkan), skip —
             # absence of the API is not a failure.
+            #
+            # API note: Chrome 127+ replaced requestAdapterInfo() (async,
+            # now removed) with adapter.info (sync property). We try the
+            # new way first and fall back for very old Chromes. Any
+            # TypeError / missing-member issue returns `true` (skip).
             async_tests["webgpu_vendor_consistent_with_webgl"] = (
                 "(async () => {"
-                "  if (!navigator.gpu) return true;"   # skip if WebGPU missing
                 "  try {"
+                "    if (!navigator.gpu) return true;"
                 "    const a = await navigator.gpu.requestAdapter();"
                 "    if (!a) return true;"
-                "    const info = a.requestAdapterInfo"
-                "                 ? await a.requestAdapterInfo() : null;"
+                "    let info = null;"
+                "    if (a.info) {"
+                "      info = a.info;"                           # modern
+                "    } else if (typeof a.requestAdapterInfo === 'function') {"
+                "      try { info = await a.requestAdapterInfo(); }"
+                "      catch (_) { info = null; }"
+                "    }"
                 "    if (!info) return true;"
                 "    const c = document.createElement('canvas');"
                 "    const gl = c.getContext('webgl');"
                 "    const ext = gl && gl.getExtension('WEBGL_debug_renderer_info');"
                 "    if (!ext) return true;"
-                "    const webglVendor = gl.getParameter(ext.UNMASKED_VENDOR_WEBGL);"
-                "    // Both strings reference the same GPU family — loose match"
-                "    // because WebGPU vendor is a short token ('intel'/'nvidia')"
-                "    // while WebGL wraps it in 'Google Inc. (...)'."
+                "    const webglVendor = gl.getParameter(ext.UNMASKED_VENDOR_WEBGL) || '';"
                 "    const tok = (info.vendor || '').toLowerCase();"
                 "    return !tok || webglVendor.toLowerCase().includes(tok);"
-                "  } catch (e) { return true; }"   # any exception -> skip gracefully
+                "  } catch (e) { return true; }"
                 "})()"
             )
 

@@ -54,8 +54,9 @@ class SessionManager:
         return len(cookies)
 
     def import_cookies(self, filepath: str, domain_filter: list = None) -> int:
-        """Import cookies from JSON. Navigates to each domain so it can
-        legally set cookies for that scope."""
+        """Import cookies from JSON into Chrome via CDP Network.setCookie.
+        No navigation required — writes directly to the cookie jar.
+        Zero proxy traffic, zero flake from per-domain page loads."""
         if not os.path.exists(filepath):
             logging.warning(f"[Session] File not found: {filepath}")
             return 0
@@ -63,45 +64,65 @@ class SessionManager:
         with open(filepath, "r", encoding="utf-8") as f:
             cookies = json.load(f)
 
-        domains = set()
-        for c in cookies:
-            d = (c.get("domain") or "").lstrip(".")
-            if not d:
-                continue
-            if domain_filter and not any(f in d for f in domain_filter):
-                continue
-            domains.add(d)
-
         imported = 0
-        for domain in domains:
+        # STRATEGY: use CDP Network.setCookie instead of Selenium's
+        # driver.add_cookie(). Selenium requires the browser to be
+        # currently navigated to the cookie's domain before add_cookie()
+        # is accepted — which means we were doing 1 full navigation per
+        # domain (6 cookies → 6 page loads through the proxy). Those
+        # navigations sometimes hang (proxy flake, CAPTCHA, nav timeout)
+        # and if ANY of them kills the session via navigation error,
+        # the rest of the run dies with "invalid session id".
+        #
+        # CDP Network.setCookie doesn't need the browser to be ON the
+        # domain — it writes directly into Chrome's cookie jar. Also
+        # it's free: zero network traffic, zero proxy usage, zero risk
+        # of triggering anti-bot heuristics on cookie-restore.
+        try:
+            # Make sure Network domain is enabled — it usually is (we
+            # call Network.enable() earlier in start()), but setting
+            # again is cheap and idempotent.
+            self.driver.execute_cdp_cmd("Network.enable", {})
+        except Exception:
+            pass
+
+        for c in cookies:
+            if domain_filter and not any(f in (c.get("domain") or "") for f in domain_filter):
+                continue
+
+            # Build a CDP Network.setCookie param shape. Differs from
+            # Selenium's add_cookie shape — notably `expires` (not
+            # expiry), and sameSite must be one of Strict/Lax/None
+            # exactly, or omitted.
+            cdp_params = {
+                "name":   c.get("name"),
+                "value":  c.get("value", ""),
+                "domain": (c.get("domain") or "").lstrip("."),
+                "path":   c.get("path") or "/",
+            }
+            if c.get("secure"):    cdp_params["secure"]   = True
+            if c.get("httpOnly"): cdp_params["httpOnly"]  = True
+            # Expiry: Selenium uses Unix epoch seconds. CDP too.
+            exp = c.get("expiry") or c.get("expires")
+            if exp:
+                try:
+                    cdp_params["expires"] = int(exp)
+                except (ValueError, TypeError):
+                    pass
+            ss = c.get("sameSite")
+            if ss in ("Strict", "Lax", "None"):
+                cdp_params["sameSite"] = ss
+
+            if not cdp_params["name"] or not cdp_params["domain"]:
+                continue
+
             try:
-                self.driver.get(f"https://{domain}")
-                time.sleep(1)
-                for c in cookies:
-                    cd = (c.get("domain") or "").lstrip(".")
-                    if cd != domain:
-                        continue
-                    if domain_filter and not any(f in cd for f in domain_filter):
-                        continue
-
-                    # Keep only fields Selenium accepts
-                    clean = {k: v for k, v in c.items()
-                             if k in ("name", "value", "domain", "path",
-                                      "secure", "httpOnly", "expiry", "sameSite")}
-                    if "expiry" in clean:
-                        try:
-                            clean["expiry"] = int(clean["expiry"])
-                        except (ValueError, TypeError):
-                            clean.pop("expiry", None)
-                    try:
-                        self.driver.add_cookie(clean)
-                        imported += 1
-                    except Exception as e:
-                        logging.debug(f"[Session] could not set {c.get('name')}: {e}")
+                self.driver.execute_cdp_cmd("Network.setCookie", cdp_params)
+                imported += 1
             except Exception as e:
-                logging.debug(f"[Session] error on {domain}: {e}")
+                logging.debug(f"[Session] CDP setCookie failed for {c.get('name')}: {e}")
 
-        logging.info(f"[Session] Imported {imported} cookies")
+        logging.info(f"[Session] Imported {imported} cookies (via CDP, no navigation)")
         return imported
 
     # ─── localStorage / sessionStorage ────────────────────

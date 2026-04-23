@@ -219,53 +219,14 @@ ON_TARGET_DOMAIN_ACTIONS = CFG.get("actions.on_target_domain_actions",
 RUN_ID = int(os.environ.get("GHOST_SHELL_RUN_ID", "0")) or None
 if RUN_ID is None:
     RUN_ID = DB.run_start(PROFILE_NAME, proxy_url=PROXY)
-    logging.info(f"[main] Created standalone run #{RUN_ID}")
 
-# Also record our PID in the runs table. The dashboard does this too
-# when it spawns us, but standalone runs (python main.py directly) skip
-# that code path — and we still want reap_stale_runs to find us after
-# a crash. Safe to set twice.
+# Also record our PID in the runs table.
 try:
     DB.run_set_pid(RUN_ID, os.getpid())
-except Exception as e:
-    logging.debug(f"[main] run_set_pid skipped: {e}")
-
-
-# ──────────────────────────────────────────────────────────────
-# Heartbeat — lets process_reaper distinguish "alive but slow"
-# from "genuinely wedged" runs. We ping every HEARTBEAT_INTERVAL
-# seconds; if the main thread is fully stuck (e.g. driver hang),
-# this background thread keeps pinging, which means the hang
-# detection has to rely on the BROWSER watchdog instead (see
-# ghost_shell_browser.py). Conversely, if main dies uncleanly
-# (kill -9, OOM), the daemon thread dies with it and heartbeats
-# stop — reap_stale_runs will correctly clean up.
-# ──────────────────────────────────────────────────────────────
+except Exception:
+    pass
 
 HEARTBEAT_INTERVAL = 15  # seconds
-
-def _heartbeat_loop():
-    import threading as _t
-    while not getattr(_heartbeat_loop, "_stop", False):
-        try:
-            DB.run_heartbeat(RUN_ID)
-        except Exception as e:
-            logging.debug(f"[main] heartbeat failed: {e}")
-        # Sleep in small slices so shutdown is responsive
-        for _ in range(HEARTBEAT_INTERVAL):
-            if getattr(_heartbeat_loop, "_stop", False):
-                return
-            time.sleep(1)
-
-_heartbeat_thread = threading.Thread(
-    target=_heartbeat_loop, daemon=True, name="main-heartbeat"
-)
-_heartbeat_thread.start()
-
-def _stop_heartbeat():
-    _heartbeat_loop._stop = True
-
-atexit.register(_stop_heartbeat)
 
 # Dup file for manual inspection
 COMPETITOR_URLS_FILE = "competitor_urls.txt"
@@ -305,6 +266,43 @@ logging.getLogger("selenium").setLevel(logging.WARNING)
 # undetected_chromedriver dumps a 25-line C++ stacktrace on failure.
 # We catch the exception at a higher level with a readable summary.
 logging.getLogger("undetected_chromedriver").setLevel(logging.WARNING)
+
+
+# ──────────────────────────────────────────────────────────────
+# Heartbeat — lets process_reaper distinguish "alive but slow"
+# from "genuinely wedged" runs. We ping DB every HEARTBEAT_INTERVAL
+# seconds; if main thread is fully stuck (e.g. driver hang), this
+# background thread keeps pinging — and hang detection falls back
+# to the BROWSER watchdog (ghost_shell_browser.py). Conversely, if
+# main dies uncleanly (kill -9, OOM), the daemon thread dies with
+# it and heartbeats stop — reap_stale_runs picks it up.
+#
+# Started AFTER logging.basicConfig so its debug/warning lines
+# route through our configured handlers.
+# ──────────────────────────────────────────────────────────────
+
+def _heartbeat_loop():
+    while not getattr(_heartbeat_loop, "_stop", False):
+        try:
+            DB.run_heartbeat(RUN_ID)
+        except Exception as e:
+            logging.debug(f"[main] heartbeat failed: {e}")
+        # Sleep in small slices so shutdown is responsive
+        for _ in range(HEARTBEAT_INTERVAL):
+            if getattr(_heartbeat_loop, "_stop", False):
+                return
+            time.sleep(1)
+
+_heartbeat_thread = threading.Thread(
+    target=_heartbeat_loop, daemon=True, name="main-heartbeat"
+)
+_heartbeat_thread.start()
+
+def _stop_heartbeat():
+    _heartbeat_loop._stop = True
+
+atexit.register(_stop_heartbeat)
+logging.info(f"[main] Started run #{RUN_ID} for profile '{PROFILE_NAME}'")
 
 
 # ──────────────────────────────────────────────────────────────
@@ -970,6 +968,34 @@ def run_monitor():
         driver = browser.driver
         browser.setup_profile_logging()
 
+        # 0. Auto-rotate IP FIRST — before anything else hits the
+        # network through the proxy. Previously rotate happened at
+        # step 6 (after selfcheck + diagnostics), meaning the first
+        # HTTPS requests (generate_204 for secure-context selfcheck,
+        # ipapi for diagnostics) went through the OLD IP. If that IP
+        # was already burned, we'd waste a captcha before learning it.
+        # Now: rotate → everything after uses the fresh IP.
+        current_ip = None
+        auto_rotate = CFG.get("proxy.auto_rotate_on_start", True)
+        if IS_ROTATING_PROXY:
+            if auto_rotate:
+                try:
+                    log_step("rotating IP", "auto_rotate_on_start=True")
+                    new_ip = browser.force_rotate_ip()
+                    if new_ip:
+                        current_ip = new_ip
+                        logging.info(f"🌐 rotated to IP: {current_ip}")
+                except Exception as e:
+                    logging.warning(f"  auto-rotate failed: {e}")
+            # Regardless of auto-rotate: check health + unburn stale IPs
+            try:
+                if current_ip is None:
+                    current_ip = browser.check_and_rotate_if_burned()
+                    if current_ip:
+                        logging.info(f"🌐 working with IP: {current_ip}")
+            except Exception as e:
+                logging.debug(f"  rotation check: {e}")
+
         # 1. Profile health sanity check (soft: never aborts on first runs)
         sqm = SessionQualityMonitor(browser.user_data_path)
         should_abort, reason = sqm.should_abort()
@@ -1111,28 +1137,8 @@ def run_monitor():
         else:
             logging.info("✓ existing session — skipping cookie seed")
 
-        # 6. Auto-rotate on start — gets a fresh random Ukrainian IP before
-        # we touch Google. Skip if proxy is non-rotating (e.g. static ISP IP).
-        current_ip = None
-        auto_rotate = CFG.get("proxy.auto_rotate_on_start", True)
-        if IS_ROTATING_PROXY:
-            if auto_rotate:
-                try:
-                    log_step("rotating IP", "auto_rotate_on_start=True")
-                    new_ip = browser.force_rotate_ip()
-                    if new_ip:
-                        current_ip = new_ip
-                        logging.info(f"🌐 rotated to IP: {current_ip}")
-                except Exception as e:
-                    logging.warning(f"  auto-rotate failed: {e}")
-            # Regardless of auto-rotate: check health + unburn stale IPs
-            try:
-                if current_ip is None:
-                    current_ip = browser.check_and_rotate_if_burned()
-                    if current_ip:
-                        logging.info(f"🌐 working with IP: {current_ip}")
-            except Exception as e:
-                logging.debug(f"  rotation check: {e}")
+        # (Rotation moved to step 0, before selfcheck, so the diagnostics
+        # report reflects the IP we'll actually be using.)
 
         # ─── STARTUP BANNER (pretty summary of this run's context) ──
         try:

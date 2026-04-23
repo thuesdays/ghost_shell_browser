@@ -41,6 +41,154 @@ def storage_path(profile_name: str, base_dir: str = None) -> str:
     return os.path.join(profile_session_dir(profile_name, base_dir), "storage.json")
 
 
+def chrome_cookies_db_path(profile_name: str, base_dir: str = None) -> str:
+    """Path to Chrome's own Cookies SQLite DB for a profile. Exists
+    after the profile has been run at least once.
+
+    Chrome 96+ stores cookies at:
+      profiles/<name>/Default/Network/Cookies
+    Older versions used Default/Cookies directly.
+    """
+    base = base_dir or "profiles"
+    new_path = os.path.join(base, profile_name, "Default", "Network", "Cookies")
+    if os.path.exists(new_path):
+        return new_path
+    old_path = os.path.join(base, profile_name, "Default", "Cookies")
+    return old_path  # caller checks existence
+
+
+def list_chrome_live_cookies(profile_name: str, base_dir: str = None) -> list:
+    """Read cookies directly from Chrome's SQLite DB for the profile.
+
+    Returns Selenium-shape dicts so the result merges cleanly with
+    list_cookies(). Returns [] if Chrome hasn't run for this profile
+    yet OR if Chrome is currently running (DB will be locked).
+
+    We query the readable columns only — `encrypted_value` we CAN'T
+    decrypt without Chrome's keychain integration, so for those entries
+    we just expose name/domain/path/expiry/flags. The dashboard UI
+    shows "(encrypted)" for the value in that case, which is still
+    useful for "what domains has this profile authenticated against".
+
+    This is strictly READ-ONLY. Never write back — Chrome's encrypted_value
+    column uses OS-keychain-derived keys we don't have.
+    """
+    db_path = chrome_cookies_db_path(profile_name, base_dir)
+    if not os.path.exists(db_path):
+        return []
+
+    import sqlite3
+    import tempfile
+    import shutil
+
+    # Copy to a temp file first — if Chrome is running, the DB is
+    # locked. Copying bypasses the lock for read-only use.
+    tmp_fd, tmp_path = tempfile.mkstemp(suffix=".db")
+    os.close(tmp_fd)
+    try:
+        shutil.copyfile(db_path, tmp_path)
+    except Exception as e:
+        logging.debug(f"[cookies] copy of Chrome DB failed: {e}")
+        try: os.remove(tmp_path)
+        except OSError: pass
+        return []
+
+    results = []
+    try:
+        conn = sqlite3.connect(tmp_path)
+        conn.row_factory = sqlite3.Row
+        # Chrome's schema has evolved — try modern first, fall back.
+        rows = None
+        try:
+            rows = conn.execute("""
+                SELECT host_key, name, value, path, is_secure, is_httponly,
+                       expires_utc, samesite, encrypted_value
+                FROM cookies
+            """).fetchall()
+        except sqlite3.OperationalError:
+            # Very old Chrome might have `secure`/`httponly` without prefix
+            rows = conn.execute("""
+                SELECT host_key, name, value, path, secure AS is_secure,
+                       httponly AS is_httponly, expires_utc,
+                       NULL AS samesite, NULL AS encrypted_value
+                FROM cookies
+            """).fetchall()
+        conn.close()
+
+        for r in rows or []:
+            value = r["value"]
+            # If value column is empty and encrypted_value has content,
+            # Chrome stored it encrypted (OS-keychain-keyed). We can't
+            # decrypt so we surface a placeholder so the UI shows the
+            # cookie exists.
+            if (not value) and r["encrypted_value"]:
+                value = "(encrypted — run profile to decrypt)"
+            # Chrome stores expires_utc as microseconds since 1601-01-01.
+            # Convert to Unix epoch (seconds) for Selenium-style `expiry`.
+            expiry = None
+            try:
+                eu = int(r["expires_utc"] or 0)
+                if eu > 0:
+                    # 11644473600 seconds between 1601-01-01 and 1970-01-01
+                    expiry = int(eu / 1_000_000 - 11_644_473_600)
+                    if expiry < 0:
+                        expiry = None
+            except Exception:
+                pass
+            # host_key is like ".google.com" — Selenium prefers no leading dot
+            # for the domain field, but keeps it for "non-host-only" cookies.
+            # Preserve it as-is; front-end can display verbatim.
+            samesite_raw = r["samesite"]
+            samesite_map = {0: "None", 1: "Lax", 2: "Strict"}
+            samesite = samesite_map.get(samesite_raw, "Lax") if samesite_raw is not None else None
+
+            results.append({
+                "name":     r["name"],
+                "value":    value,
+                "domain":   r["host_key"],
+                "path":     r["path"],
+                "secure":   bool(r["is_secure"]),
+                "httpOnly": bool(r["is_httponly"]),
+                "expiry":   expiry,
+                "sameSite": samesite,
+                "_source":  "chrome_live",
+            })
+    except Exception as e:
+        logging.warning(f"[cookies] read Chrome DB failed: {e}")
+    finally:
+        try: os.remove(tmp_path)
+        except OSError: pass
+
+    return results
+
+
+def list_cookies_merged(profile_name: str, base_dir: str = None) -> list:
+    """Union of persisted cookies.json + Chrome's live SQLite cookies.
+
+    When both sources have a cookie with the same (domain, path, name),
+    Chrome's live copy wins — it's the most recent state. Ghost Shell
+    session JSON is older (snapshot from last run's shutdown).
+
+    Each returned entry has an `_source` field: "session" / "chrome_live" /
+    "both" so the UI can indicate provenance.
+    """
+    session_cookies = list_cookies(profile_name, base_dir)
+    live_cookies    = list_chrome_live_cookies(profile_name, base_dir)
+
+    # Key by (domain, path, name). Chrome's list overwrites session's.
+    by_key = {}
+    for c in session_cookies:
+        k = (c.get("domain"), c.get("path"), c.get("name"))
+        c["_source"] = "session"
+        by_key[k] = c
+    for c in live_cookies:
+        k = (c.get("domain"), c.get("path"), c.get("name"))
+        if k in by_key:
+            c["_source"] = "both"
+        by_key[k] = c
+    return list(by_key.values())
+
+
 # ──────────────────────────────────────────────────────────────
 # Read
 # ──────────────────────────────────────────────────────────────
