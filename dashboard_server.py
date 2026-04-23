@@ -10,6 +10,7 @@ Overпуск:
 """
 
 import os
+import re
 import sys
 import json
 import time
@@ -1408,9 +1409,26 @@ def api_run_mark_failed(run_id: int):
 
 @app.route("/api/profiles/<name>", methods=["DELETE"])
 def api_profile_delete(name: str):
+    """Delete a profile — folder, related DB rows, profiles-table row,
+    and — if this was the active profile — reassign browser.profile_name
+    to the next available profile.
+
+    Previously we only cleared events/selfchecks/fingerprints + folder,
+    but profiles_list() unions profile_name from runs too. Deleted
+    profiles kept appearing in the dropdown because run history still
+    referenced them. Now we drop the profiles row AND profiles_list()
+    filters names that exist ONLY as run-history tombstones.
+
+    Run history stays on purpose: a deleted profile's runs are still
+    useful aggregate data for the Overview stats. The name appears in
+    run history but not in dropdowns / Profiles page.
     """
-    Delete an entire profile — removes the folder AND purges DB rows for it.
-    """
+    if RUNNER_POOL.is_profile_running(name):
+        return jsonify({
+            "error": f"Profile '{name}' is currently running - stop it "
+                     f"before deleting."
+        }), 409
+
     try:
         import shutil
         profile_dir = os.path.join("profiles", name)
@@ -1421,9 +1439,34 @@ def api_profile_delete(name: str):
         conn = db._get_conn()
         for table in ("events", "selfchecks", "fingerprints"):
             conn.execute(f"DELETE FROM {table} WHERE profile_name = ?", (name,))
-        # Runs: don't delete (keep history), but note they belong to a deleted profile
-        return jsonify({"ok": True, "deleted": name})
+
+        try:
+            db.profile_meta_delete(name)
+        except Exception as e:
+            logging.debug(f"[delete profile] profile_meta_delete: {e}")
+
+        # Reassign active profile if we nuked the default. Without this,
+        # browser.profile_name keeps pointing at a dead profile and every
+        # page reading it breaks.
+        reassigned_to = None
+        active = db.config_get("browser.profile_name")
+        if active == name:
+            remaining = [p["name"] for p in db.profiles_list()]
+            reassigned_to = remaining[0] if remaining else "profile_01"
+            db.config_set("browser.profile_name", reassigned_to)
+            logging.info(
+                f"[delete profile] active profile was '{name}', "
+                f"reassigned browser.profile_name -> '{reassigned_to}'"
+            )
+
+        return jsonify({
+            "ok":            True,
+            "deleted":       name,
+            "reassigned_to": reassigned_to,
+        })
     except Exception as e:
+        import traceback
+        traceback.print_exc()
         return jsonify({"error": str(e)}), 500
 
 
@@ -1720,7 +1763,6 @@ def api_profile_templates():
     """
     try:
         from device_templates import DEVICE_TEMPLATES
-        import re
 
         def _extract_gpu(renderer: str) -> str:
             """Pull a short model from the ANGLE renderer string.

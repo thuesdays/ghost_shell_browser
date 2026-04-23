@@ -1462,32 +1462,54 @@ class DB:
     # ──────────────────────────────────────────────────────────
 
     def profiles_list(self) -> list[dict]:
-        """
-        Список all профилей that появлялись в runs + их статистика.
+        """Return the list of "alive" profiles with their 24h stats.
+
+        A profile is considered ALIVE if ANY of the following is true:
+          - Its folder exists under profiles/
+          - It has a row in the `profiles` table (per-profile metadata)
+          - It has a fingerprint row
+          - There's a default config value pointing at it
+
+        A profile that exists ONLY in run history (no folder, no meta,
+        no fingerprint) is a TOMBSTONE — it was previously deleted via
+        api_profile_delete but we kept its runs for historical stats.
+        Tombstones are filtered out here so the Profiles page and
+        dropdown don't resurrect them.
         """
         conn = self._get_conn()
-        rows = conn.execute("""
-            SELECT DISTINCT profile_name FROM runs
-            UNION
-            SELECT DISTINCT profile_name FROM events
-            UNION
-            SELECT DISTINCT profile_name FROM fingerprints
-        """).fetchall()
-        profiles = [r["profile_name"] for r in rows]
 
-        # Если БД пустая — добавим дефолтный профиль из configа
-        if not profiles:
-            default = self.config_get("browser.profile_name", "profile_01")
-            profiles = [default]
+        # Alive sources
+        alive_names = set()
 
-        # Также добавим профor из папки profiles/ if is
+        # 1. profiles-table rows
+        for r in conn.execute("SELECT name FROM profiles").fetchall():
+            alive_names.add(r["name"])
+
+        # 2. fingerprints table
+        for r in conn.execute(
+                "SELECT DISTINCT profile_name FROM fingerprints").fetchall():
+            alive_names.add(r["profile_name"])
+
+        # 3. folders on disk
         if os.path.exists("profiles"):
             for name in os.listdir("profiles"):
-                if os.path.isdir(os.path.join("profiles", name)) and name not in profiles:
-                    profiles.append(name)
+                if os.path.isdir(os.path.join("profiles", name)):
+                    alive_names.add(name)
+
+        # 4. current active profile (config-declared)
+        default = self.config_get("browser.profile_name", "profile_01")
+        if default:
+            alive_names.add(default)
+
+        profiles = sorted(alive_names)
+
+        # If nothing was found at all, still surface the default so the
+        # UI has something to render on a fresh install.
+        if not profiles:
+            profiles = [default or "profile_01"]
 
         result = []
-        for name in sorted(profiles):
+        for name in profiles:
             cutoff = (datetime.now() - timedelta(hours=24)).isoformat(timespec="seconds")
             summary = conn.execute("""
                 SELECT event_type, COUNT(*) as n FROM events

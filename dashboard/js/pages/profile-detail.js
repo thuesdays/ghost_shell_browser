@@ -166,17 +166,33 @@ const ProfileDetail = {
       message:
         `Delete profile "${this.currentProfile}"?\n\n` +
         `This removes the profile folder AND purges all related DB rows ` +
-        `(events, fingerprints, self-checks). Run history is kept.\n\n` +
+        `(events, fingerprints, self-checks, tags, notes). Run history ` +
+        `is kept for historical stats but the profile will no longer ` +
+        `appear in dropdowns.\n\n` +
+        `If this is the currently-active profile, it will be reassigned ` +
+        `to the next available one automatically.\n\n` +
         `This cannot be undone.`,
       confirmText: "Delete profile",
       confirmStyle: "danger",
     })) return;
 
     try {
-      await api(`/api/profiles/${encodeURIComponent(this.currentProfile)}`,
-                { method: "DELETE" });
-      toast(`✓ Deleted "${this.currentProfile}"`);
-      // Navigate away
+      const r = await api(
+        `/api/profiles/${encodeURIComponent(this.currentProfile)}`,
+        { method: "DELETE" }
+      );
+      // Reload the global config cache so other pages see the new
+      // `browser.profile_name` value. Without this, the sidebar badge +
+      // Overview "Profile X active" stay pointing at the deleted one.
+      await loadConfig();
+      if (r.reassigned_to) {
+        toast(
+          `✓ Deleted "${this.currentProfile}". ` +
+          `Active profile reassigned to "${r.reassigned_to}".`
+        );
+      } else {
+        toast(`✓ Deleted "${this.currentProfile}"`);
+      }
       navigate("profiles");
     } catch (e) {
       toast("Error: " + e.message, true);
