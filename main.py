@@ -1297,6 +1297,48 @@ def run_monitor():
         logging.info(f"   Rotation API      : disabled (proxy.is_rotating=false)")
     logging.info(f"   Preferred lang    : {PREFERRED_LANGUAGE}")
     logging.info(f"   Expected country  : {EXPECTED_COUNTRY} ({EXPECTED_TIMEZONE})")
+
+    # ── Coherence-system fingerprint consumption (Phase 2 bridge) ───
+    # Read the profile's current fingerprint from the DB, log its score,
+    # and let its `language` field override PREFERRED_LANGUAGE so the
+    # dashboard's per-profile FP edits actually influence the runtime
+    # browser. Deeper integration (UA / screen / timezone / fonts) still
+    # flows through DeviceTemplateBuilder — that swap is tracked as a
+    # separate follow-up because DeviceTemplateBuilder is load-bearing
+    # for stealth and changing it mid-session is risky.
+    #
+    # Fails silently: if anything about the FP system is unavailable we
+    # fall back to the old behaviour so runs never abort because of this.
+    effective_language = PREFERRED_LANGUAGE
+    _fp_meta = None
+    try:
+        _fp_meta = DB.fingerprint_current(PROFILE_NAME)
+    except Exception as _e:
+        logging.debug(f"[fingerprint] DB read failed: {_e}")
+    if _fp_meta:
+        _payload = _fp_meta.get("payload") or {}
+        _score   = _fp_meta.get("coherence_score")
+        _tmpl    = _fp_meta.get("template_name") or _fp_meta.get("template_id")
+        _lang    = _payload.get("language")
+        _grade = (_fp_meta.get("coherence_report") or {}).get("grade", "?")
+        logging.info(
+            f"   Fingerprint       : score={_score}/100 grade={_grade} "
+            f"template={_tmpl!r} source={_fp_meta.get('source')}"
+        )
+        if _score is not None and _score < 55:
+            logging.warning(
+                f"   ⚠ Fingerprint coherence is CRITICAL ({_score}/100). "
+                f"Dashboard → Fingerprint → Regenerate before next run."
+            )
+        if _lang and _lang != PREFERRED_LANGUAGE:
+            logging.info(
+                f"   Language override : {PREFERRED_LANGUAGE} → {_lang} "
+                f"(from fingerprint.language)"
+            )
+            effective_language = _lang
+    else:
+        logging.info("   Fingerprint       : not generated yet "
+                     "(DeviceTemplateBuilder will build one for this run)")
     logging.info("═" * 62)
 
     with GhostShellBrowser(
@@ -1306,7 +1348,7 @@ def run_monitor():
         is_rotating_proxy  = IS_ROTATING_PROXY,
         rotation_api_url   = ROTATION_API_URL,
         enrich_on_create   = CFG.get("browser.enrich_on_create", True),
-        preferred_language = PREFERRED_LANGUAGE,
+        preferred_language = effective_language,
         run_id             = RUN_ID,
     ) as browser:
 

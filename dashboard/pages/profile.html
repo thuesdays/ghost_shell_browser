@@ -108,6 +108,42 @@
     </div>
   </div>
 
+  <!-- ─── ACTIVE FINGERPRINT ─────────────────────────────────── -->
+  <!-- Mirror card to Active script / Active proxy above. Shows the
+       current fingerprint's coherence score + template, with direct
+       links into the full editor. The mini-badge colours follow the
+       same excellent/good/warning/critical mapping as the editor. -->
+  <div class="card">
+    <div class="card-title">
+      🧬 Active fingerprint
+      <span class="muted">— identity this profile reports to websites</span>
+    </div>
+
+    <div class="profile-fp-card-row" id="profile-fp-row">
+      <!-- Score badge populated by profile-detail.js -->
+      <div class="profile-fp-mini-badge fp-score-unknown" id="profile-fp-badge">
+        <div class="fp-mini-score" id="profile-fp-score">—</div>
+        <div class="fp-mini-grade" id="profile-fp-grade">no data</div>
+      </div>
+      <div>
+        <div class="profile-fp-summary-line" id="profile-fp-summary">
+          Loading fingerprint…
+        </div>
+        <div class="profile-fp-summary-meta" id="profile-fp-meta"></div>
+      </div>
+      <div style="display: flex; gap: 6px;">
+        <a href="#" data-nav="fingerprint" class="btn btn-primary btn-small"
+           id="profile-fp-open-btn">
+          Open fingerprint editor →
+        </a>
+        <button class="btn btn-secondary btn-small" id="profile-fp-regen-btn"
+                title="Re-roll the fingerprint for this profile (keeps none of the current values)">
+          ↻ Quick regenerate
+        </button>
+      </div>
+    </div>
+  </div>
+
   <!-- ─── PER-PROFILE OVERRIDES ──────────────────────────────── -->
   <div class="card">
     <div class="card-title">
@@ -389,19 +425,26 @@
     </div>
   </div>
 
+  <!-- ─── RUNTIME NETWORK SELF-CHECK ─────────────────────────────
+       Distinct from the Fingerprint coherence validator on the
+       Fingerprint page — this card shows results of the per-run
+       network probes: exit IP, country, timezone, WebRTC leak.
+       Fingerprint-side validation (config coherence + live stealth
+       probe) now lives under the Fingerprint editor. -->
   <div class="card">
     <div class="card-title">
-      Self-check
-      <span class="muted">— runtime fingerprint validation</span>
+      🛰 Runtime self-check
+      <span class="muted">— network probes per run: exit IP, geo, WebRTC, timezone</span>
       <span class="badge" id="selfcheck-badge">—</span>
-      <div style="margin-left: auto; display: flex; gap: 8px;">
-        <button class="btn btn-secondary" id="reset-health-btn"
-                style="font-size: 11px; padding: 6px 12px;">Reset blocks</button>
-        <button class="btn btn-secondary" id="clear-history-btn"
-                style="font-size: 11px; padding: 6px 12px;">Clear history</button>
-        <button class="btn btn-danger" id="delete-profile-btn"
-                style="font-size: 11px; padding: 6px 12px;">Delete profile</button>
-      </div>
+    </div>
+    <div class="form-hint" style="margin-bottom: 12px;">
+      Checks that run against the <strong>network layer</strong> on every Nth run
+      (configurable in <a href="#" data-nav="proxy" class="inline-link">Proxy</a>
+      → self-check cadence). These verify that the proxy actually routes
+      traffic through the expected country and doesn't leak WebRTC.
+      For <strong>fingerprint</strong> coherence checks (UA, fonts, GPU, timezone
+      plausibility) and a live stealth probe, see the
+      <a href="#" data-nav="fingerprint" class="inline-link">Fingerprint editor</a>.
     </div>
     <div id="selfcheck-time" class="muted" style="margin-bottom: 12px;"></div>
     <div class="selfcheck-grid" id="selfcheck-grid"></div>
@@ -410,7 +453,7 @@
   <div class="card">
     <div class="card-title">
       Current fingerprint
-      <span class="muted">— payload applied to Chromium at launch</span>
+      <span class="muted">— raw payload applied to Chromium at launch</span>
       <div style="margin-left: auto;">
         <button class="btn btn-primary btn-small" id="regen-fp-btn">
           🎲 Regenerate fingerprint
@@ -418,9 +461,68 @@
       </div>
     </div>
     <div class="form-hint" style="margin-bottom: 12px;">
-      Generates a fresh deterministic fingerprint using a new seed. Useful when
-      the current one is flagged. Old fingerprint is <strong>overwritten</strong>.
+      Debug view of the JSON payload Chromium consumes. For a proper editor
+      with coherence scoring, locks, history, and a live browser probe use the
+      <a href="#" data-nav="fingerprint" class="inline-link">Fingerprint page</a>.
+      The button above is a shortcut to the legacy hash-seeded regeneration.
     </div>
     <pre class="json-view" id="fingerprint-view">Loading...</pre>
+  </div>
+
+  <!-- ═══ DANGER ZONE ═══
+       Destructive profile-level operations. Pulled out of the
+       self-check header where they used to crowd an already-busy
+       title bar. Ordered by destructiveness so Delete is last.
+       IDs (#reset-health-btn, #clear-history-btn, #delete-profile-btn)
+       kept identical so profile-detail.js binds without changes. -->
+  <div class="card card-danger profile-danger-zone">
+    <div class="card-title">
+      ⚠ Danger zone
+      <span class="muted">— destructive operations scoped to this profile</span>
+    </div>
+    <div class="danger-banner">
+      These operations affect only the currently-selected profile. They do
+      not touch the proxy library, scripts, or global config. Delete cannot
+      be undone — the user-data-dir is wiped from disk.
+    </div>
+
+    <div class="danger-op-row">
+      <div class="danger-op-body">
+        <div class="danger-op-title">Reset consecutive-blocks counter</div>
+        <div class="danger-op-desc">
+          Clears the "N runs in a row hit a captcha/block" counter. Use after
+          you've rotated the proxy or edited the fingerprint and want a clean
+          slate — the health-based pause-on-block logic will stop flagging this
+          profile. No historical data is lost.
+        </div>
+      </div>
+      <button class="btn btn-secondary" id="reset-health-btn">Reset blocks</button>
+    </div>
+
+    <div class="danger-op-row">
+      <div class="danger-op-body">
+        <div class="danger-op-title">Clear session-quality history</div>
+        <div class="danger-op-desc">
+          Wipes the per-run quality log (ad counts, captcha hits, durations) for
+          this profile. Run records themselves stay in the
+          <a href="#" data-nav="runs" class="inline-link">Runs</a> page — only
+          the session-quality rollup is cleared. Cannot be undone.
+        </div>
+      </div>
+      <button class="btn btn-secondary btn-danger" id="clear-history-btn">Clear history</button>
+    </div>
+
+    <div class="danger-op-row danger-op-row-critical">
+      <div class="danger-op-body">
+        <div class="danger-op-title">Delete profile</div>
+        <div class="danger-op-desc">
+          Removes the profile from the database and deletes its entire
+          user-data-dir from disk — cookies, session, history, fingerprints,
+          all gone. Proxy assignments to this profile are released. Cannot be
+          undone. Any running job for this profile is stopped first.
+        </div>
+      </div>
+      <button class="btn btn-danger" id="delete-profile-btn">Delete profile</button>
+    </div>
   </div>
 </section>

@@ -10,6 +10,11 @@ const PAGES = {
   domains:     { html: "/pages/domains.html",     init: () => Domains.init() },
   proxy:       { html: "/pages/proxy.html",       init: () => ProxyPage.init() },
   profile:     { html: "/pages/profile.html",     init: () => ProfileDetail.init() },
+  // Fingerprint coherence editor (Phase 2). Standalone page; usually
+  // reached from the profile detail page or Overview > Fingerprint health
+  // row clicks rather than a sidebar slot. Hash may include ?profile=foo
+  // to preselect a profile.
+  fingerprint: { html: "/pages/fingerprint.html", init: () => FingerprintPage.init() },
   competitors: { html: "/pages/competitors.html", init: () => Competitors.init() },
   behavior:    { html: "/pages/behavior.html",    init: () => Behavior.init() },
   // "Scripts" page (was "Actions") — pipeline/script builder

@@ -14,6 +14,7 @@ const Overview = {
       this.loadRecentActivity(),
       this.loadTopCompetitors(),
       this.loadProfileHealth(),
+      this.loadFingerprintHealth(),
       this.loadTrafficCard(),
     ]);
 
@@ -131,6 +132,7 @@ const Overview = {
         this.loadRecentActivity(),
         this.loadTopCompetitors(),
         this.loadProfileHealth(),
+        this.loadFingerprintHealth(),
         this.loadTrafficCard(),
       ]);
     } catch (e) {
@@ -498,6 +500,105 @@ const Overview = {
       }).join("");
     } catch (e) {
       console.error("profile health:", e);
+    }
+  },
+
+  // ── Fingerprint health rollup (Phase 2 coherence system) ──────
+  // Per-profile view of coherence scores. Uses /api/fingerprints/summary
+  // which joins profiles ⟕ fingerprints (LEFT JOIN) so profiles without
+  // a fingerprint still appear — that's actually the interesting case
+  // because it means the user hasn't adopted the new system yet.
+  async loadFingerprintHealth() {
+    try {
+      const resp = await api("/api/fingerprints/summary");
+      const rows = resp.profiles || [];
+      const tbody = $("#overview-fp-tbody");
+
+      if (!rows.length) {
+        tbody.innerHTML = `<tr><td colspan="5" class="dense-empty-cell">No profiles yet</td></tr>`;
+        document.getElementById("ov-fp-avg-score").textContent = "—";
+        document.getElementById("ov-fp-warn-count").textContent = "—";
+        document.getElementById("ov-fp-missing-count").textContent = "—";
+        return;
+      }
+
+      // Aggregate — average across profiles that HAVE a fingerprint;
+      // missing ones counted separately as they have no score to include.
+      const withFp = rows.filter(r => r.coherence_score != null);
+      const missing = rows.length - withFp.length;
+      const warn = withFp.filter(r => r.coherence_score < 75).length;
+      const avg = withFp.length
+        ? Math.round(withFp.reduce((s, r) => s + r.coherence_score, 0) / withFp.length)
+        : null;
+
+      const avgEl = document.getElementById("ov-fp-avg-score");
+      const warnEl = document.getElementById("ov-fp-warn-count");
+      const missEl = document.getElementById("ov-fp-missing-count");
+      avgEl.textContent = avg == null ? "—" : avg;
+      warnEl.textContent = warn;
+      missEl.textContent = missing;
+
+      // Colour each aggregate tile by its own severity
+      const avgTile  = document.getElementById("ov-fp-tile-avg");
+      const warnTile = document.getElementById("ov-fp-tile-warn");
+      const missTile = document.getElementById("ov-fp-tile-missing");
+      avgTile.className  = "overview-fp-summary-tile "
+        + (avg == null ? "" : avg >= 90 ? "ok" : avg >= 75 ? "" : avg >= 55 ? "warn" : "bad");
+      warnTile.className = "overview-fp-summary-tile "
+        + (warn > 0 ? "warn" : "ok");
+      missTile.className = "overview-fp-summary-tile "
+        + (missing > 0 ? "bad" : "ok");
+
+      // Sort: missing first (most actionable), then by score ascending
+      // (worst fingerprints float up so they're immediately visible).
+      rows.sort((a, b) => {
+        const aMiss = a.coherence_score == null;
+        const bMiss = b.coherence_score == null;
+        if (aMiss !== bMiss) return aMiss ? -1 : 1;
+        return (a.coherence_score ?? 999) - (b.coherence_score ?? 999);
+      });
+
+      tbody.innerHTML = rows.map(r => {
+        const score = r.coherence_score;
+        const hasFp = score != null;
+        const rowCls = !hasFp ? "fp-row-bad"
+                    : score < 55 ? "fp-row-bad"
+                    : score < 75 ? "fp-row-warn"
+                    : "";
+        const scoreCls = !hasFp ? "bad"
+                    : score >= 90 ? "ok"
+                    : score >= 75 ? ""
+                    : score >= 55 ? "warn"
+                    : "bad";
+        const scoreTxt = hasFp ? score : "—";
+        const tmpl = r.template_name || r.template_id
+                     || (hasFp ? "unknown" : "no fingerprint");
+        return `
+          <tr class="${rowCls}" data-profile="${escapeHtml(r.profile_name)}"
+              style="cursor: pointer;">
+            <td><strong>${escapeHtml(r.profile_name)}</strong></td>
+            <td class="muted">${escapeHtml(tmpl)}</td>
+            <td class="col-score num ${scoreCls}">${scoreTxt}</td>
+            <td class="col-snaps num">${r.history_count ?? 0}</td>
+            <td class="col-when muted">${r.current_ts ? timeAgo(r.current_ts) : "—"}</td>
+          </tr>
+        `;
+      }).join("");
+
+      // Click a row → jump to fingerprint editor pre-scoped to that profile
+      tbody.querySelectorAll("tr[data-profile]").forEach(tr => {
+        tr.addEventListener("click", () => {
+          const p = tr.dataset.profile;
+          location.hash = `#fingerprint?profile=${encodeURIComponent(p)}`;
+          navigate("fingerprint");
+        });
+      });
+    } catch (e) {
+      console.error("fingerprint health:", e);
+      const tbody = $("#overview-fp-tbody");
+      if (tbody) {
+        tbody.innerHTML = `<tr><td colspan="5" class="dense-empty-cell">Failed to load: ${escapeHtml(e.message)}</td></tr>`;
+      }
     }
   },
 };

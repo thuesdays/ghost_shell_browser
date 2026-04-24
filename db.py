@@ -614,6 +614,21 @@ class DB:
         self._ensure_column(conn, "runs", "heartbeat_at", "TEXT")
         self._ensure_column(conn, "profiles", "script_id", "INTEGER")
 
+        # Fingerprint coherence system (added in v4):
+        #   template_id      — canonical device template used
+        #   coherence_score  — 0-100 from validator run at save time
+        #   coherence_report — JSON breakdown of checks
+        #   locked_fields    — JSON list of dot-paths user chose to preserve
+        #                      across regenerations
+        #   source           — 'generated' / 'manual_edit' / 'runtime_observed'
+        #   reason           — free text explaining why this FP was saved
+        self._ensure_column(conn, "fingerprints", "template_id",      "TEXT")
+        self._ensure_column(conn, "fingerprints", "coherence_score",  "INTEGER")
+        self._ensure_column(conn, "fingerprints", "coherence_report", "TEXT")
+        self._ensure_column(conn, "fingerprints", "locked_fields",    "TEXT")
+        self._ensure_column(conn, "fingerprints", "source",           "TEXT")
+        self._ensure_column(conn, "fingerprints", "reason",           "TEXT")
+
         # ── Seed the scripts table ─────────────────────────────
         # On first init (table empty), migrate any existing unified
         # flow (`actions.flow` config key) into a "Default" script,
@@ -2064,40 +2079,168 @@ class DB:
     # ──────────────────────────────────────────────────────────
     # FINGERPRINTS
     # ──────────────────────────────────────────────────────────
+    #
+    # Each save creates a new row (immutable history). is_current=1
+    # marks the active one. When saving a new fingerprint we first
+    # clear is_current on all previous rows for this profile — so
+    # there's always exactly one current fingerprint per profile.
+    #
+    # The `source` column distinguishes:
+    #   'generated'        — from templates, high coherence by construction
+    #   'manual_edit'      — user edited fields in dashboard UI
+    #   'runtime_observed' — scan of real browser, used for drift detection
+    #
+    # `coherence_score` + `coherence_report` store the validator result
+    # at save time. Cached so the UI doesn't re-run validation on every
+    # page load — but we DO re-validate when the user edits fields.
 
-    def fingerprint_save(self, profile_name: str, payload: dict) -> int:
+    def fingerprint_save(self, profile_name: str, payload: dict,
+                         *, coherence_score: int = None,
+                         coherence_report: dict = None,
+                         locked_fields: list = None,
+                         source: str = "generated",
+                         reason: str = None) -> int:
+        """Save a new fingerprint snapshot. Previous ones stay in the
+        table as history; only is_current flag moves."""
         conn = self._get_conn()
-        # Сбрасываем is_current у предыдущих
-        conn.execute(
-            "UPDATE fingerprints SET is_current = 0 WHERE profile_name = ?",
-            (profile_name,)
-        )
-        cur = conn.execute("""
-            INSERT INTO fingerprints (profile_name, timestamp, template_name,
-                                      payload_json, is_current)
-            VALUES (?, ?, ?, ?, 1)
-        """, (profile_name, datetime.now().isoformat(timespec="seconds"),
-              payload.get("template_name"),
-              json.dumps(payload, ensure_ascii=False)))
-        return cur.lastrowid
+        with conn:
+            # Demote previous current
+            conn.execute(
+                "UPDATE fingerprints SET is_current = 0 WHERE profile_name = ?",
+                (profile_name,),
+            )
+            cur = conn.execute("""
+                INSERT INTO fingerprints (
+                    profile_name, timestamp, template_name, template_id,
+                    payload_json, is_current,
+                    coherence_score, coherence_report,
+                    locked_fields, source, reason
+                ) VALUES (?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?)
+            """, (
+                profile_name,
+                datetime.now().isoformat(timespec="seconds"),
+                payload.get("template_label") or payload.get("template_name"),
+                payload.get("template_id"),
+                json.dumps(payload, ensure_ascii=False),
+                coherence_score,
+                json.dumps(coherence_report, ensure_ascii=False) if coherence_report else None,
+                json.dumps(locked_fields, ensure_ascii=False) if locked_fields else None,
+                source,
+                reason,
+            ))
+            return cur.lastrowid
 
     def fingerprint_current(self, profile_name: str) -> Optional[dict]:
+        """Get the currently-active fingerprint for a profile."""
         row = self._get_conn().execute("""
-            SELECT * FROM fingerprints WHERE profile_name = ? AND is_current = 1
+            SELECT * FROM fingerprints
+            WHERE profile_name = ? AND is_current = 1
             ORDER BY timestamp DESC LIMIT 1
         """, (profile_name,)).fetchone()
         if not row:
             return None
         d = dict(row)
         d["payload"] = json.loads(d.pop("payload_json"))
+        if d.get("coherence_report"):
+            try:
+                d["coherence_report"] = json.loads(d["coherence_report"])
+            except Exception:
+                d["coherence_report"] = None
+        if d.get("locked_fields"):
+            try:
+                d["locked_fields"] = json.loads(d["locked_fields"])
+            except Exception:
+                d["locked_fields"] = []
+        return d
+
+    def fingerprint_get(self, fingerprint_id: int) -> Optional[dict]:
+        """Get a specific fingerprint by id (for history restoration)."""
+        row = self._get_conn().execute(
+            "SELECT * FROM fingerprints WHERE id = ?", (fingerprint_id,)
+        ).fetchone()
+        if not row:
+            return None
+        d = dict(row)
+        d["payload"] = json.loads(d.pop("payload_json"))
+        if d.get("coherence_report"):
+            try:
+                d["coherence_report"] = json.loads(d["coherence_report"])
+            except Exception:
+                d["coherence_report"] = None
+        if d.get("locked_fields"):
+            try:
+                d["locked_fields"] = json.loads(d["locked_fields"])
+            except Exception:
+                d["locked_fields"] = []
         return d
 
     def fingerprints_history(self, profile_name: str, limit: int = 20) -> list[dict]:
+        """List past fingerprints for a profile (newest first)."""
         rows = self._get_conn().execute("""
-            SELECT id, timestamp, template_name, is_current
+            SELECT id, timestamp, template_name, template_id,
+                   is_current, coherence_score, source, reason
             FROM fingerprints WHERE profile_name = ?
             ORDER BY timestamp DESC LIMIT ?
         """, (profile_name, limit)).fetchall()
+        return [dict(r) for r in rows]
+
+    def fingerprint_activate(self, fingerprint_id: int) -> bool:
+        """Mark a historical fingerprint as the current one.
+        Used for 'restore to this version'."""
+        conn = self._get_conn()
+        row = conn.execute(
+            "SELECT profile_name FROM fingerprints WHERE id = ?",
+            (fingerprint_id,),
+        ).fetchone()
+        if not row:
+            return False
+        with conn:
+            conn.execute(
+                "UPDATE fingerprints SET is_current = 0 WHERE profile_name = ?",
+                (row["profile_name"],),
+            )
+            conn.execute(
+                "UPDATE fingerprints SET is_current = 1 WHERE id = ?",
+                (fingerprint_id,),
+            )
+        return True
+
+    def fingerprint_delete(self, fingerprint_id: int) -> bool:
+        """Delete a historical fingerprint (can't delete current)."""
+        conn = self._get_conn()
+        row = conn.execute(
+            "SELECT is_current FROM fingerprints WHERE id = ?",
+            (fingerprint_id,),
+        ).fetchone()
+        if not row:
+            return False
+        if row["is_current"]:
+            raise ValueError("Cannot delete the current fingerprint — "
+                             "restore or generate another first.")
+        with conn:
+            conn.execute("DELETE FROM fingerprints WHERE id = ?",
+                         (fingerprint_id,))
+        return True
+
+    def fingerprints_aggregate(self) -> list[dict]:
+        """Per-profile summary: current score, template, last regen,
+        # of historical snapshots. For Overview 'fingerprint health'
+        widget."""
+        rows = self._get_conn().execute("""
+            SELECT
+                p.name AS profile_name,
+                fp.template_name,
+                fp.template_id,
+                fp.coherence_score,
+                fp.timestamp AS current_ts,
+                fp.source AS current_source,
+                (SELECT COUNT(*) FROM fingerprints fh
+                 WHERE fh.profile_name = p.name) AS history_count
+            FROM profiles p
+            LEFT JOIN fingerprints fp
+                ON fp.profile_name = p.name AND fp.is_current = 1
+            ORDER BY p.name
+        """).fetchall()
         return [dict(r) for r in rows]
 
     # ──────────────────────────────────────────────────────────

@@ -3513,6 +3513,314 @@ def api_proxies_bulk_import():
 
 
 # ──────────────────────────────────────────────────────────────
+# API: FINGERPRINT COHERENCE SYSTEM
+# ──────────────────────────────────────────────────────────────
+#
+# Endpoints:
+#   GET    /api/fingerprint/templates          — list available templates
+#   GET    /api/fingerprint/<profile>          — current fp + validation
+#   POST   /api/fingerprint/<profile>/generate — make new fingerprint
+#   PUT    /api/fingerprint/<profile>          — update fields manually
+#   POST   /api/fingerprint/<profile>/validate — re-run validation
+#   POST   /api/fingerprint/<profile>/selftest — launch browser, verify
+#   GET    /api/fingerprint/<profile>/history  — list snapshots
+#   POST   /api/fingerprint/<profile>/activate/<id> — restore from history
+#   DELETE /api/fingerprint/<id>               — delete a history entry
+#   GET    /api/fingerprints/summary           — aggregate for overview
+#
+
+@app.route("/api/fingerprint/templates", methods=["GET"])
+def api_fp_templates():
+    """List all device templates. UI uses this for the template
+    picker dropdown. Returns summary only — full details are in
+    fingerprint_templates.py source."""
+    from fingerprint_templates import all_templates
+    templates = []
+    for t in all_templates():
+        templates.append({
+            "id":                t["id"],
+            "label":              t["label"],
+            "category":           t["category"],
+            "os":                 t["os"],
+            "market_share_pct":   t.get("market_share_pct", 0),
+            "chrome_version_range": t["chrome_version_range"],
+            "screen_options": [
+                {"width": s["width"], "height": s["height"], "dpr": s["dpr"]}
+                for s in t["screen_options"]
+            ],
+            "gpu_vendor":         t["gpu"]["vendor"],
+        })
+    return jsonify({"templates": templates})
+
+
+@app.route("/api/fingerprint/<name>", methods=["GET"])
+def api_fp_get(name):
+    """Current fingerprint for a profile + cached validation.
+    Returns null if the profile has no fingerprint yet."""
+    db = get_db()
+    fp_row = db.fingerprint_current(name)
+    if not fp_row:
+        return jsonify({"fingerprint": None})
+    return jsonify({"fingerprint": fp_row})
+
+
+@app.route("/api/fingerprint/<name>/generate", methods=["POST"])
+def api_fp_generate(name):
+    """Generate a new fingerprint for a profile. Body options:
+        {
+          "template_id":    "macbook_pro_14_m2_2023"  // or null = auto
+          "locked_fields":  {"timezone": "Europe/Kyiv"}
+          "mode":           "full" | "template_only" | "reshuffle"
+          "reason":         "user clicked regenerate"
+        }
+    Saves the result + runs validation, returns full report.
+
+    mode semantics:
+      full          — fresh generation, ignores current fp
+      template_only — change only template, keep locked fields
+      reshuffle     — same template, different values (for same template
+                      but different screen/GPU option)
+    """
+    from fingerprint_generator import (
+        generate, regenerate_preserving_locks
+    )
+    from fingerprint_templates import get_template
+    from fingerprint_validator import validate
+
+    data = request.get_json(silent=True) or {}
+    template_id = data.get("template_id")
+    locked_fields = data.get("locked_fields") or {}
+    mode = data.get("mode", "full")
+    reason = data.get("reason") or f"generate mode={mode}"
+
+    db = get_db()
+
+    if mode == "reshuffle":
+        current = db.fingerprint_current(name)
+        if not current:
+            return jsonify({"error": "no current fingerprint to reshuffle"}), 400
+        locked_paths = list(locked_fields.keys())
+        new_fp = regenerate_preserving_locks(
+            current["payload"],
+            locked_paths=locked_paths,
+            new_template_id=None,   # keep template
+        )
+    elif mode == "template_only":
+        if not template_id:
+            return jsonify({"error": "mode=template_only requires template_id"}), 400
+        current = db.fingerprint_current(name)
+        locked_paths = list(locked_fields.keys())
+        new_fp = regenerate_preserving_locks(
+            current["payload"] if current else {"generated_for": name},
+            locked_paths=locked_paths,
+            new_template_id=template_id,
+        )
+    else:
+        # full mode — clean slate
+        new_fp = generate(
+            profile_name=name,
+            template_id=template_id,
+            locked_fields=locked_fields,
+        )
+
+    # Validate
+    template = get_template(new_fp["template_id"])
+    runtime_shape = _flat_fp_to_runtime_shape(new_fp)
+    validation = validate(runtime_shape, template)
+
+    # Save
+    fp_id = db.fingerprint_save(
+        name, new_fp,
+        coherence_score=validation["score"],
+        coherence_report=validation,
+        locked_fields=list(locked_fields.keys()),
+        source="generated",
+        reason=reason,
+    )
+
+    return jsonify({
+        "ok":         True,
+        "id":         fp_id,
+        "fingerprint": new_fp,
+        "validation": validation,
+    })
+
+
+@app.route("/api/fingerprint/<name>", methods=["PUT", "PATCH"])
+def api_fp_update(name):
+    """Edit specific fields of a profile's current fingerprint.
+    Body: { "patches": {"timezone": "Europe/London", "language": "en-GB"} }
+    Re-runs validation and saves as a new snapshot (history
+    preserved)."""
+    from fingerprint_templates import get_template
+    from fingerprint_validator import validate
+
+    data = request.get_json(silent=True) or {}
+    patches = data.get("patches") or {}
+    if not patches:
+        return jsonify({"error": "patches is required"}), 400
+
+    db = get_db()
+    current = db.fingerprint_current(name)
+    if not current:
+        return jsonify({"error": "no current fingerprint"}), 404
+
+    # Apply patches — walk dotted paths to nested dicts
+    payload = dict(current["payload"])
+    for path, value in patches.items():
+        keys = path.split(".")
+        cur = payload
+        for k in keys[:-1]:
+            if k not in cur or not isinstance(cur[k], dict):
+                cur[k] = {}
+            cur = cur[k]
+        cur[keys[-1]] = value
+
+    # Re-validate
+    template = get_template(payload.get("template_id"))
+    if not template:
+        return jsonify({"error": "template_id invalid or missing in payload"}), 400
+    runtime_shape = _flat_fp_to_runtime_shape(payload)
+    validation = validate(runtime_shape, template)
+
+    # Preserve locks from previous record
+    locks = current.get("locked_fields") or []
+
+    fp_id = db.fingerprint_save(
+        name, payload,
+        coherence_score=validation["score"],
+        coherence_report=validation,
+        locked_fields=locks,
+        source="manual_edit",
+        reason=f"edit {list(patches.keys())}",
+    )
+
+    return jsonify({
+        "ok":         True,
+        "id":         fp_id,
+        "fingerprint": payload,
+        "validation": validation,
+    })
+
+
+@app.route("/api/fingerprint/<name>/validate", methods=["POST"])
+def api_fp_validate(name):
+    """Re-run validation on the current fingerprint without changing
+    anything. Useful after template data updates or validator rule
+    changes."""
+    from fingerprint_templates import get_template
+    from fingerprint_validator import validate
+
+    db = get_db()
+    current = db.fingerprint_current(name)
+    if not current:
+        return jsonify({"error": "no current fingerprint"}), 404
+    template = get_template(current["payload"].get("template_id"))
+    if not template:
+        return jsonify({"error": "template not found"}), 404
+    runtime_shape = _flat_fp_to_runtime_shape(current["payload"])
+    validation = validate(runtime_shape, template)
+
+    # Update cached score (but don't create new history row)
+    conn = db._get_conn()
+    conn.execute("""
+        UPDATE fingerprints SET
+            coherence_score = ?, coherence_report = ?
+        WHERE id = ?
+    """, (validation["score"], json.dumps(validation), current["id"]))
+    conn.commit()
+
+    return jsonify({"ok": True, "validation": validation})
+
+
+@app.route("/api/fingerprint/<name>/selftest", methods=["POST"])
+def api_fp_selftest(name):
+    """Launch a real browser with this profile, probe the actual
+    fingerprint, compare vs configured. Takes 5-15 seconds."""
+    from fingerprint_selftest import run_selftest
+
+    db = get_db()
+    current = db.fingerprint_current(name)
+    if not current:
+        return jsonify({"error": "no current fingerprint — generate one first"}), 404
+
+    report = run_selftest(name, current["payload"])
+    return jsonify(report)
+
+
+@app.route("/api/fingerprint/<name>/history", methods=["GET"])
+def api_fp_history(name):
+    limit = int(request.args.get("limit", 30))
+    db = get_db()
+    return jsonify({
+        "profile":   name,
+        "history":   db.fingerprints_history(name, limit=limit),
+    })
+
+
+@app.route("/api/fingerprint/<name>/activate/<int:fp_id>", methods=["POST"])
+def api_fp_activate(name, fp_id):
+    """Restore a historical fingerprint as current. Verifies the
+    fingerprint belongs to this profile."""
+    db = get_db()
+    target = db.fingerprint_get(fp_id)
+    if not target or target["profile_name"] != name:
+        return jsonify({"error": "fingerprint not found for this profile"}), 404
+    ok = db.fingerprint_activate(fp_id)
+    return jsonify({"ok": ok, "activated_id": fp_id})
+
+
+@app.route("/api/fingerprint/entry/<int:fp_id>", methods=["DELETE"])
+def api_fp_delete(fp_id):
+    """Delete a historical fingerprint (current can't be deleted)."""
+    db = get_db()
+    try:
+        ok = db.fingerprint_delete(fp_id)
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+    if not ok:
+        return jsonify({"error": "not found"}), 404
+    return jsonify({"ok": True})
+
+
+@app.route("/api/fingerprints/summary", methods=["GET"])
+def api_fp_summary():
+    """Aggregate report for Overview — every profile's fingerprint
+    score + template + history count."""
+    db = get_db()
+    return jsonify({"profiles": db.fingerprints_aggregate()})
+
+
+def _flat_fp_to_runtime_shape(fp: dict) -> dict:
+    """Convert generator's flat fingerprint dict to the nested shape
+    the validator expects (matches what JS probe returns). DRY helper
+    used by multiple endpoints."""
+    return {
+        "navigator": {
+            "userAgent":          fp.get("user_agent"),
+            "platform":           fp.get("platform"),
+            "hardwareConcurrency": fp.get("hardware_concurrency"),
+            "deviceMemory":       fp.get("device_memory"),
+            "maxTouchPoints":     fp.get("max_touch_points"),
+            "language":           fp.get("language"),
+            "vendor":             fp.get("vendor"),
+            "webdriver":          fp.get("webdriver", False),
+        },
+        "screen": {
+            "width":  fp.get("screen", {}).get("width"),
+            "height": fp.get("screen", {}).get("height"),
+        },
+        "window": {"devicePixelRatio": fp.get("dpr")},
+        "webgl":   fp.get("webgl", {}),
+        "timezone": {"intl": fp.get("timezone")},
+        "fonts":   fp.get("fonts", []),
+        "audio":   {"sampleRate": fp.get("audio_sample_rate")},
+    }
+
+
+
+
+# ──────────────────────────────────────────────────────────────
 # API: CONFIGURATION EXPORT / IMPORT
 # ──────────────────────────────────────────────────────────────
 #

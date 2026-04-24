@@ -154,4 +154,57 @@
       </table>
     </div>
   </div>
+
+  <!-- Fingerprint health — per-profile coherence scores.
+       Rows with score < 55 highlighted red, < 75 amber. Empty state
+       (no fingerprint at all) is called out separately because that's
+       the actionable signal: profiles were never generated through
+       the new system. -->
+  <div class="dense-panel">
+    <div class="dense-panel-header">
+      <div class="dense-panel-title">
+        🧬 Fingerprint health
+        <span class="dense-panel-hint">
+          — coherence scores across all profiles. Warnings are
+          profiles that need regeneration.
+        </span>
+      </div>
+      <a href="#" data-nav="fingerprint" class="btn btn-secondary btn-small">
+        Open editor →
+      </a>
+    </div>
+
+    <!-- Aggregate tiles — average score + warning counts -->
+    <div class="overview-fp-grid" id="overview-fp-tiles">
+      <div class="overview-fp-summary-tile" id="ov-fp-tile-avg">
+        <div class="overview-fp-summary-tile-label">Average score</div>
+        <div class="overview-fp-summary-tile-value" id="ov-fp-avg-score">—</div>
+      </div>
+      <div class="overview-fp-summary-tile" id="ov-fp-tile-warn">
+        <div class="overview-fp-summary-tile-label">Warnings (&lt; 75)</div>
+        <div class="overview-fp-summary-tile-value" id="ov-fp-warn-count">—</div>
+      </div>
+      <div class="overview-fp-summary-tile" id="ov-fp-tile-missing">
+        <div class="overview-fp-summary-tile-label">Missing fingerprint</div>
+        <div class="overview-fp-summary-tile-value" id="ov-fp-missing-count">—</div>
+      </div>
+    </div>
+
+    <div class="dense-table-wrap">
+      <table class="dense-table overview-fp-table">
+        <thead>
+          <tr>
+            <th class="col-profile">Profile</th>
+            <th class="col-template">Template</th>
+            <th class="col-score num">Score</th>
+            <th class="col-snaps num">Snapshots</th>
+            <th class="col-when">Last regen</th>
+          </tr>
+        </thead>
+        <tbody id="overview-fp-tbody">
+          <tr><td colspan="5" class="dense-empty-cell">Loading…</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
 </section>

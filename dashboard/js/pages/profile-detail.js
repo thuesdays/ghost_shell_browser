@@ -75,6 +75,10 @@ const ProfileDetail = {
       regenBtn.addEventListener("click", () => this.regenerateFingerprint());
     }
 
+    // New Phase-2 card: Quick regenerate button on the active-fp card
+    document.getElementById("profile-fp-regen-btn")
+      ?.addEventListener("click", () => this.quickRegenerateFingerprint());
+
     // ── Chrome history importer ──
     // Auto-detect the source path on page load so the input is pre-filled.
     this._populateChromeImportSource();
@@ -132,11 +136,119 @@ const ProfileDetail = {
   },
 
   async loadFingerprint(name) {
+    // Dual-purpose: fill the raw-JSON debug view AND populate the
+    // new coherence-score card. Uses the new /api/fingerprint/<name>
+    // endpoint which returns the FULL DB row (payload + coherence_report)
+    // rather than the legacy shape which is just the payload dict.
     try {
-      const fp = await api(`/api/profiles/${encodeURIComponent(name)}/fingerprint`);
-      $("#fingerprint-view").innerHTML = fmtJson(fp);
+      const resp = await api(`/api/fingerprint/${encodeURIComponent(name)}`);
+      const fp = resp.fingerprint;     // row or null
+      this._renderFingerprintCard(fp);
+
+      // Legacy debug view — show the payload so existing users who relied
+      // on the pretty-printed JSON still see their data.
+      if ($("#fingerprint-view")) {
+        if (fp) {
+          $("#fingerprint-view").innerHTML = fmtJson(fp.payload || fp);
+        } else {
+          $("#fingerprint-view").innerHTML = '<span class="muted">No fingerprint generated yet.</span>';
+        }
+      }
     } catch (e) {
-      $("#fingerprint-view").innerHTML = `<span class="muted">${escapeHtml(e.message)}</span>`;
+      this._renderFingerprintCard(null, e.message);
+      if ($("#fingerprint-view")) {
+        $("#fingerprint-view").innerHTML = `<span class="muted">${escapeHtml(e.message)}</span>`;
+      }
+    }
+  },
+
+  // ─────────────────────────────────────────────────────────────
+  // Fingerprint mini-card — visible on profile detail page.
+  // Feeds from the same /api/fingerprint/<name> payload as the
+  // full editor page, but shows only score + template + CTAs.
+  // ─────────────────────────────────────────────────────────────
+  _renderFingerprintCard(fp, errMsg) {
+    const badge    = document.getElementById("profile-fp-badge");
+    const scoreEl  = document.getElementById("profile-fp-score");
+    const gradeEl  = document.getElementById("profile-fp-grade");
+    const sumEl    = document.getElementById("profile-fp-summary");
+    const metaEl   = document.getElementById("profile-fp-meta");
+    const openBtn  = document.getElementById("profile-fp-open-btn");
+    if (!badge) return;    // profile.html snippet not present (old cached copy)
+
+    // Reset colour classes so previous profile's grade doesn't stick
+    badge.className = "profile-fp-mini-badge fp-score-unknown";
+
+    // Always pass current profile name into the editor link so the
+    // editor can preselect it via its ?profile=... hash parser.
+    if (openBtn && this.currentProfile) {
+      openBtn.setAttribute("data-nav-params",
+        `profile=${encodeURIComponent(this.currentProfile)}`);
+      // Also patch the hash on click — data-nav navigates without params
+      // so we wrap the click to append ?profile=… before nav fires.
+      openBtn.onclick = (e) => {
+        e.preventDefault();
+        location.hash = `#fingerprint?profile=${encodeURIComponent(this.currentProfile)}`;
+        navigate("fingerprint");
+      };
+    }
+
+    if (errMsg) {
+      scoreEl.textContent = "!";
+      gradeEl.textContent = "error";
+      sumEl.textContent = errMsg;
+      metaEl.textContent = "";
+      return;
+    }
+
+    if (!fp) {
+      scoreEl.textContent = "—";
+      gradeEl.textContent = "no data";
+      sumEl.textContent = "No fingerprint generated yet. Open the editor to create one.";
+      metaEl.textContent = "";
+      return;
+    }
+
+    const rep   = fp.coherence_report || {};
+    const score = fp.coherence_score ?? rep.score;
+    const grade = rep.grade || "unknown";
+
+    badge.classList.remove("fp-score-unknown");
+    badge.classList.add(`fp-score-${grade}`);
+    scoreEl.textContent = score == null ? "—" : score;
+    gradeEl.textContent = grade;
+
+    sumEl.textContent = rep.summary
+      || (fp.template_name || fp.template_id || "unknown template");
+
+    const parts = [];
+    if (fp.template_name || fp.template_id) {
+      parts.push(`📦 ${fp.template_name || fp.template_id}`);
+    }
+    if (fp.source) parts.push(`source: ${fp.source}`);
+    if (fp.timestamp) parts.push(`generated ${timeAgo(fp.timestamp)}`);
+    metaEl.textContent = parts.join(" · ");
+  },
+
+  // Quick regenerate — reuses the library /generate endpoint with
+  // mode=full so the same codepath as the full editor kicks in.
+  async quickRegenerateFingerprint() {
+    if (!this.currentProfile) return;
+    if (!await confirmDialog({
+      title: "Quick regenerate?",
+      message: `Generate a fresh fingerprint for "${this.currentProfile}"? The current one moves to history — you can restore it from the Fingerprint editor.`,
+      confirmText: "Regenerate",
+    })) return;
+    try {
+      const resp = await api(
+        `/api/fingerprint/${encodeURIComponent(this.currentProfile)}/generate`,
+        { method: "POST",
+          body: JSON.stringify({ mode: "full", reason: "quick regenerate from profile page" }) }
+      );
+      toast(`✓ Regenerated · score ${resp.validation?.score ?? "—"}/100`);
+      await this.loadFingerprint(this.currentProfile);
+    } catch (e) {
+      toast("Regenerate failed: " + e.message, true);
     }
   },
 
