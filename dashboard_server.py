@@ -2808,6 +2808,11 @@ def api_actions_pipelines_save():
         "post_ad_actions":          [...],
         "on_target_domain_actions": [...] }
     Any key is optional; omitted keys are left untouched.
+
+    Deprecated in favour of /api/actions/flow (single-list unified
+    runtime), but kept for back-compat with old Scripts UI + external
+    config imports. Saving here also clears any saved unified flow,
+    so the legacy shape is the source of truth again.
     """
     data = request.get_json(silent=True) or {}
     db = get_db()
@@ -2827,7 +2832,684 @@ def api_actions_pipelines_save():
             db.config_set(f"actions.{key}", pipeline)
             saved[key] = len(pipeline)
 
+    # Clear the unified flow when legacy endpoint is used — we want
+    # one source of truth, not both.
+    db.config_set("actions.flow", [])
+
     return jsonify({"ok": True, "saved": saved})
+
+
+# ── Unified flow (new format) ────────────────────────────────────
+
+def _migrate_legacy_to_flow(main_script: list,
+                            post_ad_actions: list,
+                            on_target_actions: list) -> list:
+    """Convert the old two-pipeline shape into a single unified flow.
+
+    Strategy: keep main_script as-is, then find every `search_query`
+    step and append a `foreach_ad` wrapper containing the post_ad_actions
+    right after it. This replicates the old runtime behavior (per-ad
+    pipeline ran automatically after each search) in explicit form
+    that the user can now see and modify.
+
+    Legacy on_target_domain_actions (pre-flag-merging) get merged into
+    post_ad_actions with an `only_on_target: true` flag, matching what
+    the v1 UI migration did.
+    """
+    if on_target_actions:
+        merged_post = list(post_ad_actions or []) + [
+            {**s, "only_on_target": True} for s in on_target_actions
+        ]
+    else:
+        merged_post = list(post_ad_actions or [])
+
+    def wrap_search(step):
+        """Replace a bare search_query with (search_query + foreach_ad).
+        If there are no post-ad actions, leaves search_query alone."""
+        if step.get("type") != "search_query" or not merged_post:
+            return [step]
+        return [
+            step,
+            {
+                "type":    "foreach_ad",
+                "enabled": True,
+                "steps":   [dict(s) for s in merged_post],   # deep-ish copy
+            },
+        ]
+
+    flow = []
+    for step in (main_script or []):
+        # Recurse into nested steps of loop actions
+        if step.get("type") in ("loop", "foreach"):
+            nested = step.get("steps") or []
+            new_nested = []
+            for ns in nested:
+                new_nested.extend(wrap_search(ns))
+            new_step = dict(step)
+            new_step["steps"] = new_nested
+            flow.append(new_step)
+        else:
+            flow.extend(wrap_search(step))
+    return flow
+
+
+@app.route("/api/actions/flow", methods=["GET"])
+def api_actions_flow_get():
+    """Return the unified flow — single ordered list of steps.
+
+    If the user hasn't saved a unified flow yet but has legacy
+    main_script/post_ad_actions, this endpoint migrates on the fly
+    (without persisting) so the Scripts page can show the converted
+    flow. Saving via POST persists it and shadows the legacy keys.
+    """
+    db = get_db()
+    raw = db.config_get("actions.flow")
+    if isinstance(raw, str):
+        try: raw = json.loads(raw)
+        except Exception: raw = None
+    if isinstance(raw, list) and raw:
+        return jsonify({"flow": raw, "migrated_from_legacy": False})
+
+    # Nothing saved yet — migrate legacy on the fly
+    main_script = db.config_get("actions.main_script") or []
+    post_ad     = db.config_get("actions.post_ad_actions") or []
+    on_target   = db.config_get("actions.on_target_domain_actions") or []
+    for var in ("main_script", "post_ad", "on_target"):
+        v = locals()[var]
+        if isinstance(v, str):
+            try: locals()[var] = json.loads(v)
+            except Exception: locals()[var] = []
+
+    migrated = _migrate_legacy_to_flow(main_script, post_ad, on_target)
+    return jsonify({
+        "flow":                 migrated,
+        "migrated_from_legacy": bool(migrated),
+    })
+
+
+@app.route("/api/actions/flow", methods=["POST"])
+def api_actions_flow_save():
+    """Save a unified flow. Body: {"flow": [...steps...]}.
+    Validates that every step has a `type`. Recurses into containers
+    (if/foreach_ad/foreach/loop) to validate nested steps too."""
+    data = request.get_json(silent=True) or {}
+    flow = data.get("flow")
+    if not isinstance(flow, list):
+        return jsonify({"error": "flow must be a list"}), 400
+
+    def _validate(steps, path=""):
+        for i, step in enumerate(steps):
+            p = f"{path}[{i}]"
+            if not isinstance(step, dict):
+                return f"{p} is not a dict"
+            if "type" not in step:
+                return f"{p} missing 'type'"
+            # Recurse into container params
+            for key in ("steps", "then_steps", "else_steps"):
+                if isinstance(step.get(key), list):
+                    err = _validate(step[key], f"{p}.{key}")
+                    if err: return err
+        return None
+
+    err = _validate(flow)
+    if err:
+        return jsonify({"error": err}), 400
+
+    db = get_db()
+    db.config_set("actions.flow", flow)
+    # Clear legacy pipelines so there's ONE source of truth.
+    db.config_set("actions.main_script", [])
+    db.config_set("actions.post_ad_actions", [])
+    db.config_set("actions.on_target_domain_actions", [])
+
+    return jsonify({"ok": True, "count": len(flow)})
+
+
+@app.route("/api/actions/condition-kinds", methods=["GET"])
+def api_condition_kinds():
+    """Return the list of condition predicates the `if` action
+    supports — used by the Scripts inspector to populate its
+    condition picker."""
+    from action_runner import CONDITION_KINDS
+    return jsonify({"kinds": CONDITION_KINDS})
+
+
+# ──────────────────────────────────────────────────────────────
+# API: SCRIPTS LIBRARY — saved flow definitions
+# ──────────────────────────────────────────────────────────────
+#
+# Each script is { id, name, description, flow, is_default }, with
+# `flow` being the full unified-flow step tree (same shape as the
+# legacy /api/actions/flow endpoint operated on).
+#
+# Profiles reference scripts via profiles.script_id — see the
+# script_resolve_for_profile helper used by main.py at run time.
+
+@app.route("/api/scripts", methods=["GET"])
+def api_scripts_list():
+    """Return a summary list of all scripts (no full flow JSON)."""
+    db = get_db()
+    return jsonify({"scripts": db.scripts_list()})
+
+
+@app.route("/api/scripts", methods=["POST"])
+def api_scripts_create():
+    """Create a new script. Body:
+      { "name": "...", "description": "...", "flow": [...],
+        "is_default": false }
+    """
+    data = request.get_json(silent=True) or {}
+    name = (data.get("name") or "").strip()
+    if not name:
+        return jsonify({"error": "name is required"}), 400
+    flow = data.get("flow") or []
+    if not isinstance(flow, list):
+        return jsonify({"error": "flow must be a list"}), 400
+
+    # Validate step shape (same rules as /api/actions/flow)
+    def _validate(steps, path=""):
+        for i, step in enumerate(steps):
+            p = f"{path}[{i}]"
+            if not isinstance(step, dict) or "type" not in step:
+                return f"{p} missing 'type'"
+            for key in ("steps", "then_steps", "else_steps"):
+                if isinstance(step.get(key), list):
+                    err = _validate(step[key], f"{p}.{key}")
+                    if err: return err
+        return None
+    err = _validate(flow)
+    if err:
+        return jsonify({"error": err}), 400
+
+    db = get_db()
+    try:
+        script_id = db.script_create(
+            name=name,
+            description=data.get("description", "") or "",
+            flow=flow,
+            is_default=bool(data.get("is_default")),
+        )
+    except Exception as e:
+        # Likely UNIQUE constraint on name
+        return jsonify({"error": f"Could not create: {e}"}), 400
+    return jsonify({"ok": True, "id": script_id})
+
+
+@app.route("/api/scripts/<int:script_id>", methods=["GET"])
+def api_scripts_get(script_id):
+    """Fetch one script with its full flow JSON."""
+    db = get_db()
+    sc = db.script_get(script_id)
+    if not sc:
+        return jsonify({"error": "not found"}), 404
+    sc["profiles"] = db.script_profiles(script_id)
+    return jsonify({"script": sc})
+
+
+@app.route("/api/scripts/<int:script_id>", methods=["PUT", "PATCH"])
+def api_scripts_update(script_id):
+    """Partial update. Any of name/description/flow/is_default."""
+    data = request.get_json(silent=True) or {}
+    db = get_db()
+    if "flow" in data:
+        # Same validation as create
+        flow = data["flow"]
+        if not isinstance(flow, list):
+            return jsonify({"error": "flow must be a list"}), 400
+        def _validate(steps, path=""):
+            for i, step in enumerate(steps):
+                p = f"{path}[{i}]"
+                if not isinstance(step, dict) or "type" not in step:
+                    return f"{p} missing 'type'"
+                for key in ("steps", "then_steps", "else_steps"):
+                    if isinstance(step.get(key), list):
+                        err = _validate(step[key], f"{p}.{key}")
+                        if err: return err
+            return None
+        err = _validate(flow)
+        if err:
+            return jsonify({"error": err}), 400
+    try:
+        ok = db.script_update(
+            script_id,
+            name=data.get("name"),
+            description=data.get("description"),
+            flow=data.get("flow"),
+            is_default=data.get("is_default") if "is_default" in data else None,
+        )
+    except Exception as e:
+        return jsonify({"error": f"Could not update: {e}"}), 400
+    if not ok:
+        return jsonify({"error": "not found or no changes"}), 404
+    return jsonify({"ok": True})
+
+
+@app.route("/api/scripts/<int:script_id>", methods=["DELETE"])
+def api_scripts_delete(script_id):
+    db = get_db()
+    try:
+        ok = db.script_delete(script_id)
+    except ValueError as e:
+        # e.g. "Cannot delete the default script"
+        return jsonify({"error": str(e)}), 400
+    if not ok:
+        return jsonify({"error": "not found"}), 404
+    return jsonify({"ok": True})
+
+
+@app.route("/api/scripts/<int:script_id>/assign", methods=["POST"])
+def api_scripts_assign(script_id):
+    """Assign this script to one or more profiles. Body:
+      { "profiles": ["profile_01", "profile_02"] }
+    Unassigns these profiles from any other script they had."""
+    data = request.get_json(silent=True) or {}
+    profiles = data.get("profiles") or []
+    if not isinstance(profiles, list):
+        return jsonify({"error": "profiles must be a list"}), 400
+    db = get_db()
+    # Confirm script exists
+    if not db.script_get(script_id):
+        return jsonify({"error": "script not found"}), 404
+    for p in profiles:
+        if not isinstance(p, str) or not p:
+            continue
+        db.script_assign_to_profile(p, script_id)
+    return jsonify({"ok": True, "assigned": len(profiles)})
+
+
+@app.route("/api/profiles/<name>/script", methods=["GET"])
+def api_profile_script_get(name):
+    """Return the script assigned to a profile (resolves to default
+    if none assigned). UI uses this for the profile-page dropdown."""
+    db = get_db()
+    sc = db.script_resolve_for_profile(name)
+    if not sc:
+        return jsonify({"script": None})
+    # Strip the flow to keep payload small — UI only needs metadata
+    return jsonify({"script": {
+        "id":          sc["id"],
+        "name":        sc["name"],
+        "description": sc["description"],
+        "is_default":  sc.get("is_default", 0),
+    }})
+
+
+@app.route("/api/profiles/<name>/script", methods=["POST", "PUT"])
+def api_profile_script_set(name):
+    """Assign a script (by id) to a profile. Body:
+       { "script_id": 5 } or { "script_id": null } to clear.
+    """
+    data = request.get_json(silent=True) or {}
+    script_id = data.get("script_id")
+    if script_id is not None and not isinstance(script_id, int):
+        return jsonify({"error": "script_id must be integer or null"}), 400
+    db = get_db()
+    if script_id is not None and not db.script_get(script_id):
+        return jsonify({"error": "script not found"}), 404
+    db.script_assign_to_profile(name, script_id)
+    return jsonify({"ok": True})
+
+
+# ──────────────────────────────────────────────────────────────
+# API: PROXIES LIBRARY — saved proxy configurations
+# ──────────────────────────────────────────────────────────────
+# Parallel shape to the scripts API — same CRUD + assign pattern.
+# Proxy "test" endpoint runs a plain-HTTP probe through the proxy
+# via proxy_diagnostics.test_proxy() (no Chrome needed), writes the
+# result into the cached last_* columns so subsequent page loads
+# render fast without re-probing.
+
+@app.route("/api/proxies", methods=["GET"])
+def api_proxies_list():
+    db = get_db()
+    return jsonify({"proxies": db.proxies_list()})
+
+
+@app.route("/api/proxies", methods=["POST"])
+def api_proxies_create():
+    """Create a proxy. Body:
+      { "url": "http://user:pass@host:port",
+        "name": "...",
+        "is_default": false,
+        "is_rotating": false,
+        "rotation_api_url": "...",
+        "auto_test": true }
+    If auto_test=true (default), runs a diagnostic probe right after
+    creation so the row lands in the UI already colored. When false,
+    row starts in 'untested' status.
+    """
+    data = request.get_json(silent=True) or {}
+    url = (data.get("url") or "").strip()
+    if not url:
+        return jsonify({"error": "url is required"}), 400
+    db = get_db()
+    try:
+        pid = db.proxy_create(
+            url=url,
+            name=data.get("name") or None,
+            is_rotating=bool(data.get("is_rotating")),
+            rotation_api_url=data.get("rotation_api_url") or None,
+            rotation_provider=data.get("rotation_provider") or None,
+            rotation_api_key=data.get("rotation_api_key") or None,
+            is_default=bool(data.get("is_default")),
+            notes=data.get("notes") or None,
+        )
+    except Exception as e:
+        return jsonify({"error": f"Could not create: {e}"}), 400
+
+    # Auto-test by default — users want the flag/ISP populated
+    # without a second click
+    if data.get("auto_test", True):
+        try:
+            from proxy_diagnostics import test_proxy
+            proxy = db.proxy_get(pid)
+            diag = test_proxy(proxy["url"], timeout=10)
+            db.proxy_record_diagnostics(pid, diag)
+        except Exception as e:
+            logging.warning(f"[proxies] auto-test failed: {e}")
+
+    return jsonify({"ok": True, "id": pid,
+                    "proxy": db.proxy_get(pid)})
+
+
+@app.route("/api/proxies/<int:proxy_id>", methods=["GET"])
+def api_proxies_get(proxy_id):
+    db = get_db()
+    p = db.proxy_get(proxy_id)
+    if not p:
+        return jsonify({"error": "not found"}), 404
+    p["profiles"] = db.proxy_profiles(proxy_id)
+    return jsonify({"proxy": p})
+
+
+@app.route("/api/proxies/<int:proxy_id>", methods=["PUT", "PATCH"])
+def api_proxies_update(proxy_id):
+    data = request.get_json(silent=True) or {}
+    db = get_db()
+    try:
+        ok = db.proxy_update(proxy_id, **data)
+    except Exception as e:
+        return jsonify({"error": f"Could not update: {e}"}), 400
+    if not ok:
+        return jsonify({"error": "not found or no changes"}), 404
+    # If URL changed, invalidate cached diagnostics so a stale badge
+    # doesn't keep claiming the old IP is reachable
+    if "url" in data:
+        db._get_conn().execute("""
+            UPDATE proxies SET
+                last_status = 'untested',
+                last_exit_ip = NULL, last_country = NULL,
+                last_country_code = NULL, last_city = NULL,
+                last_timezone = NULL, last_asn = NULL,
+                last_provider = NULL, last_ip_type = NULL,
+                last_detection_risk = NULL, last_latency_ms = NULL,
+                last_error = NULL, last_checked_at = NULL
+            WHERE id = ?
+        """, (proxy_id,))
+        db._get_conn().commit()
+    return jsonify({"ok": True})
+
+
+@app.route("/api/proxies/<int:proxy_id>", methods=["DELETE"])
+def api_proxies_delete(proxy_id):
+    db = get_db()
+    try:
+        ok = db.proxy_delete(proxy_id)
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+    if not ok:
+        return jsonify({"error": "not found"}), 404
+    return jsonify({"ok": True})
+
+
+@app.route("/api/proxies/<int:proxy_id>/test", methods=["POST"])
+def api_proxies_test(proxy_id):
+    """Run a diagnostic probe through a single proxy and cache the
+    result. Returns the diagnostic dict so the UI can render the
+    updated status without re-fetching the list."""
+    db = get_db()
+    proxy = db.proxy_get(proxy_id)
+    if not proxy:
+        return jsonify({"error": "not found"}), 404
+    try:
+        from proxy_diagnostics import test_proxy
+        diag = test_proxy(proxy["url"], timeout=15)
+        db.proxy_record_diagnostics(proxy_id, diag)
+        return jsonify({"ok": True, "diag": diag})
+    except Exception as e:
+        logging.exception("proxy test failed")
+        return jsonify({
+            "ok": False,
+            "diag": {"ok": False, "error": str(e)},
+        }), 500
+
+
+@app.route("/api/proxies/test-all", methods=["POST"])
+def api_proxies_test_all():
+    """Probe every proxy in the library sequentially and write back
+    cached diagnostics. Synchronous for simplicity — for large
+    libraries we'd switch to an SSE stream, but 10-20 proxies is
+    fine inline (ip-api allows 45 req/min)."""
+    db = get_db()
+    proxies = db.proxies_list()
+    results = []
+    try:
+        from proxy_diagnostics import test_proxy
+    except ImportError:
+        return jsonify({"error": "proxy_diagnostics module missing"}), 500
+    for p in proxies:
+        diag = test_proxy(p["url"], timeout=12)
+        db.proxy_record_diagnostics(p["id"], diag)
+        results.append({
+            "id":     p["id"],
+            "name":   p["name"],
+            "status": "ok" if diag.get("ok") else "error",
+            "error":  diag.get("error"),
+        })
+    return jsonify({"ok": True, "count": len(results), "results": results})
+
+
+@app.route("/api/proxies/<int:proxy_id>/assign", methods=["POST"])
+def api_proxies_assign(proxy_id):
+    """Assign this proxy to one or more profiles.
+      { "profiles": ["profile_01", "profile_02"] }
+    """
+    data = request.get_json(silent=True) or {}
+    profiles = data.get("profiles") or []
+    if not isinstance(profiles, list):
+        return jsonify({"error": "profiles must be a list"}), 400
+    db = get_db()
+    if not db.proxy_get(proxy_id):
+        return jsonify({"error": "proxy not found"}), 404
+    for p in profiles:
+        if isinstance(p, str) and p:
+            db.proxy_assign_to_profile(p, proxy_id)
+    return jsonify({"ok": True, "assigned": len(profiles)})
+
+
+@app.route("/api/profiles/<name>/proxy", methods=["GET"])
+def api_profile_proxy_get(name):
+    """Return the proxy assigned to a profile (resolves to default
+    if none assigned)."""
+    db = get_db()
+    p = db.proxy_resolve_for_profile(name)
+    if not p:
+        return jsonify({"proxy": None})
+    # Don't expose password in the profile-page response
+    return jsonify({"proxy": {
+        "id":            p["id"],
+        "name":          p["name"],
+        "url":           p["url"],
+        "host":          p["host"],
+        "port":          p["port"],
+        "type":          p["type"],
+        "is_default":    p.get("is_default", 0),
+        "is_rotating":   p.get("is_rotating", 0),
+        "last_status":   p.get("last_status"),
+        "last_country":  p.get("last_country"),
+        "last_country_code": p.get("last_country_code"),
+    }})
+
+
+@app.route("/api/profiles/<name>/proxy", methods=["POST", "PUT"])
+def api_profile_proxy_set(name):
+    data = request.get_json(silent=True) or {}
+    proxy_id = data.get("proxy_id")
+    if proxy_id is not None and not isinstance(proxy_id, int):
+        return jsonify({"error": "proxy_id must be integer or null"}), 400
+    db = get_db()
+    if proxy_id is not None and not db.proxy_get(proxy_id):
+        return jsonify({"error": "proxy not found"}), 404
+    db.proxy_assign_to_profile(name, proxy_id)
+    return jsonify({"ok": True})
+
+
+@app.route("/api/proxies/parse-preview", methods=["POST"])
+def api_proxies_parse_preview():
+    """Parse a bulk paste WITHOUT saving. UI uses this to show a live
+    preview of which lines parsed into what proxies, and which failed
+    with errors. Users confirm before hitting bulk-import.
+
+    Body:  { "text": "paste contents", "default_scheme": "http" }
+    Reply: { valid: [...], errors: [...], total: N,
+             duplicates: [ "url", ... ]  # URLs already in DB }
+    """
+    data = request.get_json(silent=True) or {}
+    text = data.get("text") or ""
+    default_scheme = (data.get("default_scheme") or "http").lower()
+    if default_scheme not in ("http", "https", "socks5", "socks4"):
+        default_scheme = "http"
+
+    try:
+        from proxy_diagnostics import parse_proxy_list
+    except ImportError:
+        return jsonify({"error": "proxy_diagnostics module missing"}), 500
+
+    parsed = parse_proxy_list(text, default_scheme=default_scheme)
+
+    # Flag URLs that already exist in the library — so the UI can show
+    # them in gray ("will be skipped on import").
+    db = get_db()
+    duplicates = []
+    for v in parsed["valid"]:
+        existing = db.proxy_get_by_url(v["url"])
+        v["duplicate"] = bool(existing)
+        if existing:
+            duplicates.append(v["url"])
+
+    return jsonify({
+        "valid":      parsed["valid"],
+        "errors":     parsed["errors"],
+        "total":      parsed["total"],
+        "duplicates": duplicates,
+    })
+
+
+@app.route("/api/proxies/bulk-import", methods=["POST"])
+def api_proxies_bulk_import():
+    """Import many proxy lines at once. Accepts two body shapes for
+    backward compat:
+
+      NEW:   { "text": "paste contents", "default_scheme": "http",
+               "auto_test": true, "skip_duplicates": true }
+      LEGACY:{ "urls": ["url1", "url2"], "auto_test": true }
+
+    The text shape goes through the multi-format parser (supports
+    host:port, host:port:user:pass, user:pass@host:port, SOCKS, IPv6,
+    etc). The legacy urls shape treats every entry as-is.
+
+    Reply adds per-line format info so the UI can display "5 imported
+    (2 host:port, 3 host:port:user:pass)".
+    """
+    data = request.get_json(silent=True) or {}
+    db = get_db()
+
+    if data.get("text") is not None:
+        # NEW smart-parser path
+        try:
+            from proxy_diagnostics import parse_proxy_list
+        except ImportError:
+            return jsonify({"error": "proxy_diagnostics module missing"}), 500
+        parsed = parse_proxy_list(
+            data["text"],
+            default_scheme=(data.get("default_scheme") or "http").lower(),
+        )
+        valid_entries = parsed["valid"]
+        parse_errors = parsed["errors"]
+    else:
+        # LEGACY urls path — normalize via parse_proxy_line individually
+        # so the rest of the code works uniformly.
+        try:
+            from proxy_diagnostics import parse_proxy_line
+        except ImportError:
+            return jsonify({"error": "proxy_diagnostics module missing"}), 500
+        urls = data.get("urls") or []
+        if not isinstance(urls, list):
+            return jsonify({"error": "urls must be a list"}), 400
+        valid_entries = []
+        parse_errors = []
+        for i, raw in enumerate(urls, 1):
+            line = (raw or "").strip()
+            if not line:
+                continue
+            r = parse_proxy_line(line)
+            if r and r.get("ok"):
+                valid_entries.append(r)
+            else:
+                parse_errors.append({
+                    "line": i, "raw": raw,
+                    "error": (r or {}).get("error", "unparseable"),
+                })
+
+    created = []
+    skipped_dupes = []
+    create_errors = []
+    fmt_counts = {}
+
+    for v in valid_entries:
+        url = v["url"]
+        try:
+            existing = db.proxy_get_by_url(url)
+            if existing:
+                skipped_dupes.append(url)
+                continue
+            # Use the parsed parts directly — proxy_create also parses
+            # internally but passing through is cleaner and avoids a
+            # second parse round.
+            pid = db.proxy_create(
+                url=url,
+                type=v.get("type"),
+                host=v.get("host"),
+                port=v.get("port"),
+                login=v.get("login") or None,
+                password=v.get("password") or None,
+            )
+            created.append({"id": pid, "url": url})
+            fmt = v.get("format", "unknown")
+            fmt_counts[fmt] = fmt_counts.get(fmt, 0) + 1
+        except Exception as e:
+            create_errors.append({"url": url, "error": str(e)})
+
+    if data.get("auto_test", True) and created:
+        try:
+            from proxy_diagnostics import test_proxy
+            for item in created:
+                diag = test_proxy(item["url"], timeout=10)
+                db.proxy_record_diagnostics(item["id"], diag)
+        except Exception as e:
+            logging.warning(f"[proxies] bulk auto-test failed: {e}")
+
+    return jsonify({
+        "ok":                 True,
+        "created":            len(created),
+        "skipped_duplicates": len(skipped_dupes),
+        "parse_errors":       len(parse_errors),
+        "create_errors":      len(create_errors),
+        "format_counts":      fmt_counts,
+        # Detailed payload for toast/log — capped at 20 items each
+        "parse_error_detail": parse_errors[:20],
+        "create_error_detail": create_errors[:20],
+    })
 
 
 # ──────────────────────────────────────────────────────────────
@@ -3097,6 +3779,136 @@ def cleanup_orphan_config_keys():
             )
     except Exception as e:
         logging.debug(f"cleanup_orphan_config_keys failed: {e}")
+
+
+def _shutdown_reap_all_runs(reason: str = "dashboard shutdown"):
+    """Kill every live run's process tree. Called from atexit and
+    signal handlers so Ctrl+C / killed terminal doesn't leave orphan
+    Chrome + chromedriver + main.py processes running.
+
+    The previous bug: closing the terminal killed only the Flask
+    process. The per-run threads were daemons (good — they die with
+    the process) but the subprocess.Popen children they spawned are
+    NOT automatically killed when their Python parent dies on Windows.
+    So main.py kept running, kept driving Chrome, kept writing to
+    locked profile folders, and a follow-up dashboard launch couldn't
+    touch those profiles until the user manually killed every
+    chrome.exe / chromedriver.exe / python.exe left over.
+
+    Now: we enumerate every RUNNER_POOL slot that has a live PID and
+    kill each tree via process_reaper. Fast — one iteration usually
+    completes in <1s. If we can't reach process_reaper (import fail)
+    we fall back to Popen.terminate() per slot, which kills main.py
+    itself. main.py has its own shutdown handlers that kill Chrome,
+    so even the fallback cleanly propagates.
+    """
+    try:
+        slots = RUNNER_POOL.all_slots()
+    except Exception:
+        return
+
+    active_pids = []
+    for slot_dict in slots:
+        if not slot_dict.get("is_running"):
+            continue
+        run_id = slot_dict.get("run_id")
+        slot = RUNNER_POOL.get(run_id) if run_id is not None else None
+        proc = getattr(slot, "process", None) if slot else None
+        pid = getattr(proc, "pid", None) if proc else None
+        if pid:
+            active_pids.append((run_id, pid))
+
+    if not active_pids:
+        return
+
+    # Print to stderr rather than logging.info — at shutdown the log
+    # handlers may already be half-closed.
+    sys.stderr.write(
+        f"\n[shutdown] {reason}: killing {len(active_pids)} live run(s) "
+        f"and their Chrome trees...\n"
+    )
+    sys.stderr.flush()
+
+    try:
+        from process_reaper import kill_process_tree
+        for run_id, pid in active_pids:
+            try:
+                kill_process_tree(pid, reason=f"dashboard shutdown (run #{run_id})")
+                # Mark in DB so the next dashboard start doesn't try
+                # to treat these runs as "still going"
+                try:
+                    get_db().run_finish(run_id, exit_code=-1,
+                                        error="dashboard shutdown")
+                except Exception:
+                    pass
+            except Exception as e:
+                sys.stderr.write(f"  couldn't kill run #{run_id} pid={pid}: {e}\n")
+    except ImportError:
+        # process_reaper not importable (no psutil?) — fall back to
+        # Popen.terminate. Less thorough: terminates main.py which in
+        # turn kills its Chrome via atexit handlers. Not bulletproof
+        # if main.py is wedged, but better than leaving zombies.
+        for run_id, _pid in active_pids:
+            slot = RUNNER_POOL.get(run_id)
+            proc = getattr(slot, "process", None) if slot else None
+            if proc is None:
+                continue
+            try:
+                proc.terminate()
+            except Exception:
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+
+
+# Install shutdown handlers. These fire on:
+#   - normal interpreter exit (atexit)
+#   - Ctrl+C → SIGINT
+#   - kill / terminal close → SIGTERM (Unix), CTRL_BREAK_EVENT (Windows)
+#
+# Flask's dev server handles SIGINT for its own shutdown, but the
+# children we spawned don't see that signal unless we explicitly
+# propagate. Hence the atexit hook — it fires after Flask has stopped
+# serving, right before the interpreter exits.
+import atexit
+import signal
+
+_shutdown_once = {"fired": False}
+
+def _handle_signal(signum, frame):
+    # Guard against double-fire (SIGINT arriving while atexit is
+    # already running, for example). Only do the reap once per process.
+    if _shutdown_once["fired"]:
+        return
+    _shutdown_once["fired"] = True
+    signame = {
+        signal.SIGINT:  "SIGINT (Ctrl+C)",
+        signal.SIGTERM: "SIGTERM",
+    }.get(signum, f"signal {signum}")
+    _shutdown_reap_all_runs(reason=signame)
+    # Re-raise the default behaviour so Flask actually stops. atexit
+    # will fire too but short-circuit via the _shutdown_once guard.
+    sys.exit(130 if signum == signal.SIGINT else 143)
+
+def _atexit_handler():
+    if _shutdown_once["fired"]:
+        return
+    _shutdown_once["fired"] = True
+    _shutdown_reap_all_runs(reason="interpreter exit")
+
+atexit.register(_atexit_handler)
+try:
+    signal.signal(signal.SIGINT,  _handle_signal)
+    signal.signal(signal.SIGTERM, _handle_signal)
+    # SIGBREAK is Windows-only (Ctrl+Break / console-close).
+    if hasattr(signal, "SIGBREAK"):
+        signal.signal(signal.SIGBREAK, _handle_signal)
+except (ValueError, OSError):
+    # signal.signal can fail if we're not on the main thread — e.g.
+    # when dashboard_server is imported for testing rather than run
+    # directly. atexit still covers us in that case.
+    pass
 
 
 if __name__ == "__main__":

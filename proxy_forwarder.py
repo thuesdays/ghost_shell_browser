@@ -1,15 +1,15 @@
 """
-proxy_forwarder.py — Локальный TCP-форвардер для авторизованных прокси
+proxy_forwarder.py — Локальный TCP-форвардер for авторизованных proxy
 
-Решает проблему: Chrome не умеет работать с прокси-аутентификацией напрямую
-без расширений, а расширения не всегда работают с undetected_chromedriver.
+Решает проблему: Chrome не умеет работать с proxy-аутентификацией напрямую
+without расширений, а расширения не allгyes работают с undetected_chromedriver.
 
-Как работает:
+Как works:
 1. Слушает на 127.0.0.1:<случайный_порт>
-2. Принимает подключения от Chrome (без аутентификации)
-3. Добавляет заголовок Proxy-Authorization: Basic ... в CONNECT и HTTP запросы
-4. Пересылает всё через настоящий авторизованный прокси
-5. После установки туннеля — просто проксирует TCP-трафик в обе стороны
+2. Принимает подключения от Chrome (without аутентификации)
+3. Добавляет заголовок Proxy-Authorization: Basic ... в CONNECT и HTTP queryы
+4. Пересылает everything via настоящий авторизованный proxy
+5. После установки туннеля — просто proxyрует TCP-трафик в обе стороны
 
 Поддерживает HTTPS (CONNECT tunneling) и plain HTTP.
 """
@@ -24,17 +24,17 @@ from urllib.parse import urlparse
 
 class ProxyForwarder:
     """
-    Использование:
+    Usage:
         fwd = ProxyForwarder("user:pass@host:port")
         local_port = fwd.start()
-        # Передать Chrome: --proxy-server=127.0.0.1:<local_port>
+        # Переyesть Chrome: --proxy-server=127.0.0.1:<local_port>
         # ...
         fwd.stop()
     """
 
     def __init__(self, upstream: str):
         """
-        upstream: "user:pass@host:port" или "host:port"
+        upstream: "user:pass@host:port" or "host:port"
         """
         # Нормализуем формат
         if "://" not in upstream:
@@ -57,10 +57,21 @@ class ProxyForwarder:
         self._server   = None
         self._stop     = threading.Event()
 
+        # ── Per-host traffic counters (authoritative) ──────────────
+        # Populated by _handle() on each new connection and updated by
+        # _forward() as bytes flow through. Readers (TrafficCollector)
+        # call drain_counters() to read + reset. Keyed by the CONNECT
+        # target host (for HTTPS) or the Host header (for plain HTTP).
+        # We can't break CONNECT tunnels apart into individual requests
+        # — they're encrypted — but per-host aggregation is exactly
+        # what traffic_stats schema wants anyway.
+        self._counters       = {}   # host -> {"bytes": N, "req_count": M}
+        self._counters_lock  = threading.Lock()
+
     # ──────────────────────────────────────────────────────────
 
     def start(self) -> int:
-        """Запускает форвардер, возвращает локальный порт"""
+        """Overпускает форвардер, возвращает локальный порт"""
         self._server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self._server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         self._server.bind(("127.0.0.1", 0))  # 0 = случайный свободный порт
@@ -99,13 +110,18 @@ class ProxyForwarder:
         """Обрабатывает одно подключение от Chrome"""
         upstream = None
         try:
-            # Читаем первые данные от Chrome — это CONNECT или HTTP-запрос
+            # Читаем первые yesнные от Chrome — this CONNECT or HTTP-query
             client.settimeout(30)
             data = self._read_headers(client)
             if not data:
                 return
 
-            # Коннектимся к апстрим-прокси
+            # Extract target host for byte accounting. Two cases:
+            #   CONNECT target.example.com:443 HTTP/1.1  — HTTPS tunnel
+            #   GET http://plain.example.com/x HTTP/1.1  — plain HTTP
+            target_host = self._extract_target_host(data)
+
+            # Коннектимся к апстрим-proxy
             upstream = socket.create_connection(
                 (self.up_host, self.up_port), timeout=30
             )
@@ -114,14 +130,19 @@ class ProxyForwarder:
             # Вставляем Proxy-Authorization в заголовки
             modified = self._inject_auth(data)
             upstream.sendall(modified)
+            # Count the headers byte stream too — proxy-level billing
+            # includes them. Small (few hundred bytes) but accumulates
+            # across thousands of requests.
+            if target_host:
+                self._add(target_host, len(modified), 1)
 
             # Дальше просто двусторонний TCP-форвардинг
             client.settimeout(None)
             upstream.settimeout(None)
-            self._forward(client, upstream)
+            self._forward(client, upstream, target_host)
 
         except Exception as e:
-            logging.debug(f"[ProxyForwarder] Ошибка соединения: {e}")
+            logging.debug(f"[ProxyForwarder] Error соединения: {e}")
         finally:
             for sock in (client, upstream):
                 try:
@@ -129,6 +150,59 @@ class ProxyForwarder:
                         sock.close()
                 except Exception:
                     pass
+
+    # ──────────────────────────────────────────────────────────────
+    # Byte accounting
+    # ──────────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _extract_target_host(data: bytes) -> str:
+        """Find the eventual destination host from the first HTTP
+        request line / CONNECT line. Returns "" if unparseable so
+        _handle can still forward without crashing."""
+        try:
+            first_line, _, rest = data.partition(b"\r\n")
+            # CONNECT host:port HTTP/1.1  — HTTPS tunnel
+            if first_line.startswith(b"CONNECT "):
+                parts = first_line.split(b" ")
+                if len(parts) >= 2:
+                    host_port = parts[1].decode("latin-1", errors="replace")
+                    return host_port.split(":")[0].lower()
+            # GET http://host/path HTTP/1.1  — plain HTTP through proxy
+            # Or any method with an absolute URL in the request line.
+            parts = first_line.split(b" ")
+            if len(parts) >= 2:
+                target = parts[1].decode("latin-1", errors="replace")
+                if target.startswith(("http://", "https://")):
+                    return urlparse(target).hostname or ""
+            # Last resort — look for Host: header
+            for line in rest.split(b"\r\n"):
+                low = line.lower()
+                if low.startswith(b"host:"):
+                    host = line.split(b":", 1)[1].strip()
+                    return host.decode("latin-1", errors="replace").split(":")[0].lower()
+        except Exception:
+            pass
+        return ""
+
+    def _add(self, host: str, bytes_count: int, req_count: int = 0):
+        """Atomically increment counters for a host."""
+        if not host or (bytes_count <= 0 and req_count <= 0):
+            return
+        with self._counters_lock:
+            slot = self._counters.setdefault(host, {"bytes": 0, "req_count": 0})
+            slot["bytes"]     += bytes_count
+            slot["req_count"] += req_count
+
+    def drain_counters(self) -> dict:
+        """Return a snapshot of counters and reset them to zero. Called
+        by TrafficCollector on each flush — it takes what we've got,
+        writes to DB, and we start accumulating fresh. Returns a dict
+        shaped for traffic_record_batch's by_domain param."""
+        with self._counters_lock:
+            snapshot = self._counters
+            self._counters = {}
+        return snapshot
 
     # ──────────────────────────────────────────────────────────
 
@@ -144,7 +218,7 @@ class ProxyForwarder:
         return buf
 
     def _inject_auth(self, data: bytes) -> bytes:
-        """Добавляет Proxy-Authorization в HTTP-запрос"""
+        """Добавляет Proxy-Authorization в HTTP-query"""
         if not self._auth_header:
             return data
 
@@ -156,16 +230,19 @@ class ProxyForwarder:
         request_line = data[:nl]
         rest         = data[nl + 2:]
 
-        # Проверяем нет ли уже Proxy-Authorization
+        # Проверяем no ли already Proxy-Authorization
         if b"proxy-authorization:" in rest.lower():
-            return data  # уже есть, не дублируем
+            return data  # already is, не дублируем
 
-        # Вставляем наш заголовок сразу после request-line
+        # Вставляем our заголовок сразу after request-line
         return request_line + b"\r\n" + self._auth_header + b"\r\n" + rest
 
-    @staticmethod
-    def _forward(sock1: socket.socket, sock2: socket.socket):
-        """Двусторонний TCP-форвардинг между двумя сокетами"""
+    def _forward(self, sock1: socket.socket, sock2: socket.socket,
+                 target_host: str = ""):
+        """Двусторонний TCP-форвардинг между двумя сокетами. Bytes
+        flowing in EITHER direction count toward target_host — the proxy
+        bill sums both upload and download (asocks charges for total
+        TCP throughput through the tunnel, not just downloads)."""
         sockets = [sock1, sock2]
         try:
             while True:
@@ -184,12 +261,17 @@ class ProxyForwarder:
                         target.sendall(data)
                     except Exception:
                         return
+                    # Byte accounting — independent of direction. For
+                    # HTTPS tunnels this is the only visibility we have
+                    # into bytes per host (payload is encrypted).
+                    if target_host:
+                        self._add(target_host, len(data), 0)
         except Exception:
             pass
 
 
 # ──────────────────────────────────────────────────────────────
-# CLI — быстрый тест
+# CLI — fast тест
 # ──────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
@@ -197,16 +279,16 @@ if __name__ == "__main__":
     import time
 
     if len(sys.argv) < 2:
-        print("Использование: python proxy_forwarder.py user:pass@host:port")
+        print("Usage: python proxy_forwarder.py user:pass@host:port")
         sys.exit(1)
 
     logging.basicConfig(level=logging.INFO)
     fwd = ProxyForwarder(sys.argv[1])
     port = fwd.start()
-    print(f"Локальный прокси: http://127.0.0.1:{port}")
-    print("Теперь можешь проверить:")
+    print(f"Локальный proxy: http://127.0.0.1:{port}")
+    print("Теперь можешь check:")
     print(f"  curl -x http://127.0.0.1:{port} https://api.ipify.org")
-    print("Ctrl+C чтобы остановить")
+    print("Ctrl+C thatбы остановить")
     try:
         while True:
             time.sleep(1)

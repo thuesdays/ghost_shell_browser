@@ -38,6 +38,76 @@
     </div>
   </div>
 
+  <!-- ─── ACTIVE SCRIPT ──────────────────────────────────────── -->
+  <!-- Which saved script (from /Scripts page) does this profile run?
+       Null = fall back to default. UI only shows when we've loaded the
+       profile name, since the API is per-profile. -->
+  <div class="card">
+    <div class="card-title">
+      🎬 Active script
+      <span class="muted">— the flow this profile executes per run</span>
+    </div>
+    <div class="form-group">
+      <label class="form-label">Script</label>
+      <select class="select" id="profile-script-select" style="min-width: 320px;">
+        <option value="">— loading —</option>
+      </select>
+      <div class="form-hint" id="profile-script-hint"
+           style="margin-top: 8px;">
+        Pick from scripts in the
+        <a href="#" data-nav="scripts" class="inline-link">Scripts library</a>.
+        Leave empty to use whichever script is marked Default.
+      </div>
+    </div>
+    <div style="display: flex; gap: 8px; margin-top: 10px;">
+      <button class="btn btn-primary btn-small" id="profile-script-save-btn">
+        Save assignment
+      </button>
+      <a href="#" data-nav="scripts" class="btn btn-secondary btn-small">
+        Open Scripts →
+      </a>
+    </div>
+  </div>
+
+  <!-- ─── ACTIVE PROXY ───────────────────────────────────────── -->
+  <!-- Mirrors Active script above — picks one proxy from the library
+       for this profile. Shows live-cached status inline so users see
+       what proxy the profile will actually route through. -->
+  <div class="card">
+    <div class="card-title">
+      🛰 Active proxy
+      <span class="muted">— which proxy this profile routes through</span>
+    </div>
+    <div class="form-group">
+      <label class="form-label">Proxy</label>
+      <select class="select" id="profile-proxy-select" style="min-width: 360px;">
+        <option value="">— loading —</option>
+      </select>
+      <div class="form-hint" id="profile-proxy-hint"
+           style="margin-top: 8px;">
+        Pick from the
+        <a href="#" data-nav="proxy" class="inline-link">Proxy library</a>.
+        Leave empty to use whichever proxy is marked Default.
+      </div>
+    </div>
+    <div id="profile-proxy-status" class="profile-proxy-status-row"
+         style="display: none;">
+      <span class="status-badge" id="profile-proxy-status-badge">—</span>
+      <span id="profile-proxy-status-meta" class="form-hint"
+            style="margin: 0;"></span>
+    </div>
+    <div style="display: flex; gap: 8px; margin-top: 10px;">
+      <button class="btn btn-primary btn-small" id="profile-proxy-save-btn">
+        Save assignment
+      </button>
+      <button class="btn btn-secondary btn-small" id="profile-proxy-test-btn"
+              title="Test the assigned proxy">🔬 Test</button>
+      <a href="#" data-nav="proxy" class="btn btn-secondary btn-small">
+        Open Proxies →
+      </a>
+    </div>
+  </div>
+
   <!-- ─── PER-PROFILE OVERRIDES ──────────────────────────────── -->
   <div class="card">
     <div class="card-title">

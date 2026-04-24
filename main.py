@@ -84,6 +84,25 @@ PROXY_SINGLE         = CFG.get("proxy.url", "")
 
 _env_proxy = os.environ.get("GHOST_SHELL_PROXY_URL", "").strip()
 _profile_proxy = None
+# ── NEW: proxies library → per-profile assignment ──
+# Try the proxies table first — this is the new Dolphin-style flow
+# where each profile points at a named proxy row. Falls through to
+# legacy resolution if the table is empty or profile has no assignment
+# (fresh install before migration, or someone nuked the table).
+_library_proxy_url = None
+_library_proxy_meta = None   # holds rotation info from the resolved row
+if PROFILE_NAME:
+    try:
+        _lib_proxy = DB.proxy_resolve_for_profile(PROFILE_NAME)
+        if _lib_proxy and _lib_proxy.get("url"):
+            _library_proxy_url = _lib_proxy["url"]
+            _library_proxy_meta = _lib_proxy
+    except Exception as e:
+        logging.debug(f"[main] proxy_resolve_for_profile failed: {e}")
+
+# Legacy per-profile override (profiles.proxy_url column) — kept as a
+# fallback for old configs that didn't migrate. New code should use
+# the proxies table.
 if PROFILE_NAME:
     try:
         _meta = DB.profile_meta_get(PROFILE_NAME)
@@ -94,9 +113,13 @@ if PROFILE_NAME:
 if _env_proxy:
     PROXY = _env_proxy
     logging.info(f"[main] Proxy from GHOST_SHELL_PROXY_URL env: {PROXY[:50]}...")
+elif _library_proxy_url:
+    PROXY = _library_proxy_url
+    name = _library_proxy_meta.get("name") if _library_proxy_meta else "?"
+    logging.info(f"[main] Proxy from library: {name!r} → {PROXY[:50]}...")
 elif _profile_proxy:
     PROXY = _profile_proxy
-    logging.info(f"[main] Proxy from profile override: {PROXY[:50]}...")
+    logging.info(f"[main] Proxy from profile override (legacy): {PROXY[:50]}...")
 elif PROXY_USE_POOL and PROXY_POOL_URLS:
     PROXY = random.choice([p for p in PROXY_POOL_URLS if p.strip()])
     logging.info(f"[main] Picked random proxy from pool: {PROXY[:50]}...")
@@ -122,7 +145,27 @@ def _resolve_rotation():
     url    = CFG.get("proxy.rotation_api_url")
     prov   = CFG.get("proxy.rotation_provider", "none")
     key    = CFG.get("proxy.rotation_api_key")
-    if PROFILE_NAME:
+
+    # ── NEW: proxy library values take precedence over config ──
+    # If the profile has a proxy assignment, read rotation settings
+    # from that row. The assignment itself was resolved earlier in
+    # _library_proxy_meta — check the module var, not an API call.
+    if _library_proxy_meta:
+        pm = _library_proxy_meta
+        if pm.get("is_rotating") is not None:
+            explicit_flag = bool(pm["is_rotating"])
+        if pm.get("rotation_api_url"):
+            url = pm["rotation_api_url"]
+        if pm.get("rotation_provider"):
+            prov = pm["rotation_provider"]
+        if pm.get("rotation_api_key"):
+            key = pm["rotation_api_key"]
+
+    # Legacy per-profile override — only applied when library values
+    # weren't populated (fresh install pre-migration, or proxy row
+    # with no rotation columns).
+    if PROFILE_NAME and not (_library_proxy_meta
+                             and _library_proxy_meta.get("rotation_api_url")):
         try:
             meta = DB.profile_meta_get(PROFILE_NAME)
             if meta.get("proxy_is_rotating") is not None:
@@ -1551,57 +1594,106 @@ def run_monitor():
             check_interval = check_every,
         ) as dog:
 
-            # ── NEW: if a "main_script" is configured in Scripts page,
-            # run THAT instead of the hardcoded query-iteration loop.
-            # Steps inside main_script call back into search_query() /
-            # run_post_ad_pipeline() via loop_ctx callbacks.
-            main_script = CFG.get("actions.main_script", []) or []
-            if main_script:
+            # ── Runtime-selection ladder ──────────────────────────
+            # Resolution order:
+            #
+            #   1. PROFILE-ASSIGNED SCRIPT — profiles.script_id → scripts
+            #      row, or falls back to is_default=1 if the assignment
+            #      is missing/invalid. This is the new norm after the
+            #      scripts-library upgrade.
+            #
+            #   2. LEGACY MAIN + POST_AD  (actions.main_script +
+            #      actions.post_ad_actions). Kept for configs that
+            #      didn't migrate yet — harmless because the migration
+            #      runs at DB init and copies these into the Default
+            #      script on first boot after the upgrade.
+            #
+            #   3. HARDCODED LOOP over SEARCH_QUERIES + POST_AD_ACTIONS.
+            #
+            # Most users will now hit #1. The fallback ladder is still
+            # there because older config bundles, imports, or DB copies
+            # from pre-upgrade versions can legitimately have main_script
+            # populated with no scripts row yet.
+            try:
+                from db import get_db as _getdb
+                _script = _getdb().script_resolve_for_profile(PROFILE_NAME)
+                unified_flow = _script["flow"] if _script else []
+            except Exception as e:
+                logging.warning(f"[main] script_resolve failed: {e}")
+                unified_flow = CFG.get("actions.flow", []) or []
+            main_script  = CFG.get("actions.main_script", []) or []
+
+            def _cb_search(q: str):
+                """Callback for search_query step — returns the ads list.
+                Shared between unified and legacy paths."""
+                try:
+                    ads = search_query(
+                        browser, q, sqm,
+                        current_ip=current_ip,
+                        watchdog=dog,
+                    )
+                    if ads:
+                        save_ads(ads)
+                    return ads or []
+                except Exception as e:
+                    logging.warning(f"_cb_search({q!r}): {e}")
+                    return []
+
+            def _cb_rotate():
+                try:
+                    return browser.force_rotate_ip()
+                except Exception as e:
+                    logging.warning(f"_cb_rotate: {e}")
+                    return None
+
+            def _cb_per_ad(ad, query):
+                try:
+                    run_post_ad_pipeline(browser, ad, query=query)
+                except Exception as e:
+                    logging.warning(
+                        f"per-ad pipeline failed for "
+                        f"{ad.get('domain', '?')!r}: {e}"
+                    )
+
+            shared_loop_ctx = {
+                "all_queries":    SEARCH_QUERIES,
+                "search_query":   _cb_search,
+                "rotate_ip":      _cb_rotate,
+                "per_ad_runner":  _cb_per_ad,
+                "watchdog":       dog,
+                "my_domains":     MY_DOMAINS,
+                "target_domains": TARGET_DOMAINS,
+                "run_id":         RUN_ID,
+                "profile_name":   PROFILE_NAME,
+            }
+
+            skip_legacy_loop = False
+
+            if unified_flow:
+                # ── UNIFIED FLOW PATH ──────────────────────────
+                from action_runner import run_flow
+                logging.info(
+                    f"[main] Running unified flow with "
+                    f"{len(unified_flow)} top-level step(s)"
+                )
+                try:
+                    run_flow(browser, unified_flow,
+                             loop_ctx=shared_loop_ctx)
+                except Exception as e:
+                    logging.error(
+                        f"[main] unified flow execution failed: "
+                        f"{type(e).__name__}: {e}"
+                    )
+                skip_legacy_loop = True
+
+            elif main_script:
+                # ── LEGACY MAIN_SCRIPT PATH ────────────────────
                 from action_runner import run_main_script
                 logging.info(
                     f"[main] Running main_script with {len(main_script)} steps "
-                    f"(legacy query loop bypassed)"
+                    f"(unified flow not configured)"
                 )
-
-                def _cb_search(q: str):
-                    """Callback for search_query step — returns the ads list."""
-                    try:
-                        ads = search_query(
-                            browser, q, sqm,
-                            current_ip=current_ip,
-                            watchdog=dog,
-                        )
-                        if ads:
-                            save_ads(ads)
-                        return ads or []
-                    except Exception as e:
-                        logging.warning(f"main_script._cb_search({q!r}): {e}")
-                        return []
-
-                def _cb_rotate():
-                    try:
-                        return browser.force_rotate_ip()
-                    except Exception as e:
-                        logging.warning(f"main_script._cb_rotate: {e}")
-                        return None
-
-                def _cb_per_ad(ad, query):
-                    """Dispatch one ad through the per-ad pipeline."""
-                    try:
-                        run_post_ad_pipeline(browser, ad, query=query)
-                    except Exception as e:
-                        logging.warning(
-                            f"main_script per-ad failed for "
-                            f"{ad.get('domain', '?')!r}: {e}"
-                        )
-
-                run_main_script(browser, main_script, loop_ctx={
-                    "all_queries":   SEARCH_QUERIES,
-                    "search_query":  _cb_search,
-                    "rotate_ip":     _cb_rotate,
-                    "per_ad_runner": _cb_per_ad,
-                    "watchdog":      dog,
-                })
+                run_main_script(browser, main_script, loop_ctx=shared_loop_ctx)
                 # Skip the legacy loop. Using a local flag instead of
                 # `SEARCH_QUERIES = []` — assigning to the module-level
                 # name inside this function would make Python treat it
@@ -1609,8 +1701,6 @@ def run_monitor():
                 # `for i, query in enumerate(SEARCH_QUERIES, 1)` below
                 # with UnboundLocalError before the assignment runs.
                 skip_legacy_loop = True
-            else:
-                skip_legacy_loop = False
 
             if skip_legacy_loop:
                 queries_to_run = []
@@ -1738,6 +1828,29 @@ def run_monitor():
 # ──────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
+    # ── Signal → exception bridge ──────────────────────────────────
+    # On Windows, dashboard_server.py terminates us via Popen.terminate(),
+    # which sends SIGTERM. Python's DEFAULT SIGTERM handler is SIG_DFL,
+    # which kills the process instantly — no `finally`, no __exit__,
+    # no browser.close() → Chrome + chromedriver become orphans.
+    #
+    # Raising KeyboardInterrupt from the signal handler converts the
+    # abrupt kill into a regular exception that propagates out through
+    # our `with GhostShellBrowser(...) as browser:` block, letting
+    # __exit__ → close() tear down Chrome cleanly.
+    #
+    # CTRL+C is already handled (raises KeyboardInterrupt natively);
+    # this just extends the same behavior to SIGTERM + CTRL_BREAK.
+    import signal as _signal
+    def _sig_to_interrupt(signum, frame):
+        raise KeyboardInterrupt(f"signal {signum}")
+    try:
+        _signal.signal(_signal.SIGTERM, _sig_to_interrupt)
+        if hasattr(_signal, "SIGBREAK"):
+            _signal.signal(_signal.SIGBREAK, _sig_to_interrupt)
+    except (ValueError, OSError):
+        pass   # not on main thread (shouldn't happen in __main__)
+
     exit_code = 0
     error_msg = None
     run_started_at = time.time()

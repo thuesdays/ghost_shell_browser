@@ -1,66 +1,78 @@
-<section>
+<section class="competitors-workspace">
   <div class="page-header">
     <div>
       <div class="page-title">Competitors</div>
-      <div class="page-subtitle">Advertisers seen across all your monitored queries</div>
+      <div class="page-subtitle">
+        Advertisers seen across all your monitored queries.
+      </div>
     </div>
   </div>
 
-  <div class="stats-grid">
-    <div class="stat">
-      <div class="stat-label">Total records</div>
-      <div class="stat-value" id="comp-total">—</div>
+  <!-- Inline stats bar — replaces the old .stats-grid card row -->
+  <div class="dense-statbar">
+    <div class="dense-stat">
+      <div class="dense-stat-label">Total records</div>
+      <div class="dense-stat-value" id="comp-total">—</div>
     </div>
-    <div class="stat">
-      <div class="stat-label">Unique domains</div>
-      <div class="stat-value" id="comp-domains">—</div>
+    <div class="dense-stat">
+      <div class="dense-stat-label">Unique domains</div>
+      <div class="dense-stat-value" id="comp-domains">—</div>
     </div>
-    <div class="stat">
-      <div class="stat-label">Actions performed</div>
-      <div class="stat-value" id="comp-actions">—</div>
-      <div class="stat-sub" id="comp-actions-sub">—</div>
+    <div class="dense-stat">
+      <div class="dense-stat-label">Actions performed</div>
+      <div class="dense-stat-value" id="comp-actions">—</div>
+      <div class="dense-stat-sub" id="comp-actions-sub">—</div>
     </div>
   </div>
 
-  <div class="card">
-    <div class="card-title">
-      By domain
-      <span class="muted">— aggregated view, top advertisers first</span>
+  <!-- Top advertisers -->
+  <div class="dense-panel">
+    <div class="dense-panel-header">
+      <div class="dense-panel-title">By domain</div>
+      <div class="dense-panel-hint">aggregated view, top advertisers first</div>
     </div>
-    <div class="table-wrap">
-      <table class="competitors-table">
+    <div class="dense-table-wrap">
+      <table class="dense-table competitors-table">
         <thead>
           <tr>
-            <th>Domain</th>
-            <th class="num">Mentions</th>
-            <th class="num" title="Post-click actions performed — clicks, visits, etc.">Actions</th>
-            <th>Matched queries</th>
-            <th>First seen</th>
-            <th>Last seen</th>
+            <th class="col-domain">Domain</th>
+            <th class="col-num">Mentions</th>
+            <th class="col-num"
+                title="Post-click actions performed — clicks, visits, etc.">Actions</th>
+            <th class="col-queries">Matched queries</th>
+            <th class="col-when">First seen</th>
+            <th class="col-when">Last seen</th>
           </tr>
         </thead>
-        <tbody id="competitors-tbody"></tbody>
+        <tbody id="competitors-tbody">
+          <tr><td colspan="6" class="dense-empty-cell">Loading…</td></tr>
+        </tbody>
       </table>
     </div>
   </div>
 
-  <div class="card">
-    <div class="card-title">
-      Recent records
-      <span class="muted">— last ads observed, newest first</span>
-      <span class="badge" id="recent-badge">0</span>
+  <!-- Recent records -->
+  <div class="dense-panel">
+    <div class="dense-panel-header">
+      <div class="dense-panel-title">
+        Recent records
+        <span class="dense-panel-badge" id="recent-badge">0</span>
+      </div>
+      <div class="dense-panel-hint">last ads observed, newest first</div>
     </div>
-    <div class="table-wrap">
-      <table class="competitors-table">
+    <div class="dense-table-wrap">
+      <table class="dense-table competitors-table">
         <thead>
           <tr>
-            <th style="width: 110px;">Time</th>
-            <th>Query</th>
-            <th>Domain</th>
-            <th>Google click URL</th>
+            <th class="col-when" style="width: 110px;">Time</th>
+            <th class="col-query">Query</th>
+            <th class="col-domain">Domain</th>
+            <th class="col-url">Google click URL</th>
           </tr>
         </thead>
-        <tbody id="recent-tbody"></tbody>
+        <tbody id="recent-tbody">
+          <tr><td colspan="4" class="dense-empty-cell">Loading…</td></tr>
+        </tbody>
       </table>
     </div>
   </div>

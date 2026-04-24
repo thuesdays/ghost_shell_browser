@@ -182,12 +182,21 @@ CREATE TABLE IF NOT EXISTS meta (
 CREATE TABLE IF NOT EXISTS profiles (
     name         TEXT PRIMARY KEY,
     tags         TEXT,             -- JSON array of strings
-    proxy_url    TEXT,             -- overrides global proxy.url when set
+    proxy_url    TEXT,             -- DEPRECATED: kept for back-compat. New code uses proxy_id.
     proxy_is_rotating    INTEGER,  -- 1 / 0 / NULL = inherit global
     rotation_api_url     TEXT,     -- per-profile rotation endpoint
     rotation_provider    TEXT,
     rotation_api_key     TEXT,
     notes        TEXT,             -- free-form user notes
+    -- FK to scripts.id. NULL means "use the default script" (the one
+    -- flagged scripts.is_default=1). Not a hard FK because we want
+    -- deleting a script to fall through to default gracefully.
+    script_id    INTEGER,
+    -- FK to proxies.id. NULL means "use the default proxy" (proxies
+    -- row with is_default=1). Same graceful-degradation story as
+    -- script_id — deleting a proxy doesn't orphan profiles, they
+    -- just fall through to default at run time.
+    proxy_id     INTEGER,
     created_at   TEXT NOT NULL DEFAULT (datetime('now')),
     updated_at   TEXT NOT NULL DEFAULT (datetime('now'))
 );
@@ -255,6 +264,65 @@ CREATE INDEX IF NOT EXISTS idx_traffic_bucket
     ON traffic_stats(hour_bucket);
 CREATE INDEX IF NOT EXISTS idx_traffic_domain
     ON traffic_stats(domain);
+
+-- ───────────────────────────────────────────────────────────────
+-- scripts — saved flow definitions, each with a human name and
+-- description. Replaces the single `actions.flow` config entry.
+-- ───────────────────────────────────────────────────────────────
+CREATE TABLE IF NOT EXISTS scripts (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    name         TEXT    NOT NULL UNIQUE,
+    description  TEXT    NOT NULL DEFAULT '',
+    flow         TEXT    NOT NULL DEFAULT '[]',    -- JSON-encoded list of steps
+    is_default   INTEGER NOT NULL DEFAULT 0,       -- one script is the fallback
+    created_at   TEXT    NOT NULL DEFAULT (datetime('now')),
+    updated_at   TEXT    NOT NULL DEFAULT (datetime('now'))
+);
+
+-- ───────────────────────────────────────────────────────────────
+-- proxies — library of reusable proxy configurations. Replaces
+-- the single `proxy.url` + `proxy.pool_urls` config entries with
+-- a named, per-profile-assignable entity.
+--
+-- Cached diagnostic fields (last_*) hold the results of the most
+-- recent /api/proxies/<id>/test call so the UI can render an
+-- ACTIVE/ERROR badge + flag/ISP/latency without re-probing on
+-- every page load. They're advisory — runtime proxy routing
+-- doesn't depend on them.
+-- ───────────────────────────────────────────────────────────────
+CREATE TABLE IF NOT EXISTS proxies (
+    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+    name             TEXT,                         -- human label; NULL → host:port
+    url              TEXT    NOT NULL UNIQUE,      -- full proxy URL
+    type             TEXT,                         -- http/https/socks5/socks4
+    host             TEXT,
+    port             INTEGER,
+    login            TEXT,
+    password         TEXT,
+    is_rotating      INTEGER NOT NULL DEFAULT 0,
+    rotation_api_url TEXT,
+    rotation_provider TEXT,                        -- none|asocks|brightdata|generic
+    rotation_api_key TEXT,
+    is_default       INTEGER NOT NULL DEFAULT 0,   -- fallback when profile.proxy_id NULL
+    notes            TEXT,
+    -- Cached diagnostics (from last test)
+    last_exit_ip     TEXT,
+    last_country     TEXT,
+    last_country_code TEXT,
+    last_city        TEXT,
+    last_timezone    TEXT,
+    last_asn         TEXT,
+    last_provider    TEXT,
+    last_ip_type     TEXT,                         -- residential|datacenter|mobile|unknown
+    last_detection_risk TEXT,                      -- low|medium|high|unknown
+    last_latency_ms  INTEGER,
+    last_status      TEXT,                         -- ok|error|untested
+    last_error       TEXT,
+    last_checked_at  TEXT,
+    created_at       TEXT    NOT NULL DEFAULT (datetime('now')),
+    updated_at       TEXT    NOT NULL DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_proxies_updated ON proxies(updated_at);
 """
 
 
@@ -544,6 +612,183 @@ class DB:
         # "ADD COLUMN IF NOT EXISTS", so we check PRAGMA first.
         self._ensure_column(conn, "runs", "pid",          "INTEGER")
         self._ensure_column(conn, "runs", "heartbeat_at", "TEXT")
+        self._ensure_column(conn, "profiles", "script_id", "INTEGER")
+
+        # ── Seed the scripts table ─────────────────────────────
+        # On first init (table empty), migrate any existing unified
+        # flow (`actions.flow` config key) into a "Default" script,
+        # so users keep working behavior across the upgrade. If
+        # there's no prior flow, create an empty Default anyway so
+        # profiles always resolve to something.
+        existing = conn.execute("SELECT COUNT(*) FROM scripts").fetchone()[0]
+        if existing == 0:
+            flow_row = conn.execute(
+                "SELECT value FROM config_kv WHERE key = 'actions.flow'"
+            ).fetchone()
+            legacy_flow = []
+            if flow_row:
+                try:
+                    legacy_flow = json.loads(flow_row["value"])
+                    if not isinstance(legacy_flow, list):
+                        legacy_flow = []
+                except Exception:
+                    legacy_flow = []
+            desc = ("Migrated from legacy `actions.flow` during the "
+                    "scripts-library upgrade."
+                    if legacy_flow else
+                    "Default empty flow — edit and save, or create new "
+                    "scripts via the Scripts page.")
+            conn.execute(
+                "INSERT INTO scripts (name, description, flow, is_default) "
+                "VALUES (?, ?, ?, 1)",
+                ("Default", desc,
+                 json.dumps(legacy_flow, ensure_ascii=False)),
+            )
+            logging.info(
+                f"[DB] Seeded scripts table — Default script with "
+                f"{len(legacy_flow)} top-level step(s)"
+            )
+
+        # ── Back-fill profile.script_id → Default ──────────────
+        # Any profile that existed before this upgrade should point
+        # at the default script so its runs still use the same flow
+        # they did before.
+        default_row = conn.execute(
+            "SELECT id FROM scripts WHERE is_default = 1 LIMIT 1"
+        ).fetchone()
+        if default_row:
+            default_id = default_row["id"]
+            conn.execute(
+                "UPDATE profiles SET script_id = ? WHERE script_id IS NULL",
+                (default_id,),
+            )
+
+        # ── Migrate legacy proxy config → proxies table ────────
+        # Seed the proxies table on first init. We pull in:
+        #   1. `proxy.url`       → one default proxy (marked is_default=1)
+        #   2. `proxy.pool_urls` → one proxy each (not default)
+        #   3. profiles.proxy_url → one proxy per unique URL, attached
+        #      back to that profile via proxy_id
+        # Idempotent — subsequent boots skip if proxies already has rows.
+        self._ensure_column(conn, "profiles", "proxy_id", "INTEGER")
+        existing_proxies = conn.execute(
+            "SELECT COUNT(*) FROM proxies"
+        ).fetchone()[0]
+        if existing_proxies == 0:
+            from urllib.parse import urlparse
+
+            def _migrate_url_to_proxy_row(url: str, is_default: bool = False,
+                                          name: str = None,
+                                          rotation_api_url: str = None,
+                                          rotation_provider: str = None,
+                                          rotation_api_key: str = None,
+                                          is_rotating: bool = False):
+                """Insert (or get) a proxy row for this URL. Returns id."""
+                if not url:
+                    return None
+                url = url.strip()
+                # Normalize — bare host:port gets http:// prefix so URL
+                # uniqueness works consistently.
+                if not url.startswith(("http://", "https://",
+                                        "socks5://", "socks4://")):
+                    url = f"http://{url}"
+                # Dedup by URL
+                existing = conn.execute(
+                    "SELECT id FROM proxies WHERE url = ?", (url,)
+                ).fetchone()
+                if existing:
+                    return existing["id"]
+                try:
+                    p = urlparse(url)
+                    ptype = p.scheme or "http"
+                    host = p.hostname
+                    port = p.port
+                    login = p.username
+                    password = p.password
+                except Exception:
+                    ptype, host, port, login, password = "http", None, None, None, None
+                display_name = name or (f"{host}:{port}" if host else url)
+                cur = conn.execute("""
+                    INSERT INTO proxies
+                      (name, url, type, host, port, login, password,
+                       is_rotating, rotation_api_url, rotation_provider,
+                       rotation_api_key, is_default, last_status)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'untested')
+                """, (display_name, url, ptype, host, port, login, password,
+                      1 if is_rotating else 0,
+                      rotation_api_url, rotation_provider, rotation_api_key,
+                      1 if is_default else 0))
+                return cur.lastrowid
+
+            # 1) Global proxy.url → default proxy
+            def _cfg_val(key):
+                row = conn.execute(
+                    "SELECT value FROM config_kv WHERE key = ?", (key,)
+                ).fetchone()
+                if not row:
+                    return None
+                try:
+                    return json.loads(row["value"])
+                except Exception:
+                    return row["value"]
+
+            global_url = _cfg_val("proxy.url")
+            rot_api    = _cfg_val("proxy.rotation_api_url")
+            rot_prov   = _cfg_val("proxy.rotation_provider")
+            rot_key    = _cfg_val("proxy.rotation_api_key")
+            is_rot     = bool(rot_api)   # heuristic: if rotation endpoint set, assume rotating
+
+            default_proxy_id = None
+            if global_url:
+                default_proxy_id = _migrate_url_to_proxy_row(
+                    global_url, is_default=True, name="Default",
+                    rotation_api_url=rot_api, rotation_provider=rot_prov,
+                    rotation_api_key=rot_key, is_rotating=is_rot,
+                )
+
+            # 2) pool URLs → non-default proxies
+            pool = _cfg_val("proxy.pool_urls") or []
+            if isinstance(pool, list):
+                for i, u in enumerate(pool):
+                    _migrate_url_to_proxy_row(u, name=f"Pool {i+1}")
+
+            # 3) Per-profile proxy_url overrides → dedicated rows
+            for pr_row in conn.execute(
+                "SELECT name, proxy_url, proxy_is_rotating, rotation_api_url, "
+                "rotation_provider, rotation_api_key "
+                "FROM profiles WHERE proxy_url IS NOT NULL "
+                "AND proxy_url != ''"
+            ).fetchall():
+                pid = _migrate_url_to_proxy_row(
+                    pr_row["proxy_url"],
+                    name=f"{pr_row['name']} (custom)",
+                    rotation_api_url=pr_row["rotation_api_url"],
+                    rotation_provider=pr_row["rotation_provider"],
+                    rotation_api_key=pr_row["rotation_api_key"],
+                    is_rotating=bool(pr_row["proxy_is_rotating"]),
+                )
+                if pid:
+                    conn.execute(
+                        "UPDATE profiles SET proxy_id = ? WHERE name = ?",
+                        (pid, pr_row["name"]),
+                    )
+
+            logging.info(
+                f"[DB] Seeded proxies table from legacy config "
+                f"(default_id={default_proxy_id})"
+            )
+
+        # Back-fill profile.proxy_id → default proxy for profiles
+        # that still have NULL (no per-profile override)
+        default_proxy_row = conn.execute(
+            "SELECT id FROM proxies WHERE is_default = 1 LIMIT 1"
+        ).fetchone()
+        if default_proxy_row:
+            conn.execute(
+                "UPDATE profiles SET proxy_id = ? WHERE proxy_id IS NULL",
+                (default_proxy_row["id"],),
+            )
+
         # Check how full config is. On first init (empty), bulk-insert all
         # defaults. On subsequent starts after an upgrade, only insert keys
         # that are missing — so user customisations stay and new features
@@ -647,6 +892,424 @@ class DB:
                     INSERT INTO config_kv (key, value, updated_at) VALUES (?, ?, ?)
                     ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at
                 """, (key, json.dumps(value, ensure_ascii=False), now))
+
+    # ──────────────────────────────────────────────────────────
+    # SCRIPTS — saved flow library + per-profile assignment
+    # ──────────────────────────────────────────────────────────
+    # A "script" is a named, saved unified flow. Profiles reference
+    # scripts via profiles.script_id. Exactly one script is flagged
+    # is_default=1 and acts as the fallback for profiles that have
+    # no assignment yet (or whose script_id no longer exists).
+
+    def scripts_list(self) -> list[dict]:
+        """All scripts with summary metadata + usage count."""
+        conn = self._get_conn()
+        rows = conn.execute("""
+            SELECT s.id, s.name, s.description, s.is_default,
+                   s.created_at, s.updated_at,
+                   (SELECT COUNT(*) FROM profiles p WHERE p.script_id = s.id)
+                       AS profile_count
+              FROM scripts s
+             ORDER BY s.is_default DESC, s.updated_at DESC
+        """).fetchall()
+        # Don't return the full flow JSON here — the list view only
+        # needs summary counts. `script_get` returns the full flow.
+        result = []
+        for r in rows:
+            d = dict(r)
+            # Compute step count by parsing flow JSON on demand
+            flow_row = conn.execute(
+                "SELECT flow FROM scripts WHERE id = ?", (r["id"],)
+            ).fetchone()
+            try:
+                flow = json.loads(flow_row["flow"] or "[]")
+                d["step_count"] = len(flow) if isinstance(flow, list) else 0
+            except Exception:
+                d["step_count"] = 0
+            result.append(d)
+        return result
+
+    def script_get(self, script_id: int) -> dict | None:
+        """Fetch one script including its full flow JSON."""
+        row = self._get_conn().execute(
+            "SELECT * FROM scripts WHERE id = ?", (script_id,)
+        ).fetchone()
+        if not row:
+            return None
+        d = dict(row)
+        try:
+            d["flow"] = json.loads(d["flow"] or "[]")
+        except Exception:
+            d["flow"] = []
+        return d
+
+    def script_get_by_name(self, name: str) -> dict | None:
+        row = self._get_conn().execute(
+            "SELECT id FROM scripts WHERE name = ?", (name,)
+        ).fetchone()
+        return self.script_get(row["id"]) if row else None
+
+    def script_get_default(self) -> dict | None:
+        """Return the default (fallback) script, creating an empty
+        one if somehow none is flagged default — this keeps runtime
+        resolution always returning something."""
+        row = self._get_conn().execute(
+            "SELECT id FROM scripts WHERE is_default = 1 LIMIT 1"
+        ).fetchone()
+        if row:
+            return self.script_get(row["id"])
+        # Nothing flagged default — promote the oldest script, or
+        # create a new empty Default if scripts table is empty.
+        any_row = self._get_conn().execute(
+            "SELECT id FROM scripts ORDER BY id LIMIT 1"
+        ).fetchone()
+        if any_row:
+            self._get_conn().execute(
+                "UPDATE scripts SET is_default = 1 WHERE id = ?",
+                (any_row["id"],),
+            )
+            return self.script_get(any_row["id"])
+        # Totally empty — seed one
+        new_id = self.script_create("Default",
+            "Default empty flow — auto-created.", [], is_default=True)
+        return self.script_get(new_id)
+
+    def script_create(self, name: str, description: str = "",
+                      flow: list = None, is_default: bool = False) -> int:
+        """Insert a new script. Raises if name already exists (UNIQUE)."""
+        flow_json = json.dumps(flow or [], ensure_ascii=False)
+        conn = self._get_conn()
+        with conn:
+            if is_default:
+                # Only one script may be default at a time
+                conn.execute("UPDATE scripts SET is_default = 0")
+            cur = conn.execute("""
+                INSERT INTO scripts (name, description, flow, is_default)
+                VALUES (?, ?, ?, ?)
+            """, (name, description or "", flow_json,
+                  1 if is_default else 0))
+            return cur.lastrowid
+
+    def script_update(self, script_id: int, *, name: str = None,
+                      description: str = None, flow: list = None,
+                      is_default: bool | None = None) -> bool:
+        """Partial update. Returns True if a row was affected."""
+        conn = self._get_conn()
+        updates = []
+        params = []
+        if name is not None:
+            updates.append("name = ?"); params.append(name)
+        if description is not None:
+            updates.append("description = ?"); params.append(description)
+        if flow is not None:
+            updates.append("flow = ?")
+            params.append(json.dumps(flow, ensure_ascii=False))
+        if is_default is True:
+            # Mark this one as default, unmark all others
+            with conn:
+                conn.execute("UPDATE scripts SET is_default = 0")
+            updates.append("is_default = 1")
+        elif is_default is False:
+            updates.append("is_default = 0")
+        if not updates:
+            return False
+        updates.append("updated_at = datetime('now')")
+        params.append(script_id)
+        with conn:
+            cur = conn.execute(
+                f"UPDATE scripts SET {', '.join(updates)} WHERE id = ?",
+                params,
+            )
+            return cur.rowcount > 0
+
+    def script_delete(self, script_id: int) -> bool:
+        """Delete a script. Profiles referencing it fall back to default.
+        Default script cannot be deleted — caller must promote another
+        first.
+        """
+        conn = self._get_conn()
+        row = conn.execute(
+            "SELECT is_default FROM scripts WHERE id = ?", (script_id,)
+        ).fetchone()
+        if not row:
+            return False
+        if row["is_default"]:
+            raise ValueError(
+                "Cannot delete the default script — set another as "
+                "default first."
+            )
+        with conn:
+            # Profiles using this script get their assignment cleared,
+            # falling back to default at runtime resolution.
+            conn.execute(
+                "UPDATE profiles SET script_id = NULL WHERE script_id = ?",
+                (script_id,),
+            )
+            conn.execute("DELETE FROM scripts WHERE id = ?", (script_id,))
+        return True
+
+    def script_assign_to_profile(self, profile_name: str,
+                                 script_id: int | None) -> bool:
+        """Assign a script to a profile (None = clear, use default)."""
+        conn = self._get_conn()
+        with conn:
+            cur = conn.execute(
+                "UPDATE profiles SET script_id = ?, "
+                "updated_at = datetime('now') WHERE name = ?",
+                (script_id, profile_name),
+            )
+            if cur.rowcount == 0:
+                # Profile doesn't have a row yet — insert minimal
+                conn.execute(
+                    "INSERT INTO profiles (name, script_id) VALUES (?, ?)",
+                    (profile_name, script_id),
+                )
+        return True
+
+    def script_profiles(self, script_id: int) -> list[str]:
+        """Profile names that have this script assigned."""
+        rows = self._get_conn().execute(
+            "SELECT name FROM profiles WHERE script_id = ? ORDER BY name",
+            (script_id,),
+        ).fetchall()
+        return [r["name"] for r in rows]
+
+    def script_resolve_for_profile(self, profile_name: str) -> dict | None:
+        """Runtime: which script should this profile use?
+        - If profile has script_id and it exists → that script
+        - Otherwise → default script (always exists)
+        Returns full script dict (with flow parsed)."""
+        row = self._get_conn().execute(
+            "SELECT script_id FROM profiles WHERE name = ?",
+            (profile_name,),
+        ).fetchone()
+        script_id = row["script_id"] if row else None
+        if script_id:
+            sc = self.script_get(script_id)
+            if sc:
+                return sc
+        # Fall back to default
+        return self.script_get_default()
+
+    # ──────────────────────────────────────────────────────────
+    # PROXIES — saved proxy library + per-profile assignment
+    # ──────────────────────────────────────────────────────────
+    # Mirrors the scripts API shape so the UI can treat both as
+    # assignable resources. One proxy may be flagged is_default=1
+    # — that's the fallback for profiles.proxy_id IS NULL.
+
+    def proxies_list(self) -> list[dict]:
+        """All proxies with summary + profile count."""
+        rows = self._get_conn().execute("""
+            SELECT p.*,
+                   (SELECT COUNT(*) FROM profiles pr WHERE pr.proxy_id = p.id)
+                       AS profile_count
+              FROM proxies p
+             ORDER BY p.is_default DESC, p.updated_at DESC
+        """).fetchall()
+        return [dict(r) for r in rows]
+
+    def proxy_get(self, proxy_id: int) -> dict | None:
+        row = self._get_conn().execute(
+            "SELECT * FROM proxies WHERE id = ?", (proxy_id,)
+        ).fetchone()
+        return dict(row) if row else None
+
+    def proxy_get_by_url(self, url: str) -> dict | None:
+        row = self._get_conn().execute(
+            "SELECT * FROM proxies WHERE url = ?", (url,)
+        ).fetchone()
+        return dict(row) if row else None
+
+    def proxy_get_default(self) -> dict | None:
+        row = self._get_conn().execute(
+            "SELECT * FROM proxies WHERE is_default = 1 LIMIT 1"
+        ).fetchone()
+        if row:
+            return dict(row)
+        # Promote oldest if none flagged default
+        any_row = self._get_conn().execute(
+            "SELECT * FROM proxies ORDER BY id LIMIT 1"
+        ).fetchone()
+        if any_row:
+            self._get_conn().execute(
+                "UPDATE proxies SET is_default = 1 WHERE id = ?",
+                (any_row["id"],),
+            )
+            return dict(any_row)
+        return None
+
+    def proxy_create(self, *, url: str, name: str = None, type: str = None,
+                     host: str = None, port: int = None,
+                     login: str = None, password: str = None,
+                     is_rotating: bool = False,
+                     rotation_api_url: str = None,
+                     rotation_provider: str = None,
+                     rotation_api_key: str = None,
+                     is_default: bool = False,
+                     notes: str = None) -> int:
+        """Insert a new proxy. Parses URL into host/port/login/password
+        if those aren't provided."""
+        if not url:
+            raise ValueError("url is required")
+        url = url.strip()
+        if not url.startswith(("http://", "https://",
+                                "socks5://", "socks4://")):
+            url = f"http://{url}"
+
+        # Auto-parse URL parts if caller didn't supply them
+        if not (host and port):
+            from urllib.parse import urlparse
+            try:
+                p = urlparse(url)
+                type = type or p.scheme or "http"
+                host = host or p.hostname
+                port = port or p.port
+                login = login or p.username
+                password = password or p.password
+            except Exception:
+                pass
+
+        display_name = name or (f"{host}:{port}" if host else url)
+
+        conn = self._get_conn()
+        with conn:
+            if is_default:
+                conn.execute("UPDATE proxies SET is_default = 0")
+            cur = conn.execute("""
+                INSERT INTO proxies
+                  (name, url, type, host, port, login, password,
+                   is_rotating, rotation_api_url, rotation_provider,
+                   rotation_api_key, is_default, notes, last_status)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'untested')
+            """, (display_name, url, type, host, port, login, password,
+                  1 if is_rotating else 0,
+                  rotation_api_url, rotation_provider, rotation_api_key,
+                  1 if is_default else 0, notes))
+            return cur.lastrowid
+
+    def proxy_update(self, proxy_id: int, **fields) -> bool:
+        """Partial update. Allowed fields: name, url, type, host, port,
+        login, password, is_rotating, rotation_api_url, rotation_provider,
+        rotation_api_key, is_default, notes."""
+        if not fields:
+            return False
+        allowed = {"name", "url", "type", "host", "port", "login", "password",
+                   "is_rotating", "rotation_api_url", "rotation_provider",
+                   "rotation_api_key", "is_default", "notes"}
+        updates = []
+        params = []
+        conn = self._get_conn()
+        if fields.get("is_default") is True:
+            with conn:
+                conn.execute("UPDATE proxies SET is_default = 0")
+        for k, v in fields.items():
+            if k not in allowed:
+                continue
+            if k == "is_rotating":
+                v = 1 if v else 0
+            if k == "is_default":
+                v = 1 if v else 0
+            updates.append(f"{k} = ?")
+            params.append(v)
+        if not updates:
+            return False
+        updates.append("updated_at = datetime('now')")
+        params.append(proxy_id)
+        with conn:
+            cur = conn.execute(
+                f"UPDATE proxies SET {', '.join(updates)} WHERE id = ?",
+                params,
+            )
+            return cur.rowcount > 0
+
+    def proxy_delete(self, proxy_id: int) -> bool:
+        conn = self._get_conn()
+        row = conn.execute(
+            "SELECT is_default FROM proxies WHERE id = ?", (proxy_id,)
+        ).fetchone()
+        if not row:
+            return False
+        if row["is_default"]:
+            raise ValueError(
+                "Cannot delete the default proxy — set another as "
+                "default first."
+            )
+        with conn:
+            # Profiles referencing this proxy fall back to default
+            conn.execute(
+                "UPDATE profiles SET proxy_id = NULL WHERE proxy_id = ?",
+                (proxy_id,),
+            )
+            conn.execute("DELETE FROM proxies WHERE id = ?", (proxy_id,))
+        return True
+
+    def proxy_record_diagnostics(self, proxy_id: int, diag: dict) -> None:
+        """Write the result of a test_proxy() call into the cached
+        diagnostic columns. Used by /api/proxies/<id>/test."""
+        from datetime import datetime as _dt
+        now = _dt.now().isoformat(timespec="seconds")
+        self._get_conn().execute("""
+            UPDATE proxies SET
+                last_exit_ip = ?,
+                last_country = ?, last_country_code = ?,
+                last_city = ?, last_timezone = ?,
+                last_asn = ?, last_provider = ?,
+                last_ip_type = ?, last_detection_risk = ?,
+                last_latency_ms = ?, last_status = ?,
+                last_error = ?, last_checked_at = ?,
+                updated_at = ?
+            WHERE id = ?
+        """, (
+            diag.get("ip"),
+            diag.get("country"), diag.get("country_code"),
+            diag.get("city"), diag.get("timezone"),
+            diag.get("asn"), diag.get("provider"),
+            diag.get("ip_type"), diag.get("detection_risk"),
+            diag.get("latency_ms"),
+            "ok" if diag.get("ok") else "error",
+            diag.get("error"),
+            now, now, proxy_id,
+        ))
+        self._get_conn().commit()
+
+    def proxy_assign_to_profile(self, profile_name: str,
+                                proxy_id: int | None) -> bool:
+        conn = self._get_conn()
+        with conn:
+            cur = conn.execute(
+                "UPDATE profiles SET proxy_id = ?, "
+                "updated_at = datetime('now') WHERE name = ?",
+                (proxy_id, profile_name),
+            )
+            if cur.rowcount == 0:
+                conn.execute(
+                    "INSERT INTO profiles (name, proxy_id) VALUES (?, ?)",
+                    (profile_name, proxy_id),
+                )
+        return True
+
+    def proxy_profiles(self, proxy_id: int) -> list[str]:
+        rows = self._get_conn().execute(
+            "SELECT name FROM profiles WHERE proxy_id = ? ORDER BY name",
+            (proxy_id,),
+        ).fetchall()
+        return [r["name"] for r in rows]
+
+    def proxy_resolve_for_profile(self, profile_name: str) -> dict | None:
+        """Runtime: which proxy does this profile use?
+        Priority: profile.proxy_id → default proxy → None."""
+        row = self._get_conn().execute(
+            "SELECT proxy_id FROM profiles WHERE name = ?",
+            (profile_name,),
+        ).fetchone()
+        proxy_id = row["proxy_id"] if row else None
+        if proxy_id:
+            p = self.proxy_get(proxy_id)
+            if p:
+                return p
+        return self.proxy_get_default()
+
 
     # ──────────────────────────────────────────────────────────
     # RUNS
@@ -952,8 +1615,11 @@ class DB:
 
     def traffic_summary(self, hours: int = 24) -> dict:
         """Total bytes + requests across all profiles in the last N hours.
-        Returns {total_bytes, total_requests, profile_count, domain_count,
-                 by_hour: [{hour, bytes, requests}, ...]}"""
+        Returns {total_bytes, total_requests, profile_count, domain_count}.
+        Timeseries is a separate method — call traffic_timeseries for
+        per-bucket data. This used to also return `by_hour` but nothing
+        in the frontend read it (wasted DB work).
+        """
         cutoff = (datetime.now() - timedelta(hours=hours)).strftime("%Y-%m-%d %H")
         conn = self._get_conn()
         totals = conn.execute("""
@@ -966,23 +1632,11 @@ class DB:
             WHERE hour_bucket >= ?
         """, (cutoff,)).fetchone()
 
-        by_hour = conn.execute("""
-            SELECT
-                hour_bucket                    AS hour,
-                COALESCE(SUM(bytes), 0)        AS bytes,
-                COALESCE(SUM(req_count), 0)    AS requests
-            FROM traffic_stats
-            WHERE hour_bucket >= ?
-            GROUP BY hour_bucket
-            ORDER BY hour_bucket ASC
-        """, (cutoff,)).fetchall()
-
         return {
             "total_bytes":    totals["total_bytes"] or 0,
             "total_requests": totals["total_requests"] or 0,
             "profile_count":  totals["profile_count"] or 0,
             "domain_count":   totals["domain_count"] or 0,
-            "by_hour":        [dict(r) for r in by_hour],
         }
 
     def traffic_by_profile(self, hours: int = 24) -> list:

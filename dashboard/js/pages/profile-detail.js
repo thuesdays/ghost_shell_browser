@@ -18,11 +18,23 @@ const ProfileDetail = {
       this.loadFingerprint(this.currentProfile);
       this.loadProfileMeta(this.currentProfile);
       this.loadCookies(this.currentProfile);
+      this.loadActiveScript(this.currentProfile);
+      this.loadActiveProxy(this.currentProfile);
     });
 
     $("#reset-health-btn").addEventListener("click", () => this.resetHealth());
     $("#clear-history-btn").addEventListener("click", () => this.clearHistory());
     $("#delete-profile-btn").addEventListener("click", () => this.deleteProfile());
+
+    // Active-script selector — load the scripts list + current assignment
+    document.getElementById("profile-script-save-btn")
+      ?.addEventListener("click", () => this.saveActiveScript());
+
+    // Active-proxy selector — mirror of scripts assignment
+    document.getElementById("profile-proxy-save-btn")
+      ?.addEventListener("click", () => this.saveActiveProxy());
+    document.getElementById("profile-proxy-test-btn")
+      ?.addEventListener("click", () => this.testActiveProxy());
 
     // Per-profile overrides wiring (tags, proxy, rotation, notes)
     document.getElementById("pp-save-btn")
@@ -78,6 +90,8 @@ const ProfileDetail = {
         this.loadFingerprint(this.currentProfile),
         this.loadProfileMeta(this.currentProfile),
         this.loadCookies(this.currentProfile),
+        this.loadActiveScript(this.currentProfile),
+        this.loadActiveProxy(this.currentProfile),
       ]);
     }
   },
@@ -676,6 +690,274 @@ const ProfileDetail = {
       await this.loadCookies(this.currentProfile);
     } catch (e) {
       toast("Import error: " + e.message, true);
+    }
+  },
+
+  // ── ACTIVE SCRIPT (per-profile script assignment) ───────────
+  //
+  // Loads the full scripts library to populate the dropdown, plus
+  // the currently-assigned script for this profile (resolved via
+  // /api/profiles/<name>/script which falls back to default).
+  //
+  // Save action calls /api/profiles/<name>/script with the selected
+  // script_id. An empty value means "unassign" → server stores NULL
+  // → runtime falls back to the default script.
+
+  async loadActiveScript(name) {
+    if (!name) return;
+    const select = document.getElementById("profile-script-select");
+    if (!select) return;
+    try {
+      // Load all scripts + current assignment in parallel
+      const [listResp, activeResp] = await Promise.all([
+        api("/api/scripts"),
+        api(`/api/profiles/${encodeURIComponent(name)}/script`),
+      ]);
+      const scripts = listResp.scripts || [];
+      const active  = activeResp.script;
+
+      if (!scripts.length) {
+        select.innerHTML = `<option value="">— no scripts —</option>`;
+        select.disabled = true;
+        return;
+      }
+      select.disabled = false;
+
+      // "" means unassigned → default. Label shows which is default
+      // so users see the implicit choice.
+      const defaultScript = scripts.find(s => s.is_default);
+      const defaultLabel = defaultScript
+        ? `— use default (${defaultScript.name}) —`
+        : "— use default —";
+
+      const options = [
+        `<option value="">${escapeHtml(defaultLabel)}</option>`,
+        ...scripts.map(s => {
+          const marker = s.is_default ? " ★" : "";
+          return `<option value="${s.id}">${escapeHtml(s.name)}${marker}</option>`;
+        }),
+      ];
+      select.innerHTML = options.join("");
+
+      // Figure out what "active" really means. The API always returns
+      // the resolved script (falling back to default), so to know
+      // whether the profile has an explicit assignment we'd need a
+      // separate flag. Simplest: mark the resolved one as selected.
+      // If the user actually had no assignment, they'll see the
+      // default entry pre-selected — which matches reality.
+      if (active?.id) {
+        select.value = String(active.id);
+      } else {
+        select.value = "";
+      }
+
+      // Hint updates on change
+      const updateHint = () => {
+        const hint = document.getElementById("profile-script-hint");
+        const sel = select.value;
+        if (!sel) {
+          hint.textContent = "Will fall back to whichever script is marked default.";
+        } else {
+          const chosen = scripts.find(s => String(s.id) === sel);
+          hint.textContent = chosen?.description
+            || "Assigned script — open Scripts page to edit.";
+        }
+      };
+      select.onchange = updateHint;
+      updateHint();
+    } catch (e) {
+      console.error("loadActiveScript:", e);
+      select.innerHTML = `<option value="">— error loading —</option>`;
+    }
+  },
+
+  async saveActiveScript() {
+    if (!this.currentProfile) {
+      toast("Select a profile first", true);
+      return;
+    }
+    const select = document.getElementById("profile-script-select");
+    if (!select) return;
+    const raw = select.value;
+    const scriptId = raw === "" ? null : Number(raw);
+    const btn = document.getElementById("profile-script-save-btn");
+    btn.disabled = true;
+    try {
+      await api(
+        `/api/profiles/${encodeURIComponent(this.currentProfile)}/script`,
+        {
+          method: "POST",
+          body: JSON.stringify({ script_id: scriptId }),
+        }
+      );
+      toast("✓ Script assigned");
+    } catch (e) {
+      toast("Save failed: " + e.message, true);
+    } finally {
+      btn.disabled = false;
+    }
+  },
+
+  // ── ACTIVE PROXY (per-profile proxy assignment) ─────────────
+  //
+  // Same pattern as scripts: load library + current assignment in
+  // parallel, render dropdown + live status of the resolved proxy.
+
+  async loadActiveProxy(name) {
+    if (!name) return;
+    const select = document.getElementById("profile-proxy-select");
+    if (!select) return;
+    try {
+      const [listResp, activeResp] = await Promise.all([
+        api("/api/proxies"),
+        api(`/api/profiles/${encodeURIComponent(name)}/proxy`),
+      ]);
+      const proxies = listResp.proxies || [];
+      const active  = activeResp.proxy;
+
+      if (!proxies.length) {
+        select.innerHTML = `<option value="">— no proxies — create one first</option>`;
+        select.disabled = true;
+        this._renderProxyStatus(null);
+        return;
+      }
+      select.disabled = false;
+
+      const defaultProxy = proxies.find(p => p.is_default);
+      const defaultLabel = defaultProxy
+        ? `— use default (${defaultProxy.name}) —`
+        : "— use default —";
+
+      const options = [
+        `<option value="">${escapeHtml(defaultLabel)}</option>`,
+        ...proxies.map(p => {
+          const marker = p.is_default ? " ★" : "";
+          // Include host:port in label for disambiguation when names
+          // collide or are missing
+          const label = `${p.name}${marker}`;
+          return `<option value="${p.id}">${escapeHtml(label)}</option>`;
+        }),
+      ];
+      select.innerHTML = options.join("");
+      select.value = active?.id ? String(active.id) : "";
+
+      // Live status of the currently-resolved proxy
+      this._renderProxyStatus(active);
+
+      // Description hint on change
+      const updateHint = () => {
+        const hint = document.getElementById("profile-proxy-hint");
+        const sel = select.value;
+        if (!sel) {
+          hint.textContent = "Will fall back to whichever proxy is marked default.";
+        } else {
+          const chosen = proxies.find(p => String(p.id) === sel);
+          if (chosen) {
+            const parts = [
+              chosen.host && chosen.port ? `${chosen.host}:${chosen.port}` : "",
+              chosen.last_country || "",
+              chosen.is_rotating ? "rotating" : "",
+            ].filter(Boolean);
+            hint.textContent = parts.join(" · ") || "—";
+          }
+        }
+      };
+      select.onchange = updateHint;
+      updateHint();
+    } catch (e) {
+      console.error("loadActiveProxy:", e);
+      select.innerHTML = `<option value="">— error loading —</option>`;
+    }
+  },
+
+  _renderProxyStatus(proxy) {
+    const row = document.getElementById("profile-proxy-status");
+    if (!row) return;
+    if (!proxy) {
+      row.style.display = "none";
+      return;
+    }
+    row.style.display = "";
+    const badge = document.getElementById("profile-proxy-status-badge");
+    const meta  = document.getElementById("profile-proxy-status-meta");
+    const status = proxy.last_status || "untested";
+    badge.className = `status-badge status-${status}`;
+    badge.textContent = status === "ok" ? "ACTIVE"
+                       : status === "error" ? "ERROR" : "UNTESTED";
+    const parts = [];
+    if (proxy.host && proxy.port) parts.push(`${proxy.host}:${proxy.port}`);
+    if (proxy.last_country) parts.push(proxy.last_country);
+    if (proxy.is_rotating) parts.push("↻ rotating");
+    meta.textContent = parts.join(" · ");
+  },
+
+  async saveActiveProxy() {
+    if (!this.currentProfile) {
+      toast("Select a profile first", true);
+      return;
+    }
+    const select = document.getElementById("profile-proxy-select");
+    if (!select) return;
+    const raw = select.value;
+    const proxyId = raw === "" ? null : Number(raw);
+    const btn = document.getElementById("profile-proxy-save-btn");
+    btn.disabled = true;
+    try {
+      await api(
+        `/api/profiles/${encodeURIComponent(this.currentProfile)}/proxy`,
+        {
+          method: "POST",
+          body: JSON.stringify({ proxy_id: proxyId }),
+        }
+      );
+      toast("✓ Proxy assigned");
+      // Reload to refresh status display
+      await this.loadActiveProxy(this.currentProfile);
+    } catch (e) {
+      toast("Save failed: " + e.message, true);
+    } finally {
+      btn.disabled = false;
+    }
+  },
+
+  async testActiveProxy() {
+    const select = document.getElementById("profile-proxy-select");
+    if (!select) return;
+    // Use the currently-selected one, OR the default if "" is selected
+    let proxyId = select.value ? Number(select.value) : null;
+    if (!proxyId) {
+      // Fetch default
+      try {
+        const listResp = await api("/api/proxies");
+        const def = (listResp.proxies || []).find(p => p.is_default);
+        if (!def) {
+          toast("No default proxy configured", true);
+          return;
+        }
+        proxyId = def.id;
+      } catch {
+        toast("Could not resolve default", true);
+        return;
+      }
+    }
+    const btn = document.getElementById("profile-proxy-test-btn");
+    btn.disabled = true;
+    const original = btn.textContent;
+    btn.textContent = "⏳ Testing…";
+    try {
+      const resp = await api(`/api/proxies/${proxyId}/test`, { method: "POST" });
+      const diag = resp.diag || {};
+      if (diag.ok) {
+        toast(`✓ ${diag.country || "OK"} · ${diag.latency_ms}ms`);
+      } else {
+        toast(`✗ ${diag.error || "failed"}`, true);
+      }
+      await this.loadActiveProxy(this.currentProfile);
+    } catch (e) {
+      toast(`Test failed: ${e.message}`, true);
+    } finally {
+      btn.disabled = false;
+      btn.textContent = original;
     }
   },
 };

@@ -1,660 +1,621 @@
 // ═══════════════════════════════════════════════════════════════
-// pages/proxy.js — pool config, IP statistics table, live diagnostics
+// pages/proxy.js — proxy library (dense-table IDE aesthetic)
+//
+// Main view is a table of proxies with inline Test buttons. Each row
+// shows cached diagnostics (flag, city, IP type, latency) so the user
+// sees status at a glance. Add/Edit/Delete via modals, bulk-import
+// accepts a paste of many URLs.
+//
+// Global options (auto-rotate, geo lock, self-check cadence) live in
+// a collapsible section at the bottom — they apply to every run
+// regardless of which proxy is assigned.
 // ═══════════════════════════════════════════════════════════════
 
 const ProxyPage = {
+  proxies: [],
+  filtered: [],
+  editingId: null,     // null = Add; number = Edit
+  _search: "",
+
   async init() {
+    await this.loadProxies();
+    this.wireHeader();
+    this.wireSearch();
+    this.wireEditModal();
+    this.wireBulkModal();
+
+    // Config bindings for global options — reuse the generic helper
     if (!configCache) await loadConfig();
     bindConfigInputs($("#content"));
-
-    // Expected values for diagnostics header
-    const expCountry = getByPath(configCache, "browser.expected_country") || "Ukraine";
-    const expTz      = getByPath(configCache, "browser.expected_timezone") || "Europe/Kyiv";
-    $("#expected-country").textContent = expCountry;
-    $("#expected-tz").textContent      = expTz;
-
-    // Wire up buttons
-    $("#btn-refresh-ip").addEventListener("click",  () => this.refreshCurrentIp());
-    $("#btn-rotate-ip").addEventListener("click",   () => this.rotateIp());
-    $("#btn-rotation-test").addEventListener("click", () => this.runRotationTest());
-    const testApiBtn = document.getElementById("btn-test-rotation-api");
-    if (testApiBtn) {
-      testApiBtn.addEventListener("click", () => this.testRotationApi());
-    }
-
-    // Rotation-API config status: re-check whenever the user edits the
-    // provider dropdown, the URL field, or the force-enable override so
-    // the chip/banner/conflict-warning update live without a reload.
-    document.querySelectorAll(
-      '[data-config="proxy.rotation_provider"], ' +
-      '[data-config="proxy.rotation_api_url"], ' +
-      '[data-config="proxy.is_rotating"]'
-    ).forEach(el => {
-      el.addEventListener("input",  () => this.refreshRotationStatus());
-      el.addEventListener("change", () => this.refreshRotationStatus());
-    });
-    this.refreshRotationStatus();
-
-    // ── Master switch → show/hide rotation body ────────────────
-    // The checkbox "Force enable rotation" reveals the whole API-config
-    // block below it when on. Implemented via a generic data-show-when
-    // attribute pointing at a checkbox id — could be re-used later for
-    // other collapsible sections if we want.
-    this._wireShowWhenToggles();
-
-    // asocks builder — two separate fields that auto-assemble into the
-    // real rotation_api_url. Matches the GET /v2/proxy/refresh/{portId}?apiKey={key}
-    // endpoint shape per https://api.asocks.com/api/docs/
-    const portInput = document.getElementById("asocks-port-id");
-    const keyInput  = document.getElementById("asocks-api-key");
-    if (portInput && keyInput) {
-      // Hydrate from cache
-      portInput.value = getByPath(configCache, "proxy.asocks_port_id") || "";
-      keyInput.value  = getByPath(configCache, "proxy.asocks_api_key") || "";
-
-      const rebuild = () => this.rebuildAsocksUrl();
-      portInput.addEventListener("input", rebuild);
-      keyInput.addEventListener("input",  rebuild);
-      rebuild();    // initial assembly
-    }
-
-    // Show / hide the right builder block depending on provider choice
-    const providerSelect = document.getElementById("rotation-provider-select");
-    if (providerSelect) {
-      providerSelect.addEventListener("change",
-        () => this.toggleRotationBuilder());
-      this.toggleRotationBuilder();
-    }
-
-    // Auto-detect button — fetches the port list from asocks so the
-    // user doesn't have to dig for their portId manually.
-    const listBtn = document.getElementById("btn-asocks-list-ports");
-    if (listBtn) {
-      listBtn.addEventListener("click", () => this.fetchAsocksPorts());
-    }
-
-    // Scroll-to-anchor for the banner link
-    document.querySelectorAll("[data-scroll-target]").forEach(el => {
-      el.addEventListener("click", e => {
-        e.preventDefault();
-        const target = document.getElementById(el.dataset.scrollTarget);
-        if (target) {
-          target.scrollIntoView({ behavior: "smooth", block: "center" });
-          target.classList.add("flash-highlight");
-          setTimeout(() => target.classList.remove("flash-highlight"), 1500);
-        }
-      });
-    });
-
-    await Promise.all([
-      this.loadIps(),
-      this.refreshCurrentIp(),   // show current IP right away
-    ]);
   },
 
-  /** Wires up data-show-when="checkbox-id" on any element — that
-   *  element is only visible (.visible class) while the referenced
-   *  checkbox is ticked. Used for the rotation-body inline block so
-   *  users don't see the API config until they've opted in to rotation.
-   *  Pure DOM wiring — no persistence, the checkbox itself drives state.
-   */
-  _wireShowWhenToggles() {
-    document.querySelectorAll("[data-show-when]").forEach(panel => {
-      const cbId = panel.getAttribute("data-show-when");
-      const cb = document.getElementById(cbId);
-      if (!cb) return;
-      const apply = () => {
-        panel.classList.toggle("visible", !!cb.checked);
-      };
-      cb.addEventListener("change", apply);
-      apply();   // initial state matches checkbox on page load
+  teardown() { /* no timers */ },
+
+  // ── Loading ──────────────────────────────────────────────────
+
+  async loadProxies() {
+    try {
+      const resp = await api("/api/proxies");
+      this.proxies = resp.proxies || [];
+      this._applyFilter();
+      this.render();
+    } catch (e) {
+      console.error("load proxies:", e);
+      toast("Failed to load proxies", true);
+    }
+  },
+
+  _applyFilter() {
+    const q = this._search.trim().toLowerCase();
+    if (!q) { this.filtered = this.proxies.slice(); return; }
+    this.filtered = this.proxies.filter(p => {
+      const hay = [
+        p.name, p.host, p.port, p.login, p.type,
+        p.last_country, p.last_city, p.last_provider, p.last_ip_type,
+      ].filter(Boolean).join(" ").toLowerCase();
+      return hay.includes(q);
     });
   },
 
-  /** Updates the chip in the Rotation-API card header and the warning
-   *  banner in Live diagnostics. Call this any time the user edits
-   *  provider / URL. */
-  refreshRotationStatus() {
-    // configCache is nested: { proxy: { rotation_provider: ..., ... } }
-    // Use getByPath (from config-form.js) so we respect that shape.
-    const provider = getByPath(configCache, "proxy.rotation_provider") || "none";
-    const url      = (getByPath(configCache, "proxy.rotation_api_url") || "").trim();
-    const configured = provider !== "none" && !!url;
+  // ── Rendering ────────────────────────────────────────────────
 
-    // The override checkbox — explicit True forces on, explicit False
-    // forces off, null means "let the API config decide".
-    const override = getByPath(configCache, "proxy.is_rotating");
-
-    // Compute effective rotation state — this is what main.py will see.
-    // Keep this logic in sync with main.py::_resolve_rotation().
-    let effective, label, tone;
-    if (override === false) {
-      effective = false;
-      label = "disabled (override)";
-      tone  = "off";
-    } else if (override === true && !configured) {
-      effective = true;
-      label = "✓ forced on (no API!)";
-      tone  = "warn";
-    } else if (configured) {
-      effective = true;
-      label = `✓ ${provider}`;
-      tone  = "on";
-    } else {
-      effective = false;
-      label = "not configured";
-      tone  = "off";
+  render() {
+    const tbody = $("#proxy-tbody");
+    if (!this.proxies.length) {
+      tbody.innerHTML = `
+        <tr><td colspan="12" class="proxy-empty-cell">
+          No proxies yet. Click <strong>+ Add proxy</strong> above.
+        </td></tr>`;
+      this._renderStats();
+      return;
     }
-
-    const chip = document.getElementById("rotation-status-chip");
-    if (chip) {
-      chip.classList.toggle("on",   tone === "on");
-      chip.classList.toggle("off",  tone === "off");
-      chip.classList.toggle("warn", tone === "warn");
-      chip.textContent = label;
-    }
-
-    const banner = document.getElementById("rotation-missing-banner");
-    if (banner) {
-      // Show banner only when rotation isn't going to work.
-      banner.style.display = effective ? "none" : "";
-    }
-
-    // Old conflict-warning box was removed when we consolidated the
-    // rotation UI — "force enable without API" still a valid bad state
-    // but the master switch is the only thing in that state that's
-    // visible now, so the status chip above communicates it adequately.
-  },
-
-  /** Show the asocks simple-fields block when provider=asocks, the
-   *  generic URL editor otherwise. Keeps the two paths from colliding. */
-  toggleRotationBuilder() {
-    const provider = getByPath(configCache, "proxy.rotation_provider") || "none";
-    const asocksBox   = document.getElementById("rotation-asocks-builder");
-    const advancedBox = document.getElementById("rotation-advanced-builder");
-    if (!asocksBox || !advancedBox) return;
-
-    if (provider === "asocks") {
-      asocksBox.style.display   = "";
-      advancedBox.style.display = "none";
-      // Make sure the URL reflects the asocks inputs
-      this.rebuildAsocksUrl();
-    } else if (provider === "none") {
-      asocksBox.style.display   = "none";
-      advancedBox.style.display = "none";
-    } else {
-      asocksBox.style.display   = "none";
-      advancedBox.style.display = "";
-    }
-  },
-
-  /** Call /v2/proxy/port-list on asocks and show the result as a
-   *  clickable list. The user picks a row → its portId goes into
-   *  the Port ID input and URL is rebuilt automatically. */
-  async fetchAsocksPorts() {
-    const btn    = document.getElementById("btn-asocks-list-ports");
-    const list   = document.getElementById("asocks-port-list");
-    const keyInp = document.getElementById("asocks-api-key");
-    if (!btn || !list || !keyInp) return;
-
-    const apiKey = (keyInp.value || "").trim();
-    if (!apiKey) {
-      list.innerHTML = `<div class="asocks-port-err">
-        Fill in the API key first.
-      </div>`;
-      list.style.display = "";
+    if (!this.filtered.length) {
+      tbody.innerHTML = `
+        <tr><td colspan="12" class="proxy-empty-cell">
+          No matches for "${escapeHtml(this._search)}".
+        </td></tr>`;
+      this._renderStats();
       return;
     }
 
-    btn.disabled = true;
-    btn.textContent = "⏳ Fetching…";
-    list.innerHTML = `<div class="asocks-port-loading">
-      Calling asocks API…
-    </div>`;
-    list.style.display = "";
+    tbody.innerHTML = this.filtered.map(p => this._renderRow(p)).join("");
+    this._wireRowButtons();
+    this._renderStats();
+  },
 
-    try {
-      const r = await api("/api/proxy/asocks-port-list", {
-        method: "POST",
-        body:   JSON.stringify({ api_key: apiKey }),
+  _renderStats() {
+    const all = this.proxies;
+    $("#stat-total").textContent     = all.length;
+    $("#stat-active").textContent    = all.filter(p => p.last_status === "ok").length;
+    $("#stat-error").textContent     = all.filter(p => p.last_status === "error").length;
+    $("#stat-untested").textContent  = all.filter(p =>
+      !p.last_status || p.last_status === "untested").length;
+  },
+
+  _renderRow(p) {
+    const status = p.last_status || "untested";
+    const statusLabel = status === "ok" ? "ACTIVE"
+                      : status === "error" ? "ERROR"
+                      : "UNTESTED";
+    const type = (p.type || "http").toUpperCase();
+    const loginShown = p.login ? escapeHtml(p.login) : `<span class="muted">—</span>`;
+    const flag = p.last_country_code
+      ? this._flagEmoji(p.last_country_code)
+      : "🌐";
+    const geoLabel = p.last_country
+      ? `${flag} ${escapeHtml(p.last_country)}${p.last_city ? ` · ${escapeHtml(p.last_city)}` : ""}`
+      : `<span class="muted">—</span>`;
+    const ipType = p.last_ip_type && p.last_ip_type !== "unknown"
+      ? `<span class="iptype-badge iptype-${p.last_ip_type}">${escapeHtml(p.last_ip_type)}</span>`
+      : `<span class="muted">—</span>`;
+    const latency = p.last_latency_ms != null
+      ? `<span class="latency ${this._latencyClass(p.last_latency_ms)}">${p.last_latency_ms}ms</span>`
+      : `<span class="muted">—</span>`;
+    const checkedAt = p.last_checked_at
+      ? this._formatRelative(p.last_checked_at)
+      : `<span class="muted">never</span>`;
+    const name = p.name || `${p.host || "?"}:${p.port || "?"}`;
+
+    return `
+      <tr data-proxy-id="${p.id}" class="proxy-row proxy-row-${status}">
+        <td class="col-name">
+          <div class="proxy-name-cell">
+            <span class="proxy-name-label">${escapeHtml(name)}</span>
+            ${p.is_default ? `<span class="proxy-default-badge">DEFAULT</span>` : ""}
+            ${p.is_rotating ? `<span class="proxy-rot-badge" title="Rotation API configured">↻</span>` : ""}
+          </div>
+        </td>
+        <td class="col-status">
+          <span class="status-badge status-${status}">${statusLabel}</span>
+        </td>
+        <td class="col-type">
+          <span class="type-badge type-${(p.type || 'http').toLowerCase()}">${type}</span>
+        </td>
+        <td class="col-host" title="${escapeHtml(p.host || '')}">${escapeHtml(p.host || "—")}</td>
+        <td class="col-port">${p.port ?? "—"}</td>
+        <td class="col-login">${loginShown}</td>
+        <td class="col-geo">${geoLabel}</td>
+        <td class="col-iptype">${ipType}</td>
+        <td class="col-latency">${latency}</td>
+        <td class="col-profiles">
+          <span class="profile-count-badge" title="${p.profile_count} profile(s) using this">
+            ${p.profile_count || 0}
+          </span>
+        </td>
+        <td class="col-checked">${checkedAt}</td>
+        <td class="col-actions">
+          <div class="row-actions">
+            <button class="btn-icon row-test-btn" title="Test this proxy"
+                    data-action="test">🔬</button>
+            <button class="btn-icon row-edit-btn" title="Edit"
+                    data-action="edit">✎</button>
+            <button class="btn-icon row-delete-btn" title="Delete"
+                    data-action="delete"
+                    ${p.is_default ? "disabled" : ""}>✕</button>
+          </div>
+        </td>
+      </tr>
+      ${p.last_error && status === "error" ? `
+        <tr class="proxy-error-row">
+          <td colspan="12">
+            <div class="proxy-error-detail">
+              <strong>Error:</strong> ${escapeHtml(p.last_error)}
+            </div>
+          </td>
+        </tr>` : ""}`;
+  },
+
+  _wireRowButtons() {
+    const tbody = $("#proxy-tbody");
+    tbody.querySelectorAll(".row-actions button").forEach(btn => {
+      btn.addEventListener("click", (e) => {
+        e.stopPropagation();
+        const row = btn.closest("tr");
+        const id = Number(row.dataset.proxyId);
+        const action = btn.dataset.action;
+        if (action === "test") this.testOne(id, btn);
+        else if (action === "edit") this.openEditModal(id);
+        else if (action === "delete") this.deleteProxy(id);
       });
+    });
+  },
 
-      if (!r.ok) {
-        list.innerHTML = `<div class="asocks-port-err">
-          ✗ ${escapeHtml(r.error || "failed")} ${r.http ? `(HTTP ${r.http})` : ""}
-          ${r.body ? `<pre>${escapeHtml(r.body)}</pre>` : ""}
-        </div>`;
-        return;
+  // ── Header wiring ────────────────────────────────────────────
+
+  wireHeader() {
+    $("#proxy-add-btn").addEventListener("click", () => this.openEditModal(null));
+    $("#proxy-bulk-import-btn").addEventListener("click", () => this.openBulkModal());
+    $("#proxy-test-all-btn").addEventListener("click", () => this.testAll());
+  },
+
+  wireSearch() {
+    $("#proxy-search").addEventListener("input", (e) => {
+      this._search = e.target.value;
+      this._applyFilter();
+      this.render();
+    });
+  },
+
+  // ── Test one row ─────────────────────────────────────────────
+
+  async testOne(id, btn) {
+    if (btn) {
+      btn.disabled = true;
+      btn.classList.add("is-testing");
+      btn.innerHTML = `<span class="spinner">⟳</span>`;
+    }
+    try {
+      const resp = await api(`/api/proxies/${id}/test`, { method: "POST" });
+      const diag = resp.diag || {};
+      if (diag.ok) {
+        toast(`✓ ${diag.country || "Connected"} · ${diag.latency_ms}ms`);
+      } else {
+        toast(`✗ ${diag.error || "Test failed"}`, true);
       }
-      if (!r.ports.length) {
-        list.innerHTML = `<div class="asocks-port-err">
-          No ports found on your asocks account. Create one in the
-          asocks dashboard first.
-        </div>`;
-        return;
-      }
-      this._renderAsocksPorts(r.ports);
+      await this.loadProxies();
     } catch (e) {
-      list.innerHTML = `<div class="asocks-port-err">
-        ✗ ${escapeHtml(e.message || "request failed")}
-      </div>`;
+      toast(`Test failed: ${e.message}`, true);
     } finally {
-      btn.disabled = false;
-      btn.textContent = "🔍 Fetch port list from asocks";
+      if (btn) {
+        btn.disabled = false;
+        btn.classList.remove("is-testing");
+        btn.innerHTML = "🔬";
+      }
     }
   },
 
-  _renderAsocksPorts(ports) {
-    const list = document.getElementById("asocks-port-list");
-    const rows = ports.map(p => {
-      const hostPort = p.host && p.port ? `${p.host}:${p.port}` : "—";
-      const country  = p.country ? escapeHtml(p.country) : "—";
-      const city     = p.city    ? ` · ${escapeHtml(p.city)}` : "";
-      const name     = p.name    ? escapeHtml(p.name) : "(unnamed)";
-      // asocks hands us a pre-signed rotation URL per port. Stash it on
-      // the row so "Use this" can apply it directly — no need for the
-      // user to have the apiKey field populated to assemble the URL.
-      const refreshAttr = p.refresh_link
-        ? ` data-refresh-link="${escapeHtml(p.refresh_link)}"`
+  // ── Test all ─────────────────────────────────────────────────
+
+  async testAll() {
+    const btn = $("#proxy-test-all-btn");
+    if (!this.proxies.length) {
+      toast("No proxies to test", true);
+      return;
+    }
+    if (!confirm(`Test all ${this.proxies.length} proxies? Takes up to ${this.proxies.length * 5}s.`)) return;
+    btn.disabled = true;
+    const original = btn.innerHTML;
+    btn.innerHTML = `⏳ Testing…`;
+    try {
+      const resp = await api("/api/proxies/test-all", { method: "POST" });
+      const okCount = (resp.results || []).filter(r => r.status === "ok").length;
+      toast(`✓ Tested ${resp.count}: ${okCount} ok, ${resp.count - okCount} errors`);
+      await this.loadProxies();
+    } catch (e) {
+      toast(`Bulk test failed: ${e.message}`, true);
+    } finally {
+      btn.disabled = false;
+      btn.innerHTML = original;
+    }
+  },
+
+  // ── Edit modal ───────────────────────────────────────────────
+
+  wireEditModal() {
+    document.querySelectorAll('[data-close="proxy-edit-modal"]').forEach(el =>
+      el.addEventListener("click", () => this.closeEditModal())
+    );
+    $("#edit-proxy-is-rotating").addEventListener("change", (e) => {
+      $("#edit-rotation-fields").style.display = e.target.checked ? "" : "none";
+    });
+    $("#proxy-edit-save-btn").addEventListener("click", () => this.saveProxy());
+  },
+
+  async openEditModal(id) {
+    this.editingId = id;
+    const modal = $("#proxy-edit-modal");
+    const title = $("#proxy-edit-title");
+    if (id) {
+      title.textContent = "Edit proxy";
+      try {
+        const resp = await api(`/api/proxies/${id}`);
+        const p = resp.proxy;
+        $("#edit-proxy-name").value        = p.name || "";
+        $("#edit-proxy-url").value         = p.url || "";
+        $("#edit-proxy-is-rotating").checked = !!p.is_rotating;
+        $("#edit-rotation-url").value      = p.rotation_api_url || "";
+        $("#edit-rotation-provider").value = p.rotation_provider || "none";
+        $("#edit-rotation-key").value      = p.rotation_api_key || "";
+        $("#edit-proxy-is-default").checked = !!p.is_default;
+        $("#edit-proxy-notes").value       = p.notes || "";
+        // Auto-test disabled by default on edit — avoid extra request
+        // unless user opts in
+        $("#edit-proxy-auto-test").checked = false;
+        $("#edit-rotation-fields").style.display = p.is_rotating ? "" : "none";
+      } catch (e) {
+        toast("Could not load proxy", true);
+        return;
+      }
+    } else {
+      title.textContent = "Add proxy";
+      $("#edit-proxy-name").value = "";
+      $("#edit-proxy-url").value = "";
+      $("#edit-proxy-is-rotating").checked = false;
+      $("#edit-rotation-url").value = "";
+      $("#edit-rotation-provider").value = "none";
+      $("#edit-rotation-key").value = "";
+      $("#edit-proxy-is-default").checked = false;
+      $("#edit-proxy-notes").value = "";
+      $("#edit-proxy-auto-test").checked = true;
+      $("#edit-rotation-fields").style.display = "none";
+    }
+    modal.style.display = "";
+    setTimeout(() => $("#edit-proxy-url").focus(), 30);
+  },
+
+  closeEditModal() {
+    $("#proxy-edit-modal").style.display = "none";
+    this.editingId = null;
+  },
+
+  async saveProxy() {
+    const url = $("#edit-proxy-url").value.trim();
+    if (!url) { toast("URL is required", true); return; }
+    const payload = {
+      name:             $("#edit-proxy-name").value.trim() || null,
+      url,
+      is_rotating:      $("#edit-proxy-is-rotating").checked,
+      rotation_api_url: $("#edit-rotation-url").value.trim() || null,
+      rotation_provider: $("#edit-rotation-provider").value || null,
+      rotation_api_key: $("#edit-rotation-key").value.trim() || null,
+      is_default:       $("#edit-proxy-is-default").checked,
+      notes:            $("#edit-proxy-notes").value.trim() || null,
+      auto_test:        $("#edit-proxy-auto-test").checked,
+    };
+    const btn = $("#proxy-edit-save-btn");
+    btn.disabled = true;
+    btn.textContent = "⏳ Saving…";
+    try {
+      if (this.editingId) {
+        // PUT (partial update) — don't send auto_test since only create
+        // supports that side-effect path
+        const { auto_test, ...updateFields } = payload;
+        await api(`/api/proxies/${this.editingId}`, {
+          method: "PUT",
+          body: JSON.stringify(updateFields),
+        });
+        // If user wants test after edit, run it separately
+        if (auto_test) {
+          await api(`/api/proxies/${this.editingId}/test`, { method: "POST" });
+        }
+        toast("✓ Saved");
+      } else {
+        await api("/api/proxies", {
+          method: "POST",
+          body: JSON.stringify(payload),
+        });
+        toast("✓ Created");
+      }
+      this.closeEditModal();
+      await this.loadProxies();
+    } catch (e) {
+      toast(`Save failed: ${e.message}`, true);
+    } finally {
+      btn.disabled = false;
+      btn.textContent = "Save";
+    }
+  },
+
+  // ── Delete ───────────────────────────────────────────────────
+
+  async deleteProxy(id) {
+    const p = this.proxies.find(x => x.id === id);
+    if (!p) return;
+    if (p.is_default) {
+      toast("Cannot delete the default proxy — set another as default first.", true);
+      return;
+    }
+    const used = p.profile_count || 0;
+    const warn = used > 0
+      ? `\n\n⚠ ${used} profile(s) use this proxy. They will fall back to the default.`
+      : "";
+    if (!confirm(`Delete "${p.name}"?${warn}`)) return;
+    try {
+      await api(`/api/proxies/${id}`, { method: "DELETE" });
+      toast("✓ Deleted");
+      await this.loadProxies();
+    } catch (e) {
+      toast(`Delete failed: ${e.message}`, true);
+    }
+  },
+
+  // ── Bulk import modal (smart multi-format parser) ───────────
+  //
+  // UX: user pastes → we debounce → POST /api/proxies/parse-preview
+  // → show per-line parse result. Import button enables only when
+  // there's at least one valid NEW (non-duplicate) entry. This
+  // matches Dolphin's workflow — see what you'll create before you
+  // commit.
+
+  wireBulkModal() {
+    document.querySelectorAll('[data-close="proxy-bulk-modal"]').forEach(el =>
+      el.addEventListener("click", () => this.closeBulkModal())
+    );
+    const ta = $("#bulk-proxy-text");
+    const scheme = $("#bulk-default-scheme");
+    // Debounce preview — parser is fast server-side but we don't want
+    // a request per keystroke when someone is pasting 200 lines.
+    ta.addEventListener("input", () => this._schedulePreview());
+    scheme.addEventListener("change", () => this._schedulePreview());
+    $("#proxy-bulk-save-btn").addEventListener("click", () => this.bulkImport());
+  },
+
+  openBulkModal() {
+    $("#proxy-bulk-modal").style.display = "";
+    $("#bulk-proxy-text").value = "";
+    $("#bulk-preview-stats").textContent = "Paste lines to see preview";
+    $("#bulk-preview-list").innerHTML = `
+      <div class="bulk-preview-empty">
+        Start typing on the left — the parser detects the format
+        automatically.
+      </div>`;
+    $("#proxy-bulk-save-btn").disabled = true;
+    this._bulkPreviewData = null;
+    setTimeout(() => $("#bulk-proxy-text").focus(), 30);
+  },
+
+  closeBulkModal() {
+    $("#proxy-bulk-modal").style.display = "none";
+    if (this._previewTimer) clearTimeout(this._previewTimer);
+  },
+
+  _schedulePreview() {
+    if (this._previewTimer) clearTimeout(this._previewTimer);
+    this._previewTimer = setTimeout(() => this._fetchPreview(), 400);
+  },
+
+  async _fetchPreview() {
+    const text = $("#bulk-proxy-text").value;
+    if (!text.trim()) {
+      $("#bulk-preview-stats").textContent = "Paste lines to see preview";
+      $("#bulk-preview-list").innerHTML = `
+        <div class="bulk-preview-empty">
+          Start typing on the left — the parser detects the format
+          automatically.
+        </div>`;
+      $("#proxy-bulk-save-btn").disabled = true;
+      this._bulkPreviewData = null;
+      return;
+    }
+    try {
+      const resp = await api("/api/proxies/parse-preview", {
+        method: "POST",
+        body: JSON.stringify({
+          text,
+          default_scheme: $("#bulk-default-scheme").value,
+        }),
+      });
+      this._bulkPreviewData = resp;
+      this._renderPreview(resp);
+    } catch (e) {
+      $("#bulk-preview-list").innerHTML = `
+        <div class="bulk-preview-empty" style="color: #fca5a5;">
+          Preview failed: ${escapeHtml(e.message)}
+        </div>`;
+    }
+  },
+
+  _renderPreview(data) {
+    const { valid = [], errors = [], total = 0 } = data;
+    const newCount = valid.filter(v => !v.duplicate).length;
+    const dupCount = valid.length - newCount;
+
+    // Stats line (above preview list)
+    const statsHtml = [];
+    if (newCount) {
+      statsHtml.push(`<strong class="stat-ok">${newCount}</strong> new`);
+    }
+    if (dupCount) {
+      statsHtml.push(`<strong class="stat-dup">${dupCount}</strong> duplicate`);
+    }
+    if (errors.length) {
+      statsHtml.push(`<strong class="stat-err">${errors.length}</strong> error`);
+    }
+    if (!statsHtml.length) {
+      statsHtml.push("No recognized lines");
+    }
+    $("#bulk-preview-stats").innerHTML = statsHtml.join(" · ");
+
+    // List: valid entries first, then errors at the bottom
+    const rows = [];
+
+    for (const v of valid) {
+      const credsChip = (v.login || v.password)
+        ? `<span class="prev-chip prev-chip-creds">${escapeHtml(v.login || '')}${v.password ? ':•••' : ''}</span>`
         : "";
-      return `
-        <div class="asocks-port-row"
-             data-port-id="${escapeHtml(String(p.id))}"${refreshAttr}>
-          <div class="asocks-port-row-main">
-            <code class="asocks-port-id-chip">id: ${escapeHtml(String(p.id))}</code>
-            <div>
-              <div class="asocks-port-name">${name}</div>
-              <div class="asocks-port-meta">
-                ${country}${city} · <code>${escapeHtml(hostPort)}</code>
-              </div>
+      const fmtLabel = this._formatLabel(v.format);
+      rows.push(`
+        <div class="bulk-preview-row ${v.duplicate ? 'is-duplicate' : 'is-new'}">
+          <div class="prev-mark">${v.duplicate ? '↺' : '+'}</div>
+          <div class="prev-body">
+            <div class="prev-url">
+              <code>${escapeHtml(v.url)}</code>
+            </div>
+            <div class="prev-meta">
+              <span class="prev-chip prev-chip-type">${escapeHtml(v.type || '')}</span>
+              <span class="prev-chip prev-chip-host">${escapeHtml(v.host || '')}:${v.port || ''}</span>
+              ${credsChip}
+              <span class="prev-chip prev-chip-fmt" title="Detected format: ${escapeHtml(v.format)}">${escapeHtml(fmtLabel)}</span>
+              ${v.duplicate ? '<span class="prev-chip prev-chip-dup">already exists</span>' : ''}
             </div>
           </div>
-          <button class="btn btn-primary btn-small asocks-port-pick">
-            Use this
-          </button>
+        </div>`);
+    }
+
+    for (const e of errors) {
+      rows.push(`
+        <div class="bulk-preview-row is-error">
+          <div class="prev-mark">✕</div>
+          <div class="prev-body">
+            <div class="prev-url prev-url-error">
+              <code>${escapeHtml(e.raw || '').slice(0, 120)}</code>
+            </div>
+            <div class="prev-meta">
+              <span class="prev-chip prev-chip-error">line ${e.line}: ${escapeHtml((e.error || '').slice(0, 80))}</span>
+            </div>
+          </div>
+        </div>`);
+    }
+
+    if (!rows.length) {
+      $("#bulk-preview-list").innerHTML = `
+        <div class="bulk-preview-empty">
+          Nothing parsed from the input.
         </div>`;
-    }).join("");
-
-    list.innerHTML = `
-      <div class="asocks-port-title">
-        ✓ Found ${ports.length} port${ports.length === 1 ? "" : "s"} on your account —
-        click <strong>Use this</strong> next to the one you want to rotate:
-      </div>
-      ${rows}`;
-
-    list.querySelectorAll(".asocks-port-row").forEach(row => {
-      row.addEventListener("click", () => {
-        const portId      = row.dataset.portId;
-        const refreshLink = row.dataset.refreshLink;
-        const portInput   = document.getElementById("asocks-port-id");
-
-        if (portInput) {
-          portInput.value = portId;
-        }
-
-        // If asocks gave us a ready-to-use refresh_link, use IT as the
-        // rotation URL directly. It already contains the apiKey encoded
-        // as a query param — no need to rebuild.
-        if (refreshLink) {
-          setByPath(configCache, "proxy.rotation_api_url",  refreshLink);
-          setByPath(configCache, "proxy.asocks_port_id",    portId);
-          setByPath(configCache, "proxy.rotation_method",   "GET");
-          setByPath(configCache, "proxy.rotation_api_key",  null);
-
-          const preview = document.getElementById("asocks-assembled-url");
-          if (preview) {
-            // Mask the key portion for safe screenshots
-            const masked = refreshLink.replace(
-              /(apiKey=)([^&]+)/,
-              (_, k, v) => k + v.slice(0, 6) + "…" + v.slice(-4)
-            );
-            preview.textContent = masked;
-            preview.classList.remove("muted");
-          }
-          scheduleConfigSave();
-          this.refreshRotationStatus();
-        } else {
-          // Fallback: trigger the old rebuild path (asocks didn't give
-          // us a link, for whatever reason).
-          portInput?.dispatchEvent(new Event("input"));
-        }
-
-        // Highlight selection
-        list.querySelectorAll(".asocks-port-row").forEach(r =>
-          r.classList.toggle("selected", r === row)
-        );
-      });
-    });
-  },
-
-  /** Assemble the real rotation URL from the asocks portId + apiKey
-   *  fields, persist it in configCache, and update the preview. */
-  rebuildAsocksUrl() {
-    const portInput = document.getElementById("asocks-port-id");
-    const keyInput  = document.getElementById("asocks-api-key");
-    const preview   = document.getElementById("asocks-assembled-url");
-    if (!portInput || !keyInput) return;
-
-    const portId = (portInput.value || "").trim();
-    const apiKey = (keyInput.value || "").trim();
-
-    // Persist the two fragments separately so the user doesn't have to
-    // retype them next visit.
-    setByPath(configCache, "proxy.asocks_port_id", portId || null);
-    setByPath(configCache, "proxy.asocks_api_key", apiKey || null);
-
-    let url = "";
-    if (portId && apiKey) {
-      url = `https://api.asocks.com/v2/proxy/refresh/${encodeURIComponent(portId)}` +
-            `?apiKey=${encodeURIComponent(apiKey)}`;
-    }
-
-    // Write the assembled URL into the same config key backend uses
-    setByPath(configCache, "proxy.rotation_api_url", url || null);
-    // asocks expects GET and carries auth in the URL — enforce both
-    setByPath(configCache, "proxy.rotation_method",  "GET");
-    setByPath(configCache, "proxy.rotation_api_key", null);
-
-    if (preview) {
-      if (url) {
-        // Mask the key in the on-screen preview so the user can share
-        // screenshots without leaking the token.
-        const masked = url.replace(
-          /(apiKey=)([^&]+)/,
-          (_, k, v) => k + v.slice(0, 6) + "…" + v.slice(-4)
-        );
-        preview.textContent = masked;
-        preview.classList.remove("muted");
-      } else {
-        preview.textContent = "Fill in Port ID and API key above to assemble the URL.";
-        preview.classList.add("muted");
-      }
-    }
-
-    scheduleConfigSave();
-    this.refreshRotationStatus();
-  },
-
-  // ───────────────────────────────────────────────────────────
-  // Current IP panel
-  // ───────────────────────────────────────────────────────────
-
-  async refreshCurrentIp() {
-    const btn = $("#btn-refresh-ip");
-    btn.disabled = true;
-    btn.textContent = "⏳ Checking…";
-    try {
-      const report = await api("/api/proxy/full-diagnostics", { method: "POST" });
-      this._renderCurrentIp(report);
-    } catch (e) {
-      this._renderError(e.message || "diagnostics failed");
-    } finally {
-      btn.disabled = false;
-      btn.textContent = "🔄 Refresh";
-    }
-  },
-
-  async rotateIp() {
-    const btn = $("#btn-rotate-ip");
-    btn.disabled = true;
-    btn.textContent = "⏳ Rotating…";
-    try {
-      const before = $("#proxy-live-ip").textContent.trim();
-      const info   = await api("/api/proxy/rotate", { method: "POST" });
-
-      // rotation_called === false means the API wasn't configured or
-      // call failed — tell the user exactly what's wrong.
-      if (info.rotation_called === false) {
-        toast(
-          info.rotation_error || "Rotation not triggered — check config",
-          true
-        );
-      }
-
-      await this.refreshCurrentIp();
-      const after = $("#proxy-live-ip").textContent.trim();
-
-      if (info.rotation_called) {
-        if (before && after && before !== after) {
-          toast(`✓ Rotated: ${before} → ${after}`);
-        } else {
-          toast(
-            "⚠ Rotation API called successfully but IP didn't change. " +
-            "Provider may be slow or reissued the same IP.",
-            true
-          );
-        }
-      }
-    } catch (e) {
-      toast(e.message || "rotation failed", true);
-    } finally {
-      btn.disabled = false;
-      btn.textContent = "⚡ Rotate IP";
-    }
-  },
-
-  /** One-off ping against the configured rotation URL — shows HTTP
-   *  status + response so the user can confirm credentials are valid. */
-  async testRotationApi() {
-    const btn = document.getElementById("btn-test-rotation-api");
-    const out = document.getElementById("rotation-api-test-result");
-    btn.disabled = true;
-    btn.textContent = "⏳ Testing…";
-    out.textContent = "Calling rotation API…";
-    out.className = "form-hint";
-    try {
-      const r = await api("/api/proxy/test-rotation-api", { method: "POST" });
-      out.textContent = r.message || (r.ok ? "ok" : "failed");
-      out.className = r.ok
-        ? "form-hint form-hint-success"
-        : "form-hint form-hint-error";
-    } catch (e) {
-      out.textContent = `✗ Request failed: ${e.message}`;
-      out.className = "form-hint form-hint-error";
-    } finally {
-      btn.disabled = false;
-      btn.textContent = "🧪 Test rotation API";
-    }
-  },
-
-  _renderCurrentIp(report) {
-    if (!report.ok) {
-      this._renderError(report.error || "lookup failed");
+      $("#proxy-bulk-save-btn").disabled = true;
       return;
     }
-    const ip = report.ip || {};
-    const flag = countryFlag(ip.country_code);
+    $("#bulk-preview-list").innerHTML = rows.join("");
 
-    $("#proxy-live-ip").innerHTML      = `${flag} ${escapeHtml(ip.ip || "—")}`;
-    $("#proxy-live-country").textContent = ip.country || "—";
-    $("#proxy-live-city").textContent    = ip.city    || "—";
-    $("#proxy-live-tz").textContent      = ip.timezone || "—";
-    $("#proxy-live-asn").textContent     = ip.org     || "—";
-
-    // IP type with coloring
-    const typeEl = $("#proxy-live-iptype");
-    typeEl.textContent = report.ip_type || "unknown";
-    typeEl.className   = "proxy-live-cell-value iptype-" + (report.ip_type || "unknown");
-
-    // Risk with coloring
-    const riskEl = $("#proxy-live-risk");
-    riskEl.textContent = report.detection_risk || "medium";
-    riskEl.className   = "proxy-live-cell-value risk-" + (report.detection_risk || "medium");
-
-    // Check rows
-    this._renderCheck("check-geo", report.geo_match,
-      report.geo_match
-        ? `Geo match: ${ip.country}`
-        : `Geo MISMATCH: got ${ip.country}, expected ${report.expected_country}`);
-    this._renderCheck("check-tz", report.tz_match,
-      report.tz_match
-        ? `Timezone match: ${ip.timezone}`
-        : `Timezone MISMATCH: got ${ip.timezone}, expected ${report.expected_timezone}`);
+    // Enable import button if at least 1 new entry
+    $("#proxy-bulk-save-btn").disabled = newCount === 0;
+    $("#proxy-bulk-save-btn").textContent = newCount > 0
+      ? `Import ${newCount}`
+      : "Nothing to import";
   },
 
-  _renderCheck(elId, passed, text) {
-    const el = $("#" + elId);
-    el.className = "proxy-live-check " + (passed ? "pass" : "fail");
-    el.querySelector(".check-icon").textContent = passed ? "✓" : "✗";
-    el.querySelector("span:last-child").textContent = text;
+  /** Human-friendly label for the detected format */
+  _formatLabel(fmt) {
+    const map = {
+      canonical:              "URL",
+      host_port:              "host:port",
+      host_port_user_pass:    "host:port:user:pass",
+      host_port_user_pass_ambiguous: "host:port:user:pass?",
+      user_pass_host_port:    "user:pass:host:port",
+      creds_at_host_port:     "user:pass@host:port",
+      host_port_at_creds:     "host:port@user:pass",
+      ipv6_colon:             "IPv6",
+      host_port_user:         "host:port:user",
+    };
+    return map[fmt] || fmt;
   },
 
-  _renderError(msg) {
-    $("#proxy-live-ip").textContent       = "error";
-    $("#proxy-live-country").textContent  = "—";
-    $("#proxy-live-city").textContent     = "—";
-    $("#proxy-live-tz").textContent       = "—";
-    $("#proxy-live-asn").textContent      = msg.slice(0, 60);
-    $("#proxy-live-iptype").textContent   = "—";
-    $("#proxy-live-risk").textContent     = "—";
-    this._renderCheck("check-geo", false, `Check failed: ${msg.slice(0, 80)}`);
-    this._renderCheck("check-tz",  false, "Not checked");
-  },
-
-  // ───────────────────────────────────────────────────────────
-  // Rotation test
-  // ───────────────────────────────────────────────────────────
-
-  async runRotationTest() {
-    const btn = $("#btn-rotation-test");
-    const container = $("#rotation-test-results");
-    const n = parseInt($("#rotation-count").value, 10);
-
+  async bulkImport() {
+    const text = $("#bulk-proxy-text").value;
+    if (!text.trim()) return;
+    const autoTest = $("#bulk-auto-test").checked;
+    const btn = $("#proxy-bulk-save-btn");
     btn.disabled = true;
-    btn.textContent = `⏳ Testing ${n} requests…`;
-    container.innerHTML = `
-      <div class="rotation-progress">
-        <div class="rotation-progress-label">
-          Running ${n} requests through the proxy…
-        </div>
-        <div class="rotation-progress-bar"><div class="rotation-progress-fill"></div></div>
-      </div>
-    `;
-
+    btn.textContent = `⏳ Importing…`;
     try {
-      const resp = await api("/api/proxy/test-rotation", {
+      const resp = await api("/api/proxies/bulk-import", {
         method: "POST",
-        body: JSON.stringify({ count: n }),
+        body: JSON.stringify({
+          text,
+          default_scheme: $("#bulk-default-scheme").value,
+          auto_test: autoTest,
+        }),
       });
-
-      if (!resp.ok) {
-        container.innerHTML = `<div class="error-banner">✗ ${escapeHtml(resp.error || "test failed")}</div>`;
-        return;
-      }
-      this._renderRotationResults(resp);
+      // Compose a compact summary for the toast
+      const parts = [`✓ Created ${resp.created}`];
+      if (resp.skipped_duplicates) parts.push(`${resp.skipped_duplicates} dup`);
+      if (resp.parse_errors) parts.push(`${resp.parse_errors} error`);
+      toast(parts.join(", "));
+      this.closeBulkModal();
+      await this.loadProxies();
     } catch (e) {
-      container.innerHTML = `<div class="error-banner">✗ ${escapeHtml(e.message || "error")}</div>`;
+      toast(`Import failed: ${e.message}`, true);
     } finally {
       btn.disabled = false;
-      btn.textContent = "🧪 Run test";
+      btn.textContent = "Import";
     }
   },
 
-  _renderRotationResults(resp) {
-    const container = $("#rotation-test-results");
+  // ── Helpers ──────────────────────────────────────────────────
 
-    // Summary: country breakdown
-    const total = resp.total;
-    const countryEntries = Object.entries(resp.countries)
-      .sort((a, b) => b[1] - a[1]);
-
-    const summaryHtml = `
-      <div class="rotation-summary">
-        <div class="rotation-summary-row">
-          <span class="rotation-summary-label">Unique IPs</span>
-          <span class="rotation-summary-value">${resp.unique_ips} / ${total}</span>
-        </div>
-        <div class="rotation-summary-row">
-          <span class="rotation-summary-label">Unique countries</span>
-          <span class="rotation-summary-value">${countryEntries.length}</span>
-        </div>
-        ${countryEntries.map(([c, n]) => {
-          const pct = Math.round(100 * n / total);
-          return `
-            <div class="rotation-country-bar">
-              <div class="rotation-country-name">${escapeHtml(c)}</div>
-              <div class="rotation-country-track">
-                <div class="rotation-country-fill" style="width: ${pct}%"></div>
-              </div>
-              <div class="rotation-country-count">${n} (${pct}%)</div>
-            </div>
-          `;
-        }).join("")}
-      </div>
-    `;
-
-    const expCountry = (getByPath(configCache, "browser.expected_country") || "Ukraine").toLowerCase();
-    const rowsHtml = resp.results.map((r, i) => {
-      if (!r.ok) {
-        return `<tr class="rotation-row-err">
-          <td>${i + 1}</td>
-          <td colspan="4" class="muted">✗ ${escapeHtml(r.error || "lookup failed")}</td>
-        </tr>`;
-      }
-      const countryOk = (r.country || "").toLowerCase().includes(expCountry) ||
-                        expCountry.includes((r.country || "").toLowerCase());
-      const flag = countryFlag(r.country_code);
-      return `
-        <tr class="${countryOk ? "rotation-row-ok" : "rotation-row-warn"}">
-          <td>${i + 1}</td>
-          <td><code>${escapeHtml(r.ip || "?")}</code></td>
-          <td>${flag} ${escapeHtml(r.country || "?")}</td>
-          <td>${escapeHtml(r.city || "?")}</td>
-          <td class="muted">${escapeHtml((r.org || "?").slice(0, 50))}</td>
-        </tr>
-      `;
-    }).join("");
-
-    container.innerHTML = `
-      ${summaryHtml}
-      <table class="rotation-results-table">
-        <thead>
-          <tr>
-            <th>#</th><th>IP</th><th>Country</th><th>City</th><th>Provider</th>
-          </tr>
-        </thead>
-        <tbody>${rowsHtml}</tbody>
-      </table>
-    `;
+  /** Two-letter country code → flag emoji.
+   *  ISO 3166-1 alpha-2 codes start at regional indicator 'A' = U+1F1E6. */
+  _flagEmoji(cc) {
+    if (!cc || cc.length !== 2) return "🌐";
+    const up = cc.toUpperCase();
+    const A = 0x1F1E6;
+    return String.fromCodePoint(
+      A + (up.charCodeAt(0) - 65),
+      A + (up.charCodeAt(1) - 65)
+    );
   },
 
-  // ───────────────────────────────────────────────────────────
-  // IP statistics table
-  // ───────────────────────────────────────────────────────────
+  _latencyClass(ms) {
+    if (ms < 300) return "latency-fast";
+    if (ms < 1000) return "latency-mid";
+    return "latency-slow";
+  },
 
-  async loadIps() {
+  _formatRelative(ts) {
     try {
-      const ips = await api("/api/ips");
-      $("#ip-count").textContent = ips.length;
-
-      const tbody = $("#ips-tbody");
-      if (!ips.length) {
-        tbody.innerHTML = `<tr><td colspan="7" class="empty-state">No IP data yet</td></tr>`;
-        return;
-      }
-
-      tbody.innerHTML = ips.map(ip => `
-        <tr>
-          <td><strong>${escapeHtml(ip.ip)}</strong></td>
-          <td class="muted">${escapeHtml(ip.country || "—")}</td>
-          <td class="muted">${escapeHtml(ip.org || "—")}</td>
-          <td>${ip.total_uses}</td>
-          <td>${ip.total_captchas}</td>
-          <td>${(ip.captcha_rate * 100).toFixed(1)}%</td>
-          <td><span class="pill pill-${ip.status}">${ip.status}</span></td>
-        </tr>
-      `).join("");
-    } catch (e) {
-      console.error(e);
-    }
+      const dt = new Date(ts.replace(" ", "T") + "Z");
+      const diff = (Date.now() - dt.getTime()) / 1000;
+      if (diff < 60) return "just now";
+      if (diff < 3600) return `${Math.floor(diff / 60)}m ago`;
+      if (diff < 86400) return `${Math.floor(diff / 3600)}h ago`;
+      if (diff < 7 * 86400) return `${Math.floor(diff / 86400)}d ago`;
+      return dt.toLocaleDateString(undefined,
+        { month: "short", day: "numeric" });
+    } catch { return ts; }
   },
 };
 
-// Helper: flag emoji from country code (e.g. "UA" → "🇺🇦")
-function countryFlag(code) {
-  if (!code || code.length !== 2) return "🌐";
-  const codePoints = code.toUpperCase()
-    .split("")
-    .map(c => 127397 + c.charCodeAt(0));
-  return String.fromCodePoint(...codePoints);
-}
+// Shorthand alias — do NOT name this `Proxy` (that's the built-in
+// JS constructor used by Chart.js internals; shadowing it globally
+// breaks unrelated pages).
+const ProxyLibrary = ProxyPage;

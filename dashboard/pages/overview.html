@@ -1,136 +1,157 @@
-<section>
-  <!-- Hero panel with headline stats + trends -->
-  <div class="ov-hero">
-    <!-- Reset button sits top-right, floating over the hero gradient.
-         Kept low-contrast (ghost style) so it doesn't compete with
-         the stats, but turns visibly red on hover to signal danger. -->
-    <button class="ov-hero-reset-btn" id="ov-reset-stats-btn"
-            title="Reset all stats (runs, events, competitors, traffic)">
-      <span class="ov-hero-reset-icon">↻</span>
-      <span class="ov-hero-reset-label">Reset stats</span>
-    </button>
-
-    <div class="ov-hero-greeting">Ghost Shell</div>
-    <div class="ov-hero-title" id="ov-hero-title">Dashboard</div>
-    <div class="ov-hero-sub" id="ov-hero-sub">Loading overview…</div>
-
-    <div class="ov-hero-stats">
-      <div class="ov-hero-stat">
-        <div class="ov-hero-stat-label">Searches (24h)</div>
-        <div class="ov-hero-stat-value" id="hero-searches">—</div>
-        <div class="ov-hero-stat-trend" id="hero-searches-trend">—</div>
-      </div>
-      <div class="ov-hero-stat">
-        <div class="ov-hero-stat-label">Ads found (24h)</div>
-        <div class="ov-hero-stat-value" id="hero-ads">—</div>
-        <div class="ov-hero-stat-trend" id="hero-ads-trend">—</div>
-      </div>
-      <div class="ov-hero-stat">
-        <div class="ov-hero-stat-label">Actions ran (24h)</div>
-        <div class="ov-hero-stat-value" id="hero-actions">—</div>
-        <div class="ov-hero-stat-trend" id="hero-actions-trend">clicks · visits · reads</div>
-      </div>
-      <div class="ov-hero-stat">
-        <div class="ov-hero-stat-label">Captchas (24h)</div>
-        <div class="ov-hero-stat-value" id="hero-captchas">—</div>
-        <div class="ov-hero-stat-trend" id="hero-captchas-trend">—</div>
-      </div>
-      <div class="ov-hero-stat">
-        <div class="ov-hero-stat-label">Success rate</div>
-        <div class="ov-hero-stat-value" id="hero-rate">—</div>
-        <div class="ov-hero-stat-trend" id="hero-rate-trend">—</div>
-      </div>
+<section class="overview-workspace">
+  <!-- Compact header strip — was "hero" with gradient + 5 big numbers.
+       Now a thin strip with title on left, Reset on right, 5 inline
+       stats below matching the rest of the app's density. -->
+  <div class="page-header">
+    <div>
+      <div class="page-title">Overview</div>
+      <div class="page-subtitle" id="ov-hero-sub">Loading overview…</div>
+    </div>
+    <div class="overview-header-actions">
+      <button class="btn btn-secondary btn-danger" id="ov-reset-stats-btn"
+              title="Reset all stats (runs, events, competitors, traffic)">
+        ↻ Reset stats
+      </button>
     </div>
   </div>
 
-  <!-- Secondary stat grid (totals) -->
-  <div class="stats-grid">
-    <div class="stat">
-      <div class="stat-label">Total searches (all time)</div>
-      <div class="stat-value" id="stat-searches">—</div>
+  <!-- Hidden element kept for JS that writes the greeting text.
+       Safer than touching overview.js — it looks for #ov-hero-title. -->
+  <span id="ov-hero-title" style="display:none"></span>
+
+  <!-- Primary 24h stat row — dense, one-line each -->
+  <div class="overview-primary-stats">
+    <div class="primary-stat">
+      <div class="primary-stat-label">Searches · 24h</div>
+      <div class="primary-stat-value" id="hero-searches">—</div>
+      <div class="primary-stat-trend" id="hero-searches-trend">—</div>
     </div>
-    <div class="stat">
-      <div class="stat-label">Total ads tracked</div>
-      <div class="stat-value" id="stat-ads">—</div>
+    <div class="primary-stat">
+      <div class="primary-stat-label">Ads found · 24h</div>
+      <div class="primary-stat-value" id="hero-ads">—</div>
+      <div class="primary-stat-trend" id="hero-ads-trend">—</div>
     </div>
-    <div class="stat">
-      <div class="stat-label">Total actions performed</div>
-      <div class="stat-value" id="stat-actions">—</div>
-      <div class="stat-sub" id="stat-actions-sub">—</div>
+    <div class="primary-stat">
+      <div class="primary-stat-label">Actions · 24h</div>
+      <div class="primary-stat-value" id="hero-actions">—</div>
+      <div class="primary-stat-trend" id="hero-actions-trend">clicks · visits · reads</div>
     </div>
-    <div class="stat">
-      <div class="stat-label">Unique competitors</div>
-      <div class="stat-value" id="stat-competitors">—</div>
+    <div class="primary-stat">
+      <div class="primary-stat-label">Captchas · 24h</div>
+      <div class="primary-stat-value" id="hero-captchas">—</div>
+      <div class="primary-stat-trend" id="hero-captchas-trend">—</div>
     </div>
-    <div class="stat">
-      <div class="stat-label">Active profiles</div>
-      <div class="stat-value" id="stat-profiles">—</div>
+    <div class="primary-stat">
+      <div class="primary-stat-label">Success rate</div>
+      <div class="primary-stat-value" id="hero-rate">—</div>
+      <div class="primary-stat-trend" id="hero-rate-trend">—</div>
     </div>
-    <div class="stat ov-traffic-card" id="stat-traffic-card"
+  </div>
+
+  <!-- Secondary all-time totals — compact inline statbar -->
+  <div class="dense-statbar">
+    <div class="dense-stat">
+      <div class="dense-stat-label">Total searches</div>
+      <div class="dense-stat-value" id="stat-searches">—</div>
+    </div>
+    <div class="dense-stat">
+      <div class="dense-stat-label">Total ads tracked</div>
+      <div class="dense-stat-value" id="stat-ads">—</div>
+    </div>
+    <div class="dense-stat">
+      <div class="dense-stat-label">Total actions</div>
+      <div class="dense-stat-value" id="stat-actions">—</div>
+      <div class="dense-stat-sub" id="stat-actions-sub">—</div>
+    </div>
+    <div class="dense-stat">
+      <div class="dense-stat-label">Competitors</div>
+      <div class="dense-stat-value" id="stat-competitors">—</div>
+    </div>
+    <div class="dense-stat">
+      <div class="dense-stat-label">Active profiles</div>
+      <div class="dense-stat-value" id="stat-profiles">—</div>
+    </div>
+    <div class="dense-stat dense-stat-clickable" id="stat-traffic-card"
          title="Click to open the Traffic page" role="button" tabindex="0">
-      <div class="stat-label">
-        Traffic (24h)
-        <span class="stat-chip" id="stat-traffic-chip" style="display:none;">
+      <div class="dense-stat-label">
+        Traffic · 24h
+        <span class="dense-stat-chip" id="stat-traffic-chip" style="display:none;">
           ⚠ heavy
         </span>
       </div>
-      <div class="stat-value" id="stat-traffic-bytes">—</div>
-      <div class="stat-sub" id="stat-traffic-sub">— requests</div>
+      <div class="dense-stat-value" id="stat-traffic-bytes">—</div>
+      <div class="dense-stat-sub" id="stat-traffic-sub">— requests</div>
     </div>
   </div>
 
-  <!-- Split: daily chart + recent activity -->
-  <div class="ov-grid">
-    <div class="card">
-      <div class="card-title">Searches (last 7 days)</div>
-      <canvas id="chart-daily" height="120"></canvas>
+  <!-- Two-pane: chart + recent activity -->
+  <div class="overview-grid">
+    <div class="dense-panel">
+      <div class="dense-panel-header">
+        <div class="dense-panel-title">Searches · last 7 days</div>
+      </div>
+      <div class="dense-panel-body">
+        <canvas id="chart-daily" height="110"></canvas>
+      </div>
     </div>
-    <div class="card">
-      <div class="card-title">Recent activity</div>
-      <div class="ov-activity" id="ov-activity">
-        <div class="empty-state" style="padding: 20px 0;">Loading…</div>
+    <div class="dense-panel">
+      <div class="dense-panel-header">
+        <div class="dense-panel-title">Recent activity</div>
+      </div>
+      <div class="dense-panel-body">
+        <div class="ov-activity" id="ov-activity">
+          <div class="dense-empty">Loading…</div>
+        </div>
       </div>
     </div>
   </div>
 
   <!-- Top competitors -->
-  <div class="card">
-    <div class="card-title">
-      Top competitors
-      <span class="badge" id="top-competitors-badge">0</span>
+  <div class="dense-panel">
+    <div class="dense-panel-header">
+      <div class="dense-panel-title">
+        Top competitors
+        <span class="dense-panel-badge" id="top-competitors-badge">0</span>
+      </div>
     </div>
-    <table>
-      <thead>
-        <tr>
-          <th>Domain</th>
-          <th>Ad title</th>
-          <th>Queries matched</th>
-          <th>Last seen</th>
-        </tr>
-      </thead>
-      <tbody id="top-competitors-tbody">
-        <tr><td colspan="4" class="empty-state">Loading…</td></tr>
-      </tbody>
-    </table>
+    <div class="dense-table-wrap">
+      <table class="dense-table">
+        <thead>
+          <tr>
+            <th class="col-domain">Domain</th>
+            <th class="col-title">Ad title</th>
+            <th class="col-queries">Queries matched</th>
+            <th class="col-when">Last seen</th>
+          </tr>
+        </thead>
+        <tbody id="top-competitors-tbody">
+          <tr><td colspan="4" class="dense-empty-cell">Loading…</td></tr>
+        </tbody>
+      </table>
+    </div>
   </div>
 
-  <!-- Health overview for each profile -->
-  <div class="card">
-    <div class="card-title">Profile health</div>
-    <table>
-      <thead>
-        <tr>
-          <th>Profile</th>
-          <th>Template</th>
-          <th>Self-check</th>
-          <th>Searches 24h</th>
-          <th>Captcha rate</th>
-          <th>Status</th>
-        </tr>
-      </thead>
-      <tbody id="profile-health-tbody">
-        <tr><td colspan="6" class="empty-state">Loading…</td></tr>
-      </tbody>
-    </table>
+  <!-- Profile health -->
+  <div class="dense-panel">
+    <div class="dense-panel-header">
+      <div class="dense-panel-title">Profile health</div>
+    </div>
+    <div class="dense-table-wrap">
+      <table class="dense-table">
+        <thead>
+          <tr>
+            <th class="col-profile">Profile</th>
+            <th class="col-template">Template</th>
+            <th class="col-check">Self-check</th>
+            <th class="col-num">Searches 24h</th>
+            <th class="col-num">Captcha rate</th>
+            <th class="col-status">Status</th>
+          </tr>
+        </thead>
+        <tbody id="profile-health-tbody">
+          <tr><td colspan="6" class="dense-empty-cell">Loading…</td></tr>
+        </tbody>
+      </table>
+    </div>
   </div>
 </section>

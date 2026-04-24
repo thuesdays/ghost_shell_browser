@@ -1440,7 +1440,7 @@ def _action_catalog_raw() -> list[dict]:
     return [
         {
             "type": "click_ad",
-            "label": "Click ad (real click on SERP)",
+            "label": "Click on advertisement",
             "description": "Finds the ad anchor, moves mouse along a curve, "
                           "Ctrl+Clicks it to open in new tab. The most "
                           "realistic ad-click signal.",
@@ -1852,13 +1852,937 @@ def _action_catalog_raw() -> list[dict]:
 
 
 def action_catalog() -> list[dict]:
-    """Top-level catalog — wraps _action_catalog_raw() and ensures every
-    entry has a `scope` ('per_ad' | 'loop') set, so the dashboard's
-    script builder can group them properly. Called by the dashboard
-    GET /api/actions/catalog endpoint.
+    """Top-level catalog — wraps _action_catalog_raw() and merges in the
+    unified-runtime actions (if/foreach_ad/catch_ads/save_var/http/
+    extract_text). Ensures every entry has `scope` and `category` so
+    the UI can group them even in legacy scripts.
     """
     catalog = _action_catalog_raw()
     for entry in catalog:
         if "scope" not in entry:
             entry["scope"] = "per_ad"
+        # Back-fill a category for legacy actions so the new palette
+        # grouping works. Mapping is best-guess; entries can override
+        # by setting category in _action_catalog_raw itself.
+        if "category" not in entry:
+            entry["category"] = _default_category_for(entry["type"])
+    # Merge unified-runtime entries (if/foreach_ad/...). Deduplicate by
+    # type — unified catalog wins over legacy if both define the same
+    # action (currently no collisions but future-proof).
+    seen = {e["type"] for e in catalog}
+    for entry in _unified_catalog():
+        if entry["type"] not in seen:
+            catalog.append(entry)
+            seen.add(entry["type"])
     return catalog
+
+
+# ════════════════════════════════════════════════════════════════
+# UNIFIED FLOW RUNTIME
+# ════════════════════════════════════════════════════════════════
+#
+# New single-flow model (supersedes the main_script / post_ad_actions
+# split, though both coexist during migration). Key ideas:
+#
+#   • One ordered list of steps. No scope distinction at runtime.
+#   • Container steps (foreach_ad, if, loop, foreach) have a `steps`
+#     (or then_steps/else_steps) list that recursively runs through
+#     this same engine.
+#   • A RunContext travels through the tree. It carries:
+#       - `ad`      the current ad dict if we're inside foreach_ad
+#       - `ads`     the list of ads from the most recent search / catch
+#       - `item`    loop variable from a foreach
+#       - `vars`    user-saved variables (from save_var / extract_text)
+#       - `flags`   captcha_present, ads_found, etc. computed at runtime
+#       - `browser` / `driver` / `loop_ctx` for actions that need them
+#   • Variables interpolate into any string param via {path} —
+#     `{ad.domain}`, `{var.username}`, `{item}`, `{ads.count}`.
+#   • Conditions evaluate against the context — see _eval_condition.
+#
+# Legacy actions (click_ad, visit, read, etc.) keep working because
+# the unified runner delegates to their existing handlers when it
+# encounters them; only the new types have dedicated unified logic.
+
+
+def _default_category_for(act_type: str) -> str:
+    """Guess a palette category for legacy catalog entries that didn't
+    declare one. Extend as we add new types."""
+    t = (act_type or "").lower()
+    if t in ("if", "foreach_ad", "foreach", "loop", "break", "continue"):
+        return "flow"
+    if t in ("visit_url", "visit", "back", "refresh", "new_tab",
+             "close_tab", "switch_tab", "navigate"):
+        return "navigation"
+    if t in ("click_ad", "click_selector", "type", "press_key", "hover",
+             "scroll", "scroll_to_bottom", "move_random", "fill_form"):
+        return "interaction"
+    if t in ("pause", "dwell", "random_delay", "wait_for", "wait_for_url"):
+        return "timing"
+    if t in ("search_query", "search_all_queries", "catch_ads",
+             "extract_text", "save_var"):
+        return "data"
+    if t in ("http_request", "rotate_ip"):
+        return "external"
+    return "other"
+
+
+class RunContext:
+    """State carried through a unified-flow execution.
+
+    Not a plain dict — having a class lets us:
+      - expose helpers like _resolve_path
+      - keep child scopes (foreach vars) without polluting the parent
+      - snapshot + restore around conditional branches
+
+    Fields that matter to users (can be referenced as {path} in params):
+      ad          current-ad dict  (inside foreach_ad)
+      ads         list of ads from most recent catch/search
+      item        current value of a foreach loop
+      var.<name>  saved via save_var / extract_text
+      run_id, profile_name, query   metadata
+    """
+
+    def __init__(self, browser=None, loop_ctx: dict = None,
+                 parent: "RunContext" = None):
+        self.browser     = browser
+        self.driver      = getattr(browser, "driver", None) if browser else None
+        self.loop_ctx    = loop_ctx or {}
+        self.parent      = parent
+        # Per-run accumulator. Child scopes inherit the SAME vars dict
+        # (variables live for the whole run, not per-loop — otherwise
+        # "save in one step, use in another" wouldn't work across
+        # different containers).
+        self.vars        = parent.vars if parent else {}
+        self.ad          = parent.ad   if parent else None
+        self.ads         = parent.ads  if parent else []
+        self.item        = parent.item if parent else None
+        self.flags       = parent.flags if parent else {}
+        # Metadata (flows into variable resolution as {query}, etc.)
+        ctx = self.loop_ctx
+        self.run_id       = ctx.get("run_id")
+        self.profile_name = ctx.get("profile_name") or "unknown"
+        self.query        = parent.query if parent else ""
+        # Break/continue flags for loops
+        self.should_break    = False
+        self.should_continue = False
+
+    def child(self, **overrides) -> "RunContext":
+        """Create a child scope with overridden values. ad/item/query
+        are the usual ones; other fields inherit."""
+        c = RunContext(browser=self.browser, loop_ctx=self.loop_ctx, parent=self)
+        for k, v in overrides.items():
+            setattr(c, k, v)
+        return c
+
+    def resolve_path(self, path: str):
+        """Resolve a dotted path like 'ad.domain' or 'var.foo.bar' or
+        'ads.count'. Returns None for missing paths (silent — callers
+        decide how to treat None, usually as empty string)."""
+        if not path:
+            return None
+        parts = path.split(".")
+        head = parts[0]
+        rest = parts[1:]
+
+        if head == "ad":
+            root = self.ad or {}
+        elif head == "ads":
+            if rest and rest[0] == "count":
+                return len(self.ads or [])
+            root = self.ads or []
+        elif head == "item":
+            return self.item
+        elif head == "var":
+            if not rest:
+                return None
+            val = self.vars.get(rest[0])
+            for k in rest[1:]:
+                if isinstance(val, dict):
+                    val = val.get(k)
+                else:
+                    return None
+            return val
+        elif head == "query":
+            return self.query
+        elif head == "profile":
+            return self.profile_name
+        elif head == "flag":
+            return self.flags.get(rest[0] if rest else "") if rest else None
+        else:
+            # Unknown root — look in vars as a convenience
+            val = self.vars.get(head)
+            for k in rest:
+                if isinstance(val, dict):
+                    val = val.get(k)
+                else:
+                    return None
+            return val
+
+        # We landed on a dict/list root — dig in
+        val = root
+        for k in rest:
+            if isinstance(val, dict):
+                val = val.get(k)
+            elif isinstance(val, list):
+                try:
+                    val = val[int(k)]
+                except (ValueError, IndexError):
+                    return None
+            else:
+                return None
+        return val
+
+
+# ── Variable interpolation ────────────────────────────────────────
+# Curly-brace templating: "{ad.domain}" → "example.com". Supports
+# dotted paths, falls through as empty string on missing values (with
+# debug log so user can see what resolved).
+#
+# We DON'T do full expression evaluation — just path lookup. If you
+# need math, extract into a save_var step with a computed value.
+
+_VAR_PATTERN = re.compile(r"\{([a-zA-Z_][a-zA-Z0-9_.]*)\}")
+
+
+def _interpolate(value, ctx: RunContext):
+    """Recursively replace {path} references in strings inside a value.
+    Plain numbers / bools / None pass through unchanged. Dicts and lists
+    are walked so params like {"url": "{ad.clean_url}"} work."""
+    if isinstance(value, str):
+        def _sub(m):
+            path = m.group(1)
+            resolved = ctx.resolve_path(path)
+            if resolved is None:
+                return ""
+            return str(resolved)
+        return _VAR_PATTERN.sub(_sub, value)
+    if isinstance(value, dict):
+        return {k: _interpolate(v, ctx) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_interpolate(v, ctx) for v in value]
+    return value
+
+
+# ── Condition evaluation for `if` ─────────────────────────────────
+#
+# A condition is a dict: {"kind": "ad_is_competitor"} or
+# {"kind": "var_equals", "var": "username", "value": "anton"}.
+# Complex conditions combine via and/or/not wrappers.
+#
+# Adding a new kind: add a case here + an entry in
+# CONDITION_KINDS (UI picker metadata).
+
+def _eval_condition(cond: dict, ctx: RunContext) -> bool:
+    if not cond:
+        return True
+    kind = cond.get("kind") or "always"
+    negate = bool(cond.get("negate"))
+
+    result = _eval_condition_raw(kind, cond, ctx)
+    return (not result) if negate else bool(result)
+
+
+def _eval_condition_raw(kind: str, cond: dict, ctx: RunContext) -> bool:
+    if kind == "always":
+        return True
+    if kind == "never":
+        return False
+
+    # Ad-scope predicates (require ctx.ad)
+    if kind == "ad_is_competitor":
+        ad = ctx.ad or {}
+        if not ad.get("domain"):
+            return False
+        if ad.get("is_target"):
+            return False
+        my = {d.lower() for d in (ctx.loop_ctx.get("my_domains") or [])}
+        dom = (ad.get("domain") or "").lower()
+        return not any(dom == d or dom.endswith("." + d) for d in my)
+    if kind == "ad_is_target":
+        return bool((ctx.ad or {}).get("is_target"))
+    if kind == "ad_is_mine":
+        ad = ctx.ad or {}
+        my = {d.lower() for d in (ctx.loop_ctx.get("my_domains") or [])}
+        dom = (ad.get("domain") or "").lower()
+        return any(dom == d or dom.endswith("." + d) for d in my)
+
+    # Ads-list predicates
+    if kind == "ads_found":
+        return len(ctx.ads or []) > 0
+    if kind == "no_ads":
+        return len(ctx.ads or []) == 0
+    if kind == "ads_count_gte":
+        return len(ctx.ads or []) >= int(cond.get("value", 1))
+
+    # Captcha / page state
+    if kind == "captcha_present":
+        return bool(ctx.flags.get("captcha_present"))
+    if kind == "url_contains":
+        try:
+            url = (ctx.driver.current_url or "") if ctx.driver else ""
+        except Exception:
+            url = ""
+        needle = _interpolate(cond.get("value", ""), ctx)
+        return bool(needle) and needle in url
+    if kind == "element_exists":
+        if not ctx.driver:
+            return False
+        sel = _interpolate(cond.get("selector", ""), ctx)
+        if not sel:
+            return False
+        try:
+            from selenium.webdriver.common.by import By
+            return len(ctx.driver.find_elements(By.CSS_SELECTOR, sel)) > 0
+        except Exception:
+            return False
+
+    # Variable predicates — left value comes from a {path}, right is literal
+    if kind == "var_equals":
+        lhs = ctx.resolve_path(cond.get("var") or "")
+        rhs = _interpolate(cond.get("value"), ctx)
+        return str(lhs) == str(rhs)
+    if kind == "var_contains":
+        lhs = str(ctx.resolve_path(cond.get("var") or "") or "")
+        rhs = str(_interpolate(cond.get("value"), ctx) or "")
+        return rhs in lhs
+    if kind == "var_matches":
+        import re as _re
+        lhs = str(ctx.resolve_path(cond.get("var") or "") or "")
+        pattern = str(_interpolate(cond.get("value"), ctx) or "")
+        if not pattern:
+            return False
+        try:
+            return bool(_re.search(pattern, lhs))
+        except _re.error:
+            return False
+    if kind == "var_empty":
+        return not bool(ctx.resolve_path(cond.get("var") or ""))
+
+    # Composite: and / or
+    if kind == "and":
+        return all(_eval_condition(c, ctx) for c in (cond.get("conditions") or []))
+    if kind == "or":
+        return any(_eval_condition(c, ctx) for c in (cond.get("conditions") or []))
+
+    log.warning(f"[run_flow] unknown condition kind: {kind}")
+    return False
+
+
+# ── Unified flow executor ─────────────────────────────────────────
+
+def run_flow(browser, steps: list, loop_ctx: dict = None,
+             context: RunContext = None):
+    """Execute a unified-flow step list. Entry point for the new
+    script format.
+
+    Returns the RunContext so callers can inspect final vars / ads.
+    """
+    ctx = context or RunContext(browser=browser, loop_ctx=loop_ctx or {})
+    _exec_steps(steps or [], ctx)
+    return ctx
+
+
+def _exec_steps(steps: list, ctx: RunContext):
+    """Iterate steps, dispatching each to the right handler. Respects
+    break/continue signals from loops within the list."""
+    for i, raw_step in enumerate(steps, 1):
+        if ctx.should_break or ctx.should_continue:
+            return
+        if not raw_step.get("enabled", True):
+            continue
+        # Probability gate
+        prob = float(raw_step.get("probability", 1.0))
+        if prob < 1.0 and random.random() > prob:
+            log.debug(f"    [flow] skip {raw_step.get('type')} (p={prob:.2f})")
+            continue
+
+        dog = ctx.loop_ctx.get("watchdog")
+        if dog:
+            try: dog.heartbeat()
+            except Exception: pass
+
+        step = _interpolate(raw_step, ctx)
+        _exec_single(step, ctx)
+
+
+def _exec_single(step: dict, ctx: RunContext):
+    act_type = step.get("type") or "unknown"
+
+    # ── Container / flow-control types ────────────────────────
+    if act_type == "if":
+        return _flow_if(step, ctx)
+    if act_type == "foreach_ad":
+        return _flow_foreach_ad(step, ctx)
+    if act_type == "foreach":
+        return _flow_foreach(step, ctx)
+    if act_type == "loop":
+        # Legacy `loop` — same as foreach with item_var convention
+        return _flow_loop_legacy(step, ctx)
+    if act_type == "break":
+        ctx.should_break = True
+        return
+    if act_type == "continue":
+        ctx.should_continue = True
+        return
+
+    # ── Data actions ──────────────────────────────────────────
+    if act_type == "catch_ads":
+        return _flow_catch_ads(step, ctx)
+    if act_type == "search_query":
+        return _flow_search_query(step, ctx)
+    if act_type == "save_var":
+        return _flow_save_var(step, ctx)
+    if act_type == "extract_text":
+        return _flow_extract_text(step, ctx)
+
+    # ── External ──────────────────────────────────────────────
+    if act_type == "http_request":
+        return _flow_http_request(step, ctx)
+    if act_type == "rotate_ip":
+        return _flow_rotate_ip(step, ctx)
+
+    # ── Navigation & interaction: delegate to legacy handlers ─
+    # These already accept (driver, action, ctx_dict); we adapt
+    # the RunContext to the dict shape they expect.
+    legacy_ctx = _legacy_ctx_from(ctx, step)
+    legacy_handler = ACTION_HANDLERS.get(act_type)
+    if legacy_handler is not None:
+        # Pre-flight for per-ad-only actions: require ctx.ad
+        if act_type in ("click_ad",) and not ctx.ad:
+            log.warning(f"  [flow] {act_type} needs an ad in context — "
+                        f"wrap in foreach_ad or run after search_query")
+            return
+        try:
+            legacy_handler(ctx.driver, step, legacy_ctx)
+        except Exception as e:
+            log.warning(f"  [flow] {act_type} errored: "
+                        f"{type(e).__name__}: {e}")
+            if step.get("abort_on_error"):
+                raise
+        return
+
+    # Loop-level legacy handlers (pause, visit_url, refresh, etc.)
+    loop_handler = LOOP_ACTION_HANDLERS.get(act_type)
+    if loop_handler is not None:
+        try:
+            loop_handler(ctx.browser, step, ctx.loop_ctx)
+        except Exception as e:
+            log.warning(f"  [flow] {act_type} errored: "
+                        f"{type(e).__name__}: {e}")
+            if step.get("abort_on_error"):
+                raise
+        return
+
+    log.warning(f"  [flow] unknown action type: {act_type}")
+
+
+def _legacy_ctx_from(ctx: RunContext, step: dict) -> dict:
+    """Shape a dict that legacy per-ad handlers expect. They read
+    ctx['ad'], ctx['my_domains'], ctx['query'] etc."""
+    return {
+        "ad":           ctx.ad or {},
+        "ads":          ctx.ads,
+        "my_domains":   ctx.loop_ctx.get("my_domains") or [],
+        "target_domains": ctx.loop_ctx.get("target_domains") or [],
+        "run_id":       ctx.run_id,
+        "profile_name": ctx.profile_name,
+        "query":        ctx.query,
+        "item":         ctx.item,
+        "vars":         ctx.vars,
+    }
+
+
+# ── if ─────────────────────────────────────────────────────────────
+
+def _flow_if(step: dict, ctx: RunContext):
+    cond = step.get("condition") or {}
+    if _eval_condition(cond, ctx):
+        _exec_steps(step.get("then_steps") or [], ctx)
+    else:
+        _exec_steps(step.get("else_steps") or [], ctx)
+
+
+# ── foreach_ad ─────────────────────────────────────────────────────
+
+def _flow_foreach_ad(step: dict, ctx: RunContext):
+    """Iterate ctx.ads, run nested steps with ctx.ad = current ad.
+    Respects break/continue within iterations."""
+    ads = list(ctx.ads or [])
+    if not ads:
+        log.info(f"  [foreach_ad] skipped — no ads in context")
+        return
+    inner = step.get("steps") or []
+    shuffle = bool(step.get("shuffle", False))
+    if shuffle:
+        random.shuffle(ads)
+    limit = step.get("limit")
+    if limit:
+        try: ads = ads[:int(limit)]
+        except (TypeError, ValueError): pass
+
+    log.info(f"  [foreach_ad] {len(ads)} ad(s)")
+    for i, ad in enumerate(ads, 1):
+        if ctx.should_break:
+            break
+        log.info(f"    [ad {i}/{len(ads)}] {ad.get('domain', '?')}")
+        child = ctx.child(ad=ad)
+        _exec_steps(inner, child)
+        # Reset `continue` flag after the iteration that raised it
+        child.should_continue = False
+        if child.should_break:
+            ctx.should_break = True
+            break
+
+
+# ── generic foreach ────────────────────────────────────────────────
+
+def _flow_foreach(step: dict, ctx: RunContext):
+    """Iterate a custom list. `items` param is a list or a string
+    reference like '{var.product_urls}'."""
+    raw_items = step.get("items")
+    if isinstance(raw_items, str):
+        # Resolve a path reference like "{var.urls}"
+        m = _VAR_PATTERN.match(raw_items.strip())
+        if m:
+            raw_items = ctx.resolve_path(m.group(1))
+    if not isinstance(raw_items, list):
+        # Textlist param — newline separated
+        if isinstance(raw_items, str):
+            raw_items = [line.strip() for line in raw_items.splitlines()
+                         if line.strip()]
+        else:
+            raw_items = []
+    if not raw_items:
+        return
+    if step.get("shuffle", False):
+        random.shuffle(raw_items)
+    item_var = step.get("item_var", "item")
+
+    log.info(f"  [foreach] {len(raw_items)} item(s)")
+    for i, item in enumerate(raw_items, 1):
+        if ctx.should_break:
+            break
+        child = ctx.child(item=item)
+        # Also make the item available under its custom var name, so
+        # users can pick a meaningful label (item_var="query" → {query}).
+        if item_var and item_var != "item":
+            child.vars[item_var] = item
+        log.info(f"    [item {i}/{len(raw_items)}] {str(item)[:60]}")
+        _exec_steps(step.get("steps") or [], child)
+        child.should_continue = False
+        if child.should_break:
+            ctx.should_break = True
+            break
+
+
+def _flow_loop_legacy(step: dict, ctx: RunContext):
+    """Back-compat shim: old `loop` action had slightly different
+    param shape. Normalize to foreach."""
+    return _flow_foreach(step, ctx)
+
+
+# ── catch_ads ──────────────────────────────────────────────────────
+
+def _flow_catch_ads(step: dict, ctx: RunContext):
+    """Parse ads on the current page into ctx.ads. Separate from
+    search_query so users can visit a page manually, then collect
+    whatever ads happen to be there."""
+    try:
+        from main import parse_ads
+    except ImportError:
+        log.warning("  [catch_ads] main.parse_ads not available")
+        return
+    query = step.get("query") or ctx.query or ""
+    ads = parse_ads(ctx.driver, query) or []
+    ctx.ads = ads
+    ctx.flags["ads_found"] = len(ads) > 0
+    log.info(f"  [catch_ads] collected {len(ads)} ad(s)")
+
+
+# ── search_query (unified wrapper) ────────────────────────────────
+
+def _flow_search_query(step: dict, ctx: RunContext):
+    """Unified search_query — calls the loop_ctx's search callback
+    (which does Google navigation + parse) and stores results in
+    ctx.ads. Previously this also ran the per-ad pipeline automatically
+    — in the new model, the user chains a `foreach_ad` step themselves
+    to make that explicit."""
+    q = (step.get("query") or "").strip()
+    if not q:
+        log.warning("  [search_query] empty query, skipping")
+        return
+    search_fn = ctx.loop_ctx.get("search_query")
+    if not search_fn:
+        log.warning("  [search_query] no runner in loop_ctx")
+        return
+    log.info(f"  [search_query] {q!r}")
+    ctx.query = q
+    ads = search_fn(q) or []
+    ctx.ads = ads
+    ctx.flags["ads_found"] = len(ads) > 0
+
+    # Back-compat: if the step has `auto_foreach` (legacy behavior),
+    # also run the per_ad_runner for each ad right here. The migration
+    # logic sets auto_foreach=False; fresh scripts should use an
+    # explicit foreach_ad wrapper.
+    if step.get("auto_foreach"):
+        per_ad = ctx.loop_ctx.get("per_ad_runner")
+        if per_ad and ads:
+            for ad in ads:
+                per_ad(ad, q)
+
+
+# ── save_var ───────────────────────────────────────────────────────
+
+def _flow_save_var(step: dict, ctx: RunContext):
+    """Save a literal or computed value into ctx.vars[name]. Useful
+    for counters, flags, or pre-computed paths that downstream steps
+    reference via {var.name}."""
+    name = step.get("name")
+    if not name:
+        log.warning("  [save_var] missing `name`")
+        return
+    # `value` is interpolated already by _exec_steps, so {ad.domain}
+    # and friends resolve before we store them.
+    ctx.vars[name] = step.get("value")
+    log.info(f"  [save_var] {name} = {str(ctx.vars[name])[:80]!r}")
+
+
+# ── extract_text ───────────────────────────────────────────────────
+
+def _flow_extract_text(step: dict, ctx: RunContext):
+    """Run a CSS selector, take .textContent of the first (or all)
+    matching element(s), save into ctx.vars under `save_as`."""
+    if not ctx.driver:
+        return
+    sel = step.get("selector") or ""
+    if not sel:
+        log.warning("  [extract_text] missing selector")
+        return
+    save_as = step.get("save_as") or "extracted"
+    multi   = bool(step.get("all"))
+    try:
+        from selenium.webdriver.common.by import By
+        if multi:
+            els = ctx.driver.find_elements(By.CSS_SELECTOR, sel)
+            val = [e.text for e in els]
+        else:
+            el = ctx.driver.find_element(By.CSS_SELECTOR, sel)
+            val = el.text
+    except Exception as e:
+        log.warning(f"  [extract_text] {sel!r}: {e}")
+        val = "" if not multi else []
+    ctx.vars[save_as] = val
+    shown = str(val)[:80] if isinstance(val, str) else f"list({len(val)})"
+    log.info(f"  [extract_text] {save_as} = {shown}")
+
+
+# ── http_request ───────────────────────────────────────────────────
+
+def _flow_http_request(step: dict, ctx: RunContext):
+    """Fire a plain-HTTP request (NOT through the browser). Typical
+    use: fire a webhook when something interesting happens.
+
+    Goes DIRECT (not through the user's proxy) so the webhook target
+    sees your actual server IP, not the rotating residential. That's
+    usually what you want for webhooks — change later if you need
+    proxy routing.
+    """
+    try:
+        import requests
+    except ImportError:
+        log.warning("  [http_request] requests library not installed")
+        return
+
+    method = (step.get("method") or "GET").upper()
+    url    = step.get("url") or ""
+    if not url:
+        log.warning("  [http_request] missing url")
+        return
+    headers = step.get("headers") or {}
+    # Body can be a dict (auto-JSON) or a raw string
+    body = step.get("body")
+    timeout = float(step.get("timeout", 15))
+    save_as = step.get("save_as")
+
+    try:
+        kwargs = {"headers": headers, "timeout": timeout}
+        if isinstance(body, dict):
+            kwargs["json"] = body
+        elif body is not None:
+            kwargs["data"] = body
+
+        resp = requests.request(method, url, **kwargs)
+        log.info(f"  [http_request] {method} {url[:60]} → {resp.status_code}")
+
+        if save_as:
+            # Try JSON first, fall back to text
+            try:
+                ctx.vars[save_as] = resp.json()
+            except Exception:
+                ctx.vars[save_as] = {
+                    "status": resp.status_code,
+                    "text":   resp.text[:10000],   # cap at 10 KB
+                }
+    except Exception as e:
+        log.warning(f"  [http_request] {type(e).__name__}: {e}")
+        if step.get("abort_on_error"):
+            raise
+
+
+# ── rotate_ip (thin wrapper) ──────────────────────────────────────
+
+def _flow_rotate_ip(step: dict, ctx: RunContext):
+    rotate = ctx.loop_ctx.get("rotate_ip")
+    if not rotate:
+        log.debug("  [rotate_ip] no rotate callback in loop_ctx")
+        return
+    try:
+        new_ip = rotate()
+        if new_ip:
+            log.info(f"  [rotate_ip] now on {new_ip}")
+            ctx.vars["last_rotated_ip"] = new_ip
+    except Exception as e:
+        log.warning(f"  [rotate_ip] {type(e).__name__}: {e}")
+    # Optional pause after
+    wait = float(step.get("wait_after_sec", 0))
+    if wait > 0:
+        time.sleep(wait)
+
+
+# ════════════════════════════════════════════════════════════════
+# UNIFIED CATALOG — metadata for the new action types
+# ════════════════════════════════════════════════════════════════
+
+# Condition kinds exposed to the UI. Each entry knows which params
+# the condition needs; the Scripts inspector renders a picker based
+# on this. Keep labels short — they render inline in step summaries.
+CONDITION_KINDS = [
+    {"kind": "always",           "label": "Always run",
+     "group": "simple"},
+    {"kind": "ads_found",        "label": "Ads were found",
+     "group": "ads"},
+    {"kind": "no_ads",           "label": "No ads found",
+     "group": "ads"},
+    {"kind": "ads_count_gte",    "label": "Ads count ≥ N",
+     "group": "ads", "fields": [
+         {"name": "value", "type": "number", "default": 2,
+          "label": "Minimum count"}
+     ]},
+    {"kind": "ad_is_competitor", "label": "Ad is competitor",
+     "group": "ads", "needs_ad": True},
+    {"kind": "ad_is_target",     "label": "Ad is target-domain",
+     "group": "ads", "needs_ad": True},
+    {"kind": "ad_is_mine",       "label": "Ad is my-domain",
+     "group": "ads", "needs_ad": True},
+    {"kind": "captcha_present",  "label": "Captcha on page",
+     "group": "page"},
+    {"kind": "url_contains",     "label": "URL contains…",
+     "group": "page", "fields": [
+         {"name": "value", "type": "text",
+          "placeholder": "/checkout", "label": "Substring"}
+     ]},
+    {"kind": "element_exists",   "label": "Element exists (CSS)",
+     "group": "page", "fields": [
+         {"name": "selector", "type": "text",
+          "placeholder": ".product-card", "label": "Selector"}
+     ]},
+    {"kind": "var_equals",       "label": "Variable equals…",
+     "group": "vars", "fields": [
+         {"name": "var",   "type": "text", "placeholder": "var.username"},
+         {"name": "value", "type": "text", "placeholder": "anton"},
+     ]},
+    {"kind": "var_contains",     "label": "Variable contains…",
+     "group": "vars", "fields": [
+         {"name": "var",   "type": "text", "placeholder": "var.response.text"},
+         {"name": "value", "type": "text", "placeholder": "success"},
+     ]},
+    {"kind": "var_matches",      "label": "Variable matches regex",
+     "group": "vars", "fields": [
+         {"name": "var",   "type": "text", "placeholder": "var.email"},
+         {"name": "value", "type": "text", "placeholder": r"^[\w.]+@"},
+     ]},
+    {"kind": "var_empty",        "label": "Variable is empty",
+     "group": "vars", "fields": [
+         {"name": "var", "type": "text", "placeholder": "var.result"}
+     ]},
+]
+
+
+def _unified_catalog() -> list[dict]:
+    """Catalog entries for the new unified-flow actions. Merged into
+    the main action_catalog() result. Every entry has `category` so
+    the redesigned palette can group by function rather than scope."""
+    return [
+        # ── FLOW CONTROL ─────────────────────────────────────
+        {
+            "type":        "if",
+            "label":       "If / Else",
+            "category":    "flow",
+            "scope":       "any",
+            "description": "Conditional branching. Runs then-steps when "
+                           "the condition is true, else-steps otherwise. "
+                           "Conditions include ad/page/variable predicates.",
+            "is_container": True,
+            "params": [
+                {"name": "condition", "type": "condition",
+                 "default": {"kind": "always"},
+                 "label": "Condition",
+                 "hint": "Choose a predicate. Everything inside will run "
+                         "only when it evaluates to true."},
+                {"name": "then_steps", "type": "steps", "default": [],
+                 "label": "Then (do these steps)"},
+                {"name": "else_steps", "type": "steps", "default": [],
+                 "label": "Else (optional — when condition is false)"},
+            ],
+        },
+        {
+            "type":        "foreach_ad",
+            "label":       "For each advertisement",
+            "category":    "flow",
+            "scope":       "any",
+            "description": "Iterate ads captured by the most recent "
+                           "search_query or catch_ads. Nested steps see "
+                           "the current ad via {ad.domain}, {ad.title}, "
+                           "{ad.clean_url}.",
+            "is_container": True,
+            "params": [
+                {"name": "shuffle", "type": "bool", "default": False,
+                 "label": "Shuffle order",
+                 "hint": "Randomize the iteration order. Useful to not "
+                         "always click the #1 ad first."},
+                {"name": "limit",   "type": "number", "default": "",
+                 "label": "Limit", "placeholder": "all",
+                 "hint": "Cap on how many ads to process. Leave blank "
+                         "for all."},
+                {"name": "steps", "type": "steps", "default": [],
+                 "label": "Steps (run once per ad)"},
+            ],
+        },
+        {
+            "type":        "foreach",
+            "label":       "For each item",
+            "category":    "flow",
+            "scope":       "any",
+            "description": "Iterate a custom list (one per line, or a "
+                           "{var.xxx} reference). Inside, use {item} — or "
+                           "set a custom name in the inspector.",
+            "is_container": True,
+            "params": [
+                {"name": "items",    "type": "textlist", "default": "",
+                 "label": "Items (one per line)",
+                 "hint": "Or reference a variable: {var.product_urls}"},
+                {"name": "item_var", "type": "text", "default": "item",
+                 "label": "Variable name",
+                 "hint": "Use as {item} or {your_name}."},
+                {"name": "shuffle",  "type": "bool", "default": True,
+                 "label": "Shuffle order"},
+                {"name": "steps",    "type": "steps", "default": [],
+                 "label": "Steps"},
+            ],
+        },
+        {
+            "type":        "break",
+            "label":       "Break loop",
+            "category":    "flow",
+            "scope":       "any",
+            "description": "Stop the innermost foreach/loop immediately. "
+                           "Use inside an if to bail out conditionally.",
+            "params": [],
+        },
+        {
+            "type":        "continue",
+            "label":       "Skip to next iteration",
+            "category":    "flow",
+            "scope":       "any",
+            "description": "Jump to the next iteration of the innermost "
+                           "loop, skipping remaining steps.",
+            "params": [],
+        },
+
+        # ── DATA ──────────────────────────────────────────────
+        {
+            "type":        "catch_ads",
+            "label":       "Catch ads on current page",
+            "category":    "data",
+            "scope":       "any",
+            "description": "Parse ads on whatever page we're on, save "
+                           "them to the context as `ads`. Doesn't search "
+                           "Google — use after visit_url on any SERP "
+                           "or ad-containing page.",
+            "params": [
+                {"name": "query", "type": "text", "default": "",
+                 "label": "Query label (for stats)",
+                 "hint": "Optional — what to record in the DB as the "
+                         "query this run. Leave blank to keep the "
+                         "current query context."},
+            ],
+        },
+        {
+            "type":        "save_var",
+            "label":       "Save variable",
+            "category":    "data",
+            "scope":       "any",
+            "description": "Save a value (literal or interpolated) to "
+                           "a named variable. Read it later as {var.name}.",
+            "params": [
+                {"name": "name",  "type": "text", "required": True,
+                 "label": "Variable name",
+                 "placeholder": "counter"},
+                {"name": "value", "type": "text", "default": "",
+                 "label": "Value",
+                 "hint": "Can reference other variables: "
+                         "'{ad.domain} at {query}'"},
+            ],
+        },
+        {
+            "type":        "extract_text",
+            "label":       "Extract text from element",
+            "category":    "data",
+            "scope":       "any",
+            "description": "Run a CSS selector and save the element's "
+                           "text content to a variable.",
+            "params": [
+                {"name": "selector", "type": "text", "required": True,
+                 "label": "CSS selector",
+                 "placeholder": ".price-tag"},
+                {"name": "save_as",  "type": "text", "default": "extracted",
+                 "label": "Save as",
+                 "hint": "Access later as {var.<name>}"},
+                {"name": "all", "type": "bool", "default": False,
+                 "label": "All matches",
+                 "hint": "When on: saves a list of strings. "
+                         "When off: saves only the first match."},
+            ],
+        },
+
+        # ── EXTERNAL ─────────────────────────────────────────
+        {
+            "type":        "http_request",
+            "label":       "HTTP request (webhook)",
+            "category":    "external",
+            "scope":       "any",
+            "description": "Fire a HTTP request — typical use is a "
+                           "webhook to notify your Slack/Discord/etc. "
+                           "Does NOT route through the browser's proxy.",
+            "params": [
+                {"name": "method", "type": "select", "default": "POST",
+                 "options": ["GET", "POST", "PUT", "DELETE"],
+                 "label": "Method"},
+                {"name": "url", "type": "text", "required": True,
+                 "label": "URL",
+                 "placeholder": "https://hooks.slack.com/services/..."},
+                {"name": "body", "type": "textarea", "default": "",
+                 "label": "Body (JSON)",
+                 "hint": 'Plain text or JSON like {"text": "ad clicked: '
+                         '{ad.domain}"}. Variables interpolate.'},
+                {"name": "save_as", "type": "text", "default": "",
+                 "label": "Save response as",
+                 "hint": "Optional. The response JSON (or text) lands "
+                         "in var.<save_as>."},
+                {"name": "timeout", "type": "number", "default": 15,
+                 "label": "Timeout (s)"},
+            ],
+        },
+    ]
+

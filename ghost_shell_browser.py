@@ -882,7 +882,12 @@ class GhostShellBrowser:
         # phase sensitivity. Both bg threads can safely poll without
         # racing the main thread's fragile init operations.
 
-        # Traffic collector — bytes per domain via PerformanceObserver
+        # Traffic collector — bytes per domain, via two data sources:
+        #   (a) ProxyForwarder's per-host byte counters — authoritative,
+        #       100% accurate for billed bytes (what asocks charges us)
+        #   (b) Chrome PerformanceObserver — fills in request counts
+        #       for cache-hit resources that never touched the proxy
+        # The collector merges these on each flush.
         try:
             from db import get_db as _get_db
             _db = _get_db()
@@ -896,6 +901,7 @@ class GhostShellBrowser:
                     flush_interval_sec = int(
                         _db.config_get("traffic.flush_interval_sec") or 30
                     ),
+                    proxy_forwarder    = self._proxy_forwarder,
                 )
                 self._traffic_collector.start()
         except Exception as e:

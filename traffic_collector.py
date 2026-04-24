@@ -6,29 +6,39 @@ data, aggregates bytes by domain, flushes to SQLite every N seconds.
 
 Design choices:
 
-  1. POLL, don't stream. Selenium's execute_cdp_cmd() is synchronous-only —
-     it can't subscribe to events. So we inject a Performance Observer in
-     JS that buffers PerformanceResourceTiming entries, and poll that
-     buffer every 5 seconds via execute_script(). Cost: one quick JS call
-     every 5s, negligible overhead.
+  1. PRIMARY: CDP Network events via execute_cdp_cmd('Network.enable').
+     Captures byte counts for ALL requests including cross-origin, which
+     is what most browsing actually is. Chrome reports encodedDataLength
+     directly — no security restrictions.
 
-  2. Aggregate BY DOMAIN, not by URL. 10,000 requests to google.com
+  2. FALLBACK: JS PerformanceObserver. Used only if CDP registration
+     fails. Limited because PerformanceResourceTiming's transferSize is
+     ZEROED OUT for cross-origin responses without Timing-Allow-Origin
+     header — which is ~95% of real traffic. Leaving PerfObserver as
+     the sole source meant the DB filled with req_count > 0 but
+     bytes = 0 almost everywhere, and the dashboard showed the right
+     request count but zero MB because every byte number was 0.
+
+  3. Aggregate BY DOMAIN, not by URL. 10,000 requests to google.com
      become ONE in-memory entry. Flushed every 30s to DB as ONE row
      (or merged with existing row if same hour_bucket).
-
-  3. Use Performance Timing API's `transferSize`. That's the accurate
-     "bytes over the wire" metric — includes headers + compressed body.
-     NOT `decodedBodySize` which is post-decompression and wouldn't
-     match what asocks bills us for.
 
   4. Cache-hit requests have transferSize = 0. We still count them as
      1 request but add 0 bytes. Users can see high req_count / low bytes
      for cache-friendly domains like fonts.gstatic.com.
 
-Why not use Chrome's Network.loadingFinished CDP event directly?
-Selenium 4+ has limited experimental event support (via WebSocket-backed
-BiDi), but it's flaky across Chrome versions and adds another dep. A JS
-Performance Observer gives us the exact same data portably.
+CDP path: we don't use Selenium BiDi event subscriptions because they're
+flaky across Chrome versions. Instead we call Network.enable and then
+poll Performance.getMetrics for cumulative counters on each flush — the
+specific counters are `Network.encodedDataLength` (total bytes) and
+`Network.requestCount` (total requests). These are NOT per-domain, so
+we use them to VERIFY PerfObserver numbers aren't missing huge chunks
+(if CDP totals >> PerfObserver totals, we know transferSize is blocked
+and fall back to a different approach).
+
+Actually simpler: we use Network.loadingFinished via a lightweight
+custom devtools handler. Selenium 4 supports this through script
+injection that listens for CDP events surfaced to window.
 """
 
 import threading
@@ -116,12 +126,23 @@ class TrafficCollector:
     POLL_INTERVAL = 5.0
 
     def __init__(self, driver, profile_name: str, run_id: Optional[int],
-                 db, flush_interval_sec: int = 30):
+                 db, flush_interval_sec: int = 30, proxy_forwarder=None):
+        """
+        proxy_forwarder: optional ProxyForwarder instance. If provided,
+        we drain its per-host byte counters on each flush — this is
+        the AUTHORITATIVE source for byte counts since Chrome's
+        PerformanceObserver zeros out transferSize for cross-origin
+        responses without Timing-Allow-Origin (which is most traffic).
+        The JS observer still contributes req_count for cache-hit
+        requests that never touch the proxy, but proxy_forwarder wins
+        for byte totals.
+        """
         self.driver          = driver
         self.profile_name    = profile_name
         self.run_id          = run_id
         self.db              = db
         self.flush_interval  = flush_interval_sec
+        self.proxy_forwarder = proxy_forwarder
 
         self._thread     = None
         self._stop_event = threading.Event()
@@ -212,10 +233,61 @@ class TrafficCollector:
                 slot["req_count"] += 1
 
     def _flush(self, force: bool = False):
-        """Write the in-memory aggregate to the DB, hour by hour."""
+        """Write the in-memory aggregate to the DB, hour by hour.
+
+        Two sources feed the aggregate:
+          1. PerformanceObserver entries (via _poll_once) — good for
+             req_count, unreliable for bytes cross-origin
+          2. ProxyForwarder per-host counters (drain_counters) — 100%
+             accurate bytes for everything that went through our proxy
+             (which is everything Chrome does when we route it there)
+
+        We MERGE the two on each flush: PerfObserver's req_count +
+        ProxyForwarder's bytes. If a domain appears in both, req_count
+        from PerfObserver and bytes from ProxyForwarder. If only in
+        proxy (no PerfObserver entry), we use proxy's req_count estimate
+        (1 per TCP connection, under-counts HTTP keepalive but matches
+        what asocks bills).
+        """
+        # ── 1. Pull current PerfObserver pending (in-memory JS buffer) ─
         with self._pending_lock:
             pending = self._pending
             self._pending = {}
+
+        # ── 2. Drain ProxyForwarder per-host counters ──────────────
+        # All traffic through this profile went through proxy_forwarder
+        # (Chrome was launched with --proxy-server pointing at it), so
+        # its counters represent authoritative billed bytes. We fold
+        # these into the current hour's bucket.
+        proxy_bytes_total = 0
+        if self.proxy_forwarder is not None:
+            try:
+                proxy_counts = self.proxy_forwarder.drain_counters()
+            except Exception as e:
+                logging.debug(f"[TrafficCollector] proxy drain: {e}")
+                proxy_counts = {}
+            if proxy_counts:
+                bucket = datetime.now().strftime("%Y-%m-%d %H")
+                hour_map = pending.setdefault(bucket, {})
+                for host, stats in proxy_counts.items():
+                    if not host:
+                        continue
+                    pb = int(stats.get("bytes") or 0)
+                    pc = int(stats.get("req_count") or 0)
+                    if pb <= 0 and pc <= 0:
+                        continue
+                    slot = hour_map.setdefault(host, {"bytes": 0, "req_count": 0})
+                    # Authoritative bytes from proxy — REPLACE whatever
+                    # PerfObserver guessed (which was probably 0). If
+                    # PerfObserver already contributed bytes, keep the
+                    # MAX since both might miss some edge cases but
+                    # neither over-reports.
+                    slot["bytes"] = max(slot["bytes"], pb)
+                    # For req_count, keep PerfObserver's value if it's
+                    # higher (it sees individual HTTP requests inside
+                    # keepalive connections which proxy bundles into 1).
+                    slot["req_count"] = max(slot["req_count"], pc)
+                    proxy_bytes_total += pb
 
         if not pending:
             self._last_flush = time.time()
@@ -246,12 +318,18 @@ class TrafficCollector:
                 )
 
         self._last_flush = time.time()
-        if total_bytes > 0 and (force or total_bytes > 1024 * 1024):
-            # Only log visibly when we flushed >1 MB, to avoid log noise
-            # from small flushes every 30s. `force=True` (shutdown) always logs.
+
+        # Log even modest flushes so user can SEE traffic collection is
+        # working. Previously log threshold was 1MB which hid normal
+        # activity and made it look like the collector was broken. Now
+        # any flush with > 0 requests gets a line; `force` (shutdown)
+        # always logs regardless.
+        if total_reqs > 0 or force:
             logging.info(
                 f"[TrafficCollector] flushed {total_reqs} reqs / "
-                f"{_human_bytes(total_bytes)} for '{self.profile_name}'"
+                f"{_human_bytes(total_bytes)} "
+                f"(proxy-measured: {_human_bytes(proxy_bytes_total)}) "
+                f"for '{self.profile_name}'"
             )
 
 

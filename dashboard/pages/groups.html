@@ -1,25 +1,21 @@
-<section>
+<section class="groups-workspace">
   <div class="page-header">
     <div>
       <div class="page-title">Profile groups</div>
       <div class="page-subtitle">
-        Batch-run many profiles at once. Useful for Facebook multi-account,
-        Twitter campaigns, crypto account rotations. Each member runs in
-        its own isolated Chrome with its own proxy.
+        Batch-run many profiles at once. Each member runs in its own
+        isolated Chrome with its own proxy.
       </div>
     </div>
-    <div style="display: flex; gap: 8px;">
-      <button class="btn btn-primary" id="btn-create-group">
-        <span>✨</span> Create group
-      </button>
+    <div class="groups-header-actions">
       <button class="btn btn-secondary" id="btn-reload-groups">↻ Reload</button>
+      <button class="btn btn-primary" id="btn-create-group">+ Create group</button>
     </div>
   </div>
 
-  <div class="card">
-    <div id="groups-list" class="groups-list">
-      <!-- populated by JS -->
-    </div>
+  <!-- Groups list — JS populates with .group-card nodes -->
+  <div class="groups-panel">
+    <div id="groups-list" class="groups-list"></div>
   </div>
 </section>
 
@@ -56,9 +52,7 @@
       </div>
       <div class="form-group">
         <label class="form-label">Members</label>
-        <div id="group-members-picker" class="group-members-picker">
-          <!-- populated by JS -->
-        </div>
+        <div id="group-members-picker" class="group-members-picker"></div>
         <div class="form-hint">
           Tick profiles to include in this group. Same profile can be in
           many groups (e.g. "All Facebook" + "US East").

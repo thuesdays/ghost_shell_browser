@@ -1,371 +1,302 @@
-<section>
+<section class="proxy-workspace">
   <div class="page-header">
     <div>
-      <div class="page-title">Proxy</div>
-      <div class="page-subtitle">Connection settings, live diagnostics and IP tracking</div>
+      <div class="page-title">Proxies</div>
+      <div class="page-subtitle">
+        Proxy library. Each profile picks one — runtime routes through
+        the assigned proxy. Click a row to test or edit.
+      </div>
+    </div>
+    <div class="proxy-header-actions">
+      <button class="btn btn-secondary" id="proxy-bulk-import-btn"
+              title="Paste many URLs at once">📋 Bulk import</button>
+      <button class="btn btn-secondary" id="proxy-test-all-btn"
+              title="Probe every proxy and refresh statuses">🔬 Test all</button>
+      <button class="btn btn-primary" id="proxy-add-btn">+ Add proxy</button>
     </div>
   </div>
 
-  <!-- ─── LIVE DIAGNOSTICS ─────────────────────────────────────── -->
-  <div class="card">
-    <div class="card-title">🛰  Live proxy diagnostics</div>
-
-    <div id="rotation-missing-banner" class="banner banner-warn" style="display: none; margin-bottom: 14px;">
-      ⚠ <strong>Rotation API is not configured.</strong>
-      The ⚡ Rotate IP button below, Auto-rotate on start, and
-      <code>rotate_ip</code> script steps will have no effect until you
-      set up rotation in the <a href="#" data-scroll-target="rotation-status-chip" class="banner-link">Rotation API card below</a>.
-    </div>
-
-    <div class="proxy-live" id="proxy-live-panel">
-      <div class="proxy-live-header">
-        <div>
-          <div class="proxy-live-label">Current exit IP</div>
-          <div class="proxy-live-ip" id="proxy-live-ip">—</div>
-        </div>
-        <div class="proxy-live-actions">
-          <button class="btn btn-secondary" id="btn-refresh-ip">🔄 Refresh</button>
-          <button class="btn btn-primary"   id="btn-rotate-ip">⚡ Rotate IP</button>
-        </div>
-      </div>
-
-      <div class="proxy-live-grid">
-        <div class="proxy-live-cell">
-          <div class="proxy-live-cell-label">Country</div>
-          <div class="proxy-live-cell-value" id="proxy-live-country">—</div>
-        </div>
-        <div class="proxy-live-cell">
-          <div class="proxy-live-cell-label">City</div>
-          <div class="proxy-live-cell-value" id="proxy-live-city">—</div>
-        </div>
-        <div class="proxy-live-cell">
-          <div class="proxy-live-cell-label">Timezone</div>
-          <div class="proxy-live-cell-value" id="proxy-live-tz">—</div>
-        </div>
-        <div class="proxy-live-cell">
-          <div class="proxy-live-cell-label">ASN / Provider</div>
-          <div class="proxy-live-cell-value" id="proxy-live-asn">—</div>
-        </div>
-        <div class="proxy-live-cell">
-          <div class="proxy-live-cell-label">IP type</div>
-          <div class="proxy-live-cell-value" id="proxy-live-iptype">—</div>
-        </div>
-        <div class="proxy-live-cell">
-          <div class="proxy-live-cell-label">Detection risk</div>
-          <div class="proxy-live-cell-value" id="proxy-live-risk">—</div>
-        </div>
-      </div>
-
-      <div class="proxy-live-checks">
-        <div class="proxy-live-check" id="check-geo">
-          <span class="check-icon">○</span>
-          <span>Geo match (expected <span id="expected-country">Ukraine</span>)</span>
-        </div>
-        <div class="proxy-live-check" id="check-tz">
-          <span class="check-icon">○</span>
-          <span>Timezone match (expected <span id="expected-tz">Europe/Kyiv</span>)</span>
-        </div>
-      </div>
-    </div>
-
-    <!-- Rotation test -->
-    <div class="proxy-rotation-test">
-      <div class="proxy-rotation-header">
-        <div class="proxy-rotation-title">Rotation test</div>
-        <div class="proxy-rotation-controls">
-          <label class="form-label" for="rotation-count" style="margin: 0; color: var(--text-2);">
-            Requests:
-          </label>
-          <select id="rotation-count" class="select" style="width: 80px;">
-            <option value="5">5</option>
-            <option value="10" selected>10</option>
-            <option value="20">20</option>
-            <option value="30">30</option>
-          </select>
-          <button class="btn btn-secondary" id="btn-rotation-test">🧪 Run test</button>
-        </div>
-      </div>
-      <div class="form-hint" style="margin-top: 0;">
-        Runs N requests through the proxy and shows each exit. Use this to
-        verify the country filter actually works as configured.
-      </div>
-      <div id="rotation-test-results"></div>
+  <!-- ── Search + counter toolbar ────────────────────────────── -->
+  <div class="proxy-toolbar">
+    <input type="text" id="proxy-search" class="input proxy-search"
+           placeholder="Search name, host, country, ISP…">
+    <div class="proxy-toolbar-stats" id="proxy-toolbar-stats">
+      <span><strong id="stat-total">0</strong> total</span>
+      <span class="stat-sep">·</span>
+      <span><strong id="stat-active" class="stat-active">0</strong> active</span>
+      <span class="stat-sep">·</span>
+      <span><strong id="stat-error" class="stat-error">0</strong> errors</span>
+      <span class="stat-sep">·</span>
+      <span><strong id="stat-untested" class="stat-untested">0</strong> untested</span>
     </div>
   </div>
 
-  <!-- ─── MODE ─────────────────────────────────────────────────── -->
-  <div class="card">
-    <div class="card-title">Mode</div>
-    <div class="checkbox-row">
-      <input type="checkbox" id="cfg-use-pool" data-config="proxy.use_pool">
-      <label for="cfg-use-pool">Use proxy pool (pick random on every run)</label>
-    </div>
-    <div class="form-hint">
-      When enabled, one proxy URL is picked at random from the pool below.
-    </div>
-
-    <div class="checkbox-row" style="margin-top: 12px;">
-      <input type="checkbox" id="cfg-auto-rotate" data-config="proxy.auto_rotate_on_start">
-      <label for="cfg-auto-rotate">
-        Auto-rotate IP at start of every run
-        <span class="badge-recommended">recommended</span>
-      </label>
-    </div>
-    <div class="form-hint">
-      Forces a fresh random exit IP for each run. Prevents re-using a
-      stale IP across runs, which Google picks up as automation.
-    </div>
-  </div>
-
-  <!-- ─── GEO LOCK ─────────────────────────────────────────────── -->
-  <div class="card">
-    <div class="card-title">Geo lock</div>
-    <div class="input-row">
-      <div class="form-group">
-        <label class="form-label">Expected exit country</label>
-        <input type="text" class="input" data-config="browser.expected_country"
-               placeholder="Ukraine">
-      </div>
-      <div class="form-group">
-        <label class="form-label">Expected timezone</label>
-        <input type="text" class="input" data-config="browser.expected_timezone"
-               placeholder="Europe/Kyiv">
-      </div>
-    </div>
-    <div class="form-group">
-      <label class="form-label">When the exit doesn't match</label>
-      <select class="select" data-config="browser.geo_mismatch_mode"
-              style="max-width: 260px;">
-        <option value="rotate">Rotate up to 5 times, then abort</option>
-        <option value="abort">Abort immediately</option>
-        <option value="warn">Warn but proceed</option>
-      </select>
-      <div class="form-hint">
-        If the rotating proxy returns an exit in the wrong country, the
-        browser fingerprint (locale, timezone) mismatches the IP — Google
-        flags this immediately.
-      </div>
-    </div>
-  </div>
-
-  <!-- ─── SINGLE PROXY ─────────────────────────────────────────── -->
-  <div class="card">
-    <div class="card-title">
-      Single proxy URL
-      <span class="muted">— used when the pool is disabled</span>
-    </div>
-    <div class="form-group">
-      <input type="text" class="input"
-             data-config="proxy.url"
-             placeholder="user:pass@host:port">
-      <div class="form-hint">Format: username:password@host:port</div>
-    </div>
-  </div>
-
-  <!-- ─── ROTATION (unified: master switch + cadence + API config) ─── -->
-  <!-- Single card owns everything rotation-related. The master switch at
-       the top controls visibility of the API config block below — when
-       it's off, the block is hidden entirely (less visual clutter on
-       setups using static proxies). Throttle field sits just under the
-       switch so users see the trade-off between "rotate often" (signals
-       new user) and "rotate rarely" (ripens trust) up front. -->
-  <div class="card">
-    <div class="card-title">
-      Rotation
-      <span class="muted">— exit IP management</span>
-      <span id="rotation-status-chip" class="rotation-status-chip off">
-        not configured
-      </span>
-    </div>
-
-    <!-- ── MASTER SWITCH ── -->
-    <div class="checkbox-row">
-      <input type="checkbox" id="cfg-is-rotating" data-config="proxy.is_rotating">
-      <label for="cfg-is-rotating">
-        <strong>Force enable rotation (override)</strong>
-        <span class="form-hint" style="display:block; margin-top:4px;">
-          Turning this on treats the proxy as rotating regardless of
-          provider. Below you configure how often and which API to call.
-          Captcha-triggered rotation works independently of this switch.
-        </span>
-      </label>
-    </div>
-
-    <!-- Everything below appears only when the switch is on.
-         data-show-when= attribute is handled by proxy.js. -->
-    <div id="rotation-body" class="rotation-body" data-show-when="cfg-is-rotating">
-
-      <!-- Cadence: rotate every N runs. Default 10. -->
-      <div class="input-row" style="margin-top: 16px;">
-        <div class="form-group" style="max-width: 260px;">
-          <label class="form-label">Rotate every N runs</label>
-          <input type="number" class="input" min="1" max="1000"
-                 data-config="proxy.rotate_every_n_runs"
-                 placeholder="10">
-          <div class="form-hint">
-            <strong>1</strong> = rotate every run (fresh IP each time).
-            <strong>10</strong> = rotate every 10th run (IPs ripen into
-            trusted status). Captcha on any run still triggers rotation
-            unconditionally.
-          </div>
-        </div>
-      </div>
-
-      <!-- ── API config — inline subsection ── -->
-      <div class="rotation-api-inline">
-        <div class="rotation-api-inline-title">
-          🔌 Rotation API
-          <span class="muted">— how we tell the provider to rotate</span>
-        </div>
-        <div class="form-hint" style="margin-bottom: 12px;">
-          Without a configured API, <strong>⚡ Rotate IP</strong>,
-          <strong>Auto-rotate on start</strong>, and <code>rotate_ip</code>
-          script steps all silently no-op — the proxy keeps whatever exit
-          it grabbed at connect time.
-        </div>
-
-        <div class="form-group">
-          <label class="form-label">Provider</label>
-          <select class="select" id="rotation-provider-select"
-                  data-config="proxy.rotation_provider"
-                  style="max-width: 240px;">
-            <option value="none">None — wait for auto-rotation</option>
-            <option value="asocks">asocks</option>
-            <option value="brightdata">Bright Data (Bearer token)</option>
-            <option value="generic">Generic (URL only)</option>
-          </select>
-        </div>
-
-        <!-- ── asocks-specific simple builder ── -->
-        <div id="rotation-asocks-builder" class="rotation-provider-box">
-          <div class="rotation-provider-title">
-            🔧 asocks configuration
-          </div>
-          <div class="form-hint" style="margin-bottom: 12px;">
-            Per the <a href="https://api.asocks.com/api/docs/" target="_blank" class="link-inline">asocks API docs</a>,
-            the refresh endpoint is
-            <code>GET https://api.asocks.com/v2/proxy/refresh/{portId}?apiKey={apiKey}</code>.
-            Fill in the two pieces below and we'll assemble the URL for you.
-          </div>
-          <div class="input-row">
-            <div class="form-group">
-              <label class="form-label">Port ID <span class="label-required">*</span></label>
-              <input type="number" class="input" id="asocks-port-id"
-                     placeholder="e.g. 123456" min="1">
-              <div class="form-hint">
-                <strong>Important:</strong> this is NOT the TCP port from
-                your proxy's <code>host:port</code> (e.g. 16720). It's the
-                <strong>internal record ID</strong> in asocks — usually a 6–8
-                digit number. Use the button below to auto-fetch it.
-              </div>
-            </div>
-            <div class="form-group">
-              <label class="form-label">API key <span class="label-required">*</span></label>
-              <input type="password" class="input" id="asocks-api-key"
-                     placeholder="paste your asocks API key">
-              <div class="form-hint">
-                From <em>My Account → API Keys</em> in the asocks dashboard.
-                This is <strong>not</strong> the proxy password — it's a
-                separate long token used only for API calls.
-              </div>
-            </div>
-          </div>
-
-          <div class="asocks-port-picker">
-            <button class="btn btn-secondary" id="btn-asocks-list-ports">
-              🔍 Fetch port list from asocks
-            </button>
-            <div class="form-hint">
-              Calls <code>GET /v2/proxy/port-list</code> with the API key
-              above and shows every proxy port on your account so you can
-              pick the right one.
-            </div>
-            <div id="asocks-port-list" class="asocks-port-list" style="display: none;"></div>
-          </div>
-
-          <div class="form-group">
-            <label class="form-label">Assembled URL (read-only)</label>
-            <div class="input-readonly" id="asocks-assembled-url">—</div>
-            <div class="form-hint">
-              This is what Ghost Shell will GET to rotate. If it looks right,
-              click <strong>🧪 Test rotation API</strong> below.
-            </div>
-          </div>
-        </div>
-
-        <!-- ── Advanced / generic raw-URL editor ── -->
-        <div id="rotation-advanced-builder" class="rotation-provider-box">
-          <div class="form-group">
-            <label class="form-label">Rotation API URL</label>
-            <input type="text" class="input" id="rotation-raw-url"
-                   data-config="proxy.rotation_api_url"
-                   placeholder="https://example-provider.com/rotate?token=...">
-            <div class="form-hint">
-              Full URL your provider exposes for rotation. Include query
-              params + tokens as needed.
-            </div>
-          </div>
-          <div class="input-row">
-            <div class="form-group">
-              <label class="form-label">API key (optional, sent as header)</label>
-              <input type="password" class="input" data-config="proxy.rotation_api_key">
-              <div class="form-hint">
-                <strong>Bright Data:</strong> sent as <code>Authorization: Bearer</code><br>
-                <strong>Generic:</strong> sent as <code>X-API-Key</code>
-              </div>
-            </div>
-            <div class="form-group">
-              <label class="form-label">HTTP method</label>
-              <select class="select" data-config="proxy.rotation_method">
-                <option value="GET">GET</option>
-                <option value="POST">POST</option>
-              </select>
-            </div>
-          </div>
-        </div>
-
-        <div class="rotation-test-footer">
-          <button id="btn-test-rotation-api" class="btn btn-secondary">
-            🧪 Test rotation API
-          </button>
-          <div id="rotation-api-test-result" class="form-hint">
-            Calls the URL above once and reports the HTTP status.
-          </div>
-        </div>
-      </div><!-- /.rotation-api-inline -->
-    </div><!-- /#rotation-body -->
-  </div>
-
-  <!-- ─── POOL ─────────────────────────────────────────────────── -->
-  <div class="card">
-    <div class="card-title">Proxy pool (one per line)</div>
-    <textarea class="textarea" rows="8"
-              data-config="proxy.pool_urls" data-config-list="true"
-              placeholder="user1:pass1@host1:port&#10;user2:pass2@host2:port"></textarea>
-    <div class="form-hint">
-      Paste multiple proxies. When "Use pool" is enabled above, a random one
-      is picked each run.
-    </div>
-  </div>
-
-  <!-- ─── IP STATS ─────────────────────────────────────────────── -->
-  <div class="card">
-    <div class="card-title">
-      IP statistics <span class="badge" id="ip-count">0</span>
-    </div>
-    <table>
+  <!-- ── Main grid ───────────────────────────────────────────── -->
+  <div class="proxy-table-wrap">
+    <table class="proxy-table" id="proxy-table">
       <thead>
         <tr>
-          <th>IP</th>
-          <th>Country</th>
-          <th>Provider</th>
-          <th>Uses</th>
-          <th>Captchas</th>
-          <th>Rate</th>
-          <th>Status</th>
+          <th class="col-name">Name</th>
+          <th class="col-status">Status</th>
+          <th class="col-type">Type</th>
+          <th class="col-host">Host</th>
+          <th class="col-port">Port</th>
+          <th class="col-login">Login</th>
+          <th class="col-geo">Geo</th>
+          <th class="col-iptype">IP type</th>
+          <th class="col-latency">Latency</th>
+          <th class="col-profiles">Profiles</th>
+          <th class="col-checked">Checked</th>
+          <th class="col-actions"></th>
         </tr>
       </thead>
-      <tbody id="ips-tbody"></tbody>
+      <tbody id="proxy-tbody">
+        <tr><td colspan="12" class="proxy-empty-cell">Loading…</td></tr>
+      </tbody>
     </table>
   </div>
+
+  <!-- ── Global options (collapsible) ────────────────────────── -->
+  <!-- Settings that apply to the whole run regardless of which
+       proxy is assigned: auto-rotate at start-of-run, geo-lock
+       expectations, rotation throttle. Keeps the page compact —
+       bulk of screen is the table above. -->
+  <details class="proxy-global-options" id="proxy-global-options">
+    <summary class="proxy-global-summary">
+      <span class="summary-icon">▸</span>
+      Global options
+      <span class="summary-hint">— apply to all runs regardless of assigned proxy</span>
+    </summary>
+
+    <div class="proxy-global-body">
+      <div class="proxy-global-grid">
+
+        <!-- Auto-rotate -->
+        <div class="option-card">
+          <div class="option-card-title">🔄 Auto-rotate at run start</div>
+          <label class="checkbox-row">
+            <input type="checkbox" id="opt-auto-rotate"
+                   data-config="proxy.rotate_on_start">
+            <span>Rotate before each run</span>
+          </label>
+          <div class="option-card-hint">
+            Forces a fresh exit IP at the start of every run. Requires
+            a rotation API on the assigned proxy.
+          </div>
+
+          <div class="form-group" style="margin-top: 10px;">
+            <label class="form-label">Rotate every N runs</label>
+            <input type="number" class="input" min="1" max="1000"
+                   data-config="proxy.rotate_every_n_runs"
+                   style="max-width: 100px;">
+          </div>
+        </div>
+
+        <!-- Geo lock -->
+        <div class="option-card">
+          <div class="option-card-title">🌍 Geo lock</div>
+          <div class="option-card-hint" style="margin-bottom: 10px;">
+            If the actual exit IP's geo doesn't match these values,
+            the run aborts before opening Chrome.
+          </div>
+          <div class="form-row" style="display: grid; grid-template-columns: 1fr 1fr; gap: 8px;">
+            <div class="form-group" style="margin: 0;">
+              <label class="form-label">Expected country</label>
+              <input type="text" class="input"
+                     data-config="browser.expected_country"
+                     placeholder="Ukraine">
+            </div>
+            <div class="form-group" style="margin: 0;">
+              <label class="form-label">Expected timezone</label>
+              <input type="text" class="input"
+                     data-config="browser.expected_timezone"
+                     placeholder="Europe/Kyiv">
+            </div>
+          </div>
+        </div>
+
+        <!-- Self-check cadence -->
+        <div class="option-card">
+          <div class="option-card-title">🔬 Self-check cadence</div>
+          <div class="form-group">
+            <label class="form-label">Run self-check every N runs</label>
+            <input type="number" class="input" min="1" max="1000"
+                   data-config="browser.selfcheck_every_n_runs"
+                   style="max-width: 100px;">
+          </div>
+          <div class="option-card-hint">
+            Self-check verifies exit IP, country, timezone, WebRTC leak
+            every N runs (always on run #1). Lower = safer but slower.
+          </div>
+        </div>
+
+      </div>
+    </div>
+  </details>
 </section>
+
+<!-- ── Add/Edit proxy modal ──────────────────────────────────── -->
+<div class="profile-modal" id="proxy-edit-modal" style="display: none;">
+  <div class="profile-modal-backdrop" data-close="proxy-edit-modal"></div>
+  <div class="profile-modal-content" style="width: 560px;">
+    <div class="profile-modal-header">
+      <div class="profile-modal-title" id="proxy-edit-title">Add proxy</div>
+      <button class="profile-modal-close" data-close="proxy-edit-modal">×</button>
+    </div>
+    <div class="profile-modal-body">
+      <div class="form-group">
+        <label class="form-label">Name (optional)</label>
+        <input type="text" id="edit-proxy-name" class="input"
+               placeholder="e.g. Residential UA-1">
+      </div>
+      <div class="form-group">
+        <label class="form-label">Proxy URL *</label>
+        <input type="text" id="edit-proxy-url" class="input"
+               placeholder="http://user:pass@host:port or socks5://…"
+               style="font-family: ui-monospace, monospace;">
+        <div class="form-hint">
+          Accepts bare <code>host:port</code>, <code>user:pass@host:port</code>,
+          or full URL with scheme (<code>http://</code>, <code>socks5://</code>).
+        </div>
+      </div>
+      <div class="form-group">
+        <label class="checkbox-row">
+          <input type="checkbox" id="edit-proxy-is-rotating">
+          <span>This proxy supports rotation (rotation API)</span>
+        </label>
+      </div>
+      <div id="edit-rotation-fields" style="display: none;">
+        <div class="form-group">
+          <label class="form-label">Rotation API URL</label>
+          <input type="text" id="edit-rotation-url" class="input"
+                 placeholder="https://api.asocks.com/v2/proxy/refresh/…"
+                 style="font-family: ui-monospace, monospace;">
+        </div>
+        <div class="form-row" style="display: grid; grid-template-columns: 1fr 1fr; gap: 10px;">
+          <div class="form-group">
+            <label class="form-label">Provider</label>
+            <select id="edit-rotation-provider" class="select">
+              <option value="none">generic (no auth)</option>
+              <option value="asocks">asocks</option>
+              <option value="brightdata">brightdata</option>
+              <option value="generic">generic with key</option>
+            </select>
+          </div>
+          <div class="form-group">
+            <label class="form-label">API key (optional)</label>
+            <input type="text" id="edit-rotation-key" class="input">
+          </div>
+        </div>
+      </div>
+      <div class="form-group">
+        <label class="checkbox-row">
+          <input type="checkbox" id="edit-proxy-is-default">
+          <span>Make this the default proxy
+            <span class="form-hint" style="display: block;">
+              Profiles without an explicit assignment will use this.
+            </span>
+          </span>
+        </label>
+      </div>
+      <div class="form-group">
+        <label class="form-label">Notes (optional)</label>
+        <textarea id="edit-proxy-notes" class="input" rows="2"
+                  placeholder="Why this proxy exists, expiry date…"></textarea>
+      </div>
+      <div class="form-group">
+        <label class="checkbox-row">
+          <input type="checkbox" id="edit-proxy-auto-test" checked>
+          <span>Test connection after saving</span>
+        </label>
+      </div>
+    </div>
+    <div class="profile-modal-footer">
+      <button class="btn btn-secondary" data-close="proxy-edit-modal">Cancel</button>
+      <button class="btn btn-primary" id="proxy-edit-save-btn">Save</button>
+    </div>
+  </div>
+</div>
+
+<!-- ── Bulk import modal (multi-format + live preview) ──────── -->
+<!-- Accepts any of these per-line shapes:
+       host:port
+       host:port:user:pass       (IPRoyal / Webshare export)
+       user:pass@host:port
+       user:pass:host:port       (reversed colon)
+       http://u:p@host:port      (full URL)
+       socks5://u:p@host:port
+       [2001:db8::1]:8080        (IPv6)
+     Comments after `#` are stripped. Parser runs live as the user
+     types so they see what will actually be imported before Save. -->
+<div class="profile-modal" id="proxy-bulk-modal" style="display: none;">
+  <div class="profile-modal-backdrop" data-close="proxy-bulk-modal"></div>
+  <div class="profile-modal-content" style="width: 820px; max-height: 90vh;">
+    <div class="profile-modal-header">
+      <div class="profile-modal-title">📋 Bulk import proxies</div>
+      <button class="profile-modal-close" data-close="proxy-bulk-modal">×</button>
+    </div>
+    <div class="profile-modal-body bulk-body">
+
+      <!-- Left: paste area + options -->
+      <div class="bulk-input-pane">
+        <label class="form-label">Paste proxy list</label>
+        <textarea id="bulk-proxy-text" class="input bulk-textarea"
+                  rows="14"
+                  placeholder="Paste any format, one per line:
+
+1.2.3.4:8080
+1.2.3.4:8080:user:pass
+user:pass@1.2.3.4:8080
+http://user:pass@1.2.3.4:8080
+socks5://user:pass@1.2.3.4:1080
+[2001:db8::1]:8080
+
+# Comments are skipped"
+                  spellcheck="false"
+                  style="font-family: ui-monospace, monospace;"></textarea>
+
+        <div class="bulk-options">
+          <div class="form-group" style="margin-bottom: 8px;">
+            <label class="form-label">Default scheme</label>
+            <select id="bulk-default-scheme" class="select"
+                    style="width: 130px;">
+              <option value="http" selected>HTTP</option>
+              <option value="https">HTTPS</option>
+              <option value="socks5">SOCKS5</option>
+              <option value="socks4">SOCKS4</option>
+            </select>
+            <div class="form-hint">
+              Applied to lines without an explicit scheme.
+            </div>
+          </div>
+          <label class="checkbox-row">
+            <input type="checkbox" id="bulk-auto-test" checked>
+            <span>Test each proxy after import</span>
+          </label>
+        </div>
+      </div>
+
+      <!-- Right: live preview -->
+      <div class="bulk-preview-pane">
+        <div class="bulk-preview-header">
+          <div class="bulk-preview-title">Preview</div>
+          <div class="bulk-preview-stats" id="bulk-preview-stats">
+            Paste lines to see preview
+          </div>
+        </div>
+        <div class="bulk-preview-list" id="bulk-preview-list">
+          <div class="bulk-preview-empty">
+            Start typing on the left — the parser detects the format
+            automatically.
+          </div>
+        </div>
+      </div>
+    </div>
+    <div class="profile-modal-footer">
+      <button class="btn btn-secondary" data-close="proxy-bulk-modal">Cancel</button>
+      <button class="btn btn-primary" id="proxy-bulk-save-btn" disabled>
+        Import
+      </button>
+    </div>
+  </div>
+</div>

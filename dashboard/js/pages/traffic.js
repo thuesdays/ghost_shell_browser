@@ -129,6 +129,42 @@ const Traffic = {
   _renderChart(series, bucket) {
     const canvas = document.getElementById("tr-chart");
     if (!canvas) return;
+    const wrap = canvas.closest(".chart-wrap") || canvas.parentElement;
+    let emptyEl = wrap?.querySelector(".chart-empty-state");
+
+    // Empty-state handling — if series is empty OR every bucket has
+    // both 0 bytes and 0 requests, show a helpful hint instead of an
+    // empty chart. A blank chart isn't useful and looks broken; a
+    // message that says "no traffic yet" tells the user to either run
+    // something or wait for the collector to flush.
+    const totalBytes = series.reduce((a, r) => a + (r.bytes    || 0), 0);
+    const totalReqs  = series.reduce((a, r) => a + (r.requests || 0), 0);
+    const isEmpty = series.length === 0 || (totalBytes === 0 && totalReqs === 0);
+
+    if (isEmpty) {
+      if (this._chart) { this._chart.destroy(); this._chart = null; }
+      canvas.style.display = "none";
+      if (!emptyEl && wrap) {
+        emptyEl = document.createElement("div");
+        emptyEl.className = "chart-empty-state";
+        emptyEl.innerHTML = `
+          <div class="chart-empty-icon">📊</div>
+          <div class="chart-empty-title">No traffic data for this range</div>
+          <div class="chart-empty-hint">
+            Traffic is collected during runs and flushed every 30s.
+            Start a run, or expand the range if nothing's run recently.
+          </div>
+        `;
+        wrap.appendChild(emptyEl);
+      }
+      if (emptyEl) emptyEl.style.display = "";
+      return;
+    }
+
+    // Real data — hide the empty state if previously shown
+    if (emptyEl) emptyEl.style.display = "none";
+    canvas.style.display = "";
+
     const ctx = canvas.getContext("2d");
 
     // Format labels for readability — "15" (hour) or "04-22" (day)
@@ -341,8 +377,8 @@ const Traffic = {
   },
 };
 
-// ─── formatBytes is defined canonically in utils.js ──────────────
-// We take a local reference so this module works without relying on
-// script evaluation order (utils.js is loaded before us in index.html,
-// but keeping this alias makes the code resilient to future refactors).
-const formatBytes = window.formatBytes || ((n) => `${n} B`);
+// formatBytes comes from utils.js (script load order guarantees it's
+// defined first). We used to re-declare a local `const formatBytes`
+// here as a fallback, but that threw SyntaxError if utils.js hoisted
+// its declaration to the same global scope — `const` doesn't allow
+// redeclaration. Reference the global directly instead.
