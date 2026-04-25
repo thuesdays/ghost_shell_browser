@@ -26,6 +26,9 @@ Design principles:
     wants, we err on the side of deletion rather than hoping.
 """
 
+__author__ = "Mykola Kovhanko"
+__email__ = "thuesdays@gmail.com"
+
 import json
 import logging
 import os

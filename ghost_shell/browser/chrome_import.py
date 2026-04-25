@@ -31,6 +31,9 @@ exclusive locks while Chrome is running — we can't even read them. We
 check and refuse to start if the source is locked.
 """
 
+__author__ = "Mykola Kovhanko"
+__email__ = "thuesdays@gmail.com"
+
 import os
 import sys
 import json

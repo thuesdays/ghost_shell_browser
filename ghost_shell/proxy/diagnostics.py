@@ -1,13 +1,16 @@
 """
-proxy_diagnostics.py — Проверка качества proxy и окрalreadyния
+proxy_diagnostics.py — Проверка качества proxy и окружyния
 
 Проверяет:
-- Совпаyesет ли IP browserа с IP proxy
+- Совпадает ли IP browserа с IP proxy
 - Не утекает ли real IP via WebRTC
 - Не утекает ли DNS
-- Соответствует ли таймзона геолокации IP
+- Соresponseствует ли таймзона геолокации IP
 - Репутация IP (datacenter vs residential)
 """
+
+__author__ = "Mykola Kovhanko"
+__email__ = "thuesdays@gmail.com"
 
 import time
 import json
@@ -111,7 +114,7 @@ class ProxyDiagnostics:
                 if (match) ips.add(match[1]);
             };
             pc.createOffer().then(o => pc.setLocalDescription(o), e => callback({ok: false, error: e.toString()}));
-            // Таймаут на случай if stun не ответит
+            // Таймаут на случай if stun не responseит
             setTimeout(() => callback({ ok: true, ips: Array.from(ips) }), 5000);
         } catch(e) {
             callback({ ok: false, error: e.toString() });
@@ -128,7 +131,7 @@ class ProxyDiagnostics:
     # ──────────────────────────────────────────────────────────
 
     def timezone_consistency(self, expected_timezone: str) -> dict:
-        """Проверяем that JS-таймзона совпаyesет с таймзоной IP.
+        """Проверяем that JS-таймзона совпадает с таймзоной IP.
         Chrome uses legacy IANA name Europe/Kiev instead of Europe/Kyiv —
         сreading их эквивалентными."""
         try:
@@ -139,7 +142,7 @@ class ProxyDiagnostics:
             aliases = {
                 "Europe/Kiev": "Europe/Kyiv",
                 "Europe/Kyiv": "Europe/Kyiv",
-                "Asia/Kiev":   "Europe/Kyiv",  # соallм устаревший
+                "Asia/Kiev":   "Europe/Kyiv",  # совсем устаревший
             }
             normalized_js       = aliases.get(js_tz, js_tz)
             normalized_expected = aliases.get(expected_timezone, expected_timezone)
@@ -158,7 +161,7 @@ class ProxyDiagnostics:
     def ip_reputation_hint(self, ip_info: dict) -> dict:
         """
         Simple heuristic: if org/ASN contains 'hosting', 'cloud',
-        'datacenter' — proxy на yesтацентровом IP (high detection risk)
+        'datacenter' — proxy на датацентровом IP (high detection risk)
         """
         if not ip_info.get("ok"):
             return {"hint": "unknown", "risk": "unknown"}
@@ -253,7 +256,7 @@ class ProxyDiagnostics:
             print(f" Timezone:   {ip.get('timezone')}")
             print(f" Provider:  {ip.get('org')}")
         else:
-            print(f"\n ✗ Не уyesлось получить IP: {ip.get('error')}")
+            print(f"\n ✗ Не удалось получить IP: {ip.get('error')}")
 
         rep = report.get("reputation", {})
         rep_icon = {"low": "✓", "medium": "⚠", "high": "✗"}.get(rep.get("risk"), "?")
@@ -264,7 +267,7 @@ class ProxyDiagnostics:
         print(f" {tz_icon} Timezone browserа: {tz.get('browser_timezone')}")
 
         if report.get("webrtc_leak"):
-            print(f"\n ✗ WebRTC УТЕЧКА обнарalreadyна!")
+            print(f"\n ✗ WebRTC УТЕЧКА обнаружyна!")
             print(f"   Leaked IPs: {report['webrtc'].get('ips')}")
         else:
             print(f"\n ✓ No WebRTC leak")

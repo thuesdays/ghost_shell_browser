@@ -49,6 +49,9 @@ Usage:
     tracker.report(ip, success=False, captcha=True)
 """
 
+__author__ = "Mykola Kovhanko"
+__email__ = "thuesdays@gmail.com"
+
 import json
 import time
 import logging

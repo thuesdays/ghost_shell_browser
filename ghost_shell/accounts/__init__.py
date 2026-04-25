@@ -24,6 +24,10 @@ Public API:
         delete_account, set_account_status, get_account_cleartext,
     )
 """
+
+__author__ = "Mykola Kovhanko"
+__email__ = "thuesdays@gmail.com"
+
 from .vault   import Vault, get_vault, VaultLockedError
 from .totp    import compute_totp, remaining_seconds
 from .kinds   import KINDS, list_kinds, get_kind

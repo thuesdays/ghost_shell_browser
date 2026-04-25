@@ -1,13 +1,10 @@
 # Database Reference
 
-Ghost Shell uses a single SQLite file — `ghost_shell.db` at the project
-root (`F:\projects\ghost_shell_browser\ghost_shell.db` on Windows,
-equivalent on other platforms).
-
-Every dashboard page and every run reads/writes through `db.py`.
-There is no ORM — just typed helper methods on a `DB` class.
-
-To inspect it directly:
+Ghost Shell Anty uses a single SQLite file -- `ghost_shell.db` at the
+project root. Every dashboard page and every run reads/writes through
+`ghost_shell.db.database` (the post-refactor location of the layer
+historically called `db.py`). There is no ORM -- just typed helper
+methods on a `DB` class.
 
 ```powershell
 sqlite3 ghost_shell.db ".tables"
@@ -17,196 +14,92 @@ sqlite3 ghost_shell.db "SELECT * FROM config_kv LIMIT 20"
 
 ---
 
-## Table overview
+## Table overview (18 tables)
 
-| Table          | Purpose                                          | Pruning         |
-|----------------|--------------------------------------------------|-----------------|
-| `config_kv`    | All dashboard settings (flat dotted-key store)   | Permanent       |
-| `runs`         | One row per monitor run                          | Manual only     |
-| `events`       | Search events: ok / empty / captcha / blocked    | Manual only     |
-| `selfchecks`   | Fingerprint self-check snapshots                 | Last 20 / profile kept |
-| `competitors`  | Every ad ever captured                           | Manual only     |
-| `action_events`| Per-step log of the Script executor              | Manual only     |
-| `ip_history`   | Per-IP usage counter + burn status               | Permanent       |
-| `fingerprints` | Payload snapshot per profile                     | Last 10 / profile kept |
-| `logs`         | Line-by-line monitor output                      | Rolling tail    |
-| `meta`         | Schema version + migration markers               | Permanent       |
+| Table              | Purpose                                                  | Pruning                |
+|--------------------|----------------------------------------------------------|------------------------|
+| `config_kv`        | All dashboard settings (flat dotted-key store)           | Permanent              |
+| `runs`             | One row per monitor run                                  | Manual only            |
+| `events`           | Search events: ok / empty / captcha / blocked            | Manual only            |
+| `selfchecks`       | Runtime network self-check snapshots (geo / WebRTC / TZ) | Last 20 / profile kept |
+| `competitors`      | Every ad ever captured                                   | Manual only            |
+| `action_events`    | Per-step log of the Script executor                      | Manual only            |
+| `ip_history`       | Per-IP usage counter + burn status                       | Permanent              |
+| `fingerprints`     | Phase 2 fingerprint snapshots + coherence reports        | Last 10 / profile kept |
+| `profiles`         | Per-profile metadata (tags, proxy/script/group refs)     | Permanent              |
+| `profile_groups`   | Named groups for batch monitoring                        | Permanent              |
+| `profile_group_members` | Many-to-many between profiles and groups            | Permanent              |
+| `traffic_stats`    | Per-profile per-host bandwidth counter                   | `traffic.retention_days` |
+| `scripts`          | Saved per-ad pipelines (Scripts page library)            | Permanent              |
+| `proxies`          | Proxy library with cached diagnostics                    | Permanent              |
+| `warmup_runs`      | Each warmup invocation with per-site result log          | Manual only            |
+| `cookie_snapshots` | Cookie-pool entries (auto + manual snapshots)            | Manual only            |
+| `vault_items`      | Encrypted credential vault                               | Permanent              |
+| `logs`             | Line-by-line monitor output                              | Rolling 10k tail       |
+
+All schemas live in `ghost_shell/db/database.py` inside `SCHEMA_SQL`.
+Migrations are idempotent -- `_ensure_column()` runs on every startup,
+detects missing columns and `ALTER TABLE` adds them without disturbing
+existing data.
 
 ---
 
-## `config_kv` — the single source of truth for settings
+## `config_kv` -- single source of truth for settings
 
-Flat key/value store. Every dashboard page uses dotted keys like
-`search.queries`, `proxy.url`, `actions.main_script`, etc.
+Flat key/value store. Dotted keys like `search.queries`, `proxy.url`,
+`scheduler.cron_expression`, `vault.salt`.
 
 ```sql
 CREATE TABLE config_kv (
     key        TEXT PRIMARY KEY,
-    value      TEXT,           -- JSON-encoded (string/int/bool/list/dict)
+    value      TEXT,
     updated_at TEXT
 );
 ```
 
 ### Key namespaces
 
-| Prefix        | Example keys                                    |
-|---------------|-------------------------------------------------|
-| `search.*`    | `queries`, `my_domains`, `target_domains`, `block_domains`, `refresh_max_sec` |
-| `proxy.*`     | `url`, `is_rotating`, `rotation_provider`, `auto_rotate_on_start`, `total_rotations` |
-| `behavior.*`  | 14 timing ranges (`initial_load_min/max`, `between_queries_min/max`, …) + naturalness toggles |
-| `browser.*`   | `profile_name`, `expected_country`, `expected_timezone` |
-| `actions.*`   | `main_script`, `post_ad_actions`, `on_target_domain_actions` — each a list of step dicts. `main_script` supports nested `loop` actions with their own inner `steps[]` arrays and `{item}` placeholders. |
-| `scheduler.*` | `enabled`, `cron_expr`, `last_run_at`           |
-| `captcha.*`   | `twocaptcha_key`                                |
-| `watchdog.*`  | `max_stall_sec`, `check_interval_sec`           |
-| `system.*`    | `first_run_at` (machine-local, never exported)  |
-| `profile.<n>.*` | Per-profile overrides (template, language)    |
-
-Keys are **always dotted**. If you ever see a row like `key="proxy"` in
-config_kv, that's a leftover from the v1 import bug — the current
-`dashboard_server.py` cleans them up on startup.
-
-### Access pattern
+| Namespace          | Examples                                                          |
+|--------------------|-------------------------------------------------------------------|
+| `search.*`         | `queries`, `my_domains`, `target_domains`, `block_domains`        |
+| `browser.*`        | `binary_path`, `profile_name`, `preferred_language`, `auto_session` |
+| `proxy.*`          | `auto_rotate_on_start`, `rotate_every_n_runs`, default settings   |
+| `scheduler.*`      | `target_runs_per_day`, `active_hours`, `schedule_mode`, `cron_expression`, `interval_sec`, `active_days`, `profile_names`, `selection_mode`, `group_id`, `group_mode` |
+| `behavior.*`       | typing/dwell/scroll/refresh timing                                |
+| `traffic.*`        | `retention_days`, block-list patterns                             |
+| `vault.*`          | `salt`, `verifier`, `initialized_at`                              |
+| `session.*`        | `pending_restore.<profile>` -- queued snapshot for next launch    |
 
 ```python
-from db import get_db
+from ghost_shell.db import get_db
 db = get_db()
-
-# Single value
-proxy_url = db.config_get("proxy.url")
-# Write
-db.config_set("search.my_domains", ["example.com", "example.org"])
-# Whole dict (nested representation — for dashboard convenience)
-cfg = db.config_get_all()   # → {"proxy": {"url": "..."}, "search": {...}}
+q = db.config_get("search.queries") or []
+db.config_set("scheduler.cron_expression", "*/15 7-20 * * 1-5")
 ```
-
-### `actions.main_script` schema
-
-The Main script is a list of top-level action steps. One special action
-type — `loop` — has its own nested `steps[]` list that runs per item.
-Inside nested steps, string params are substituted with the current
-item via `{item}` (or a custom `item_var`).
-
-```json
-[
-  {
-    "type": "loop",
-    "enabled": true,
-    "items": ["term one", "term two", "term three"],
-    "item_var": "query",
-    "shuffle": true,
-    "steps": [
-      {"type": "pause",        "min_sec": 2, "max_sec": 5},
-      {"type": "search_query", "query": "{query}"},
-      {"type": "rotate_ip",    "wait_after_sec": 3}
-    ]
-  },
-  {
-    "type": "visit_url",
-    "url": "https://example.com",
-    "dwell_min": 5,
-    "dwell_max": 12
-  }
-]
-```
-
-Substitution is recursive through dicts and lists but only swaps
-bare-identifier placeholders (`{query}`, `{item}`, `{index}`,
-`{total}`). Legacy `search_all_queries` steps are auto-upgraded to
-the `loop` shape on read — see
-`dashboard_server.py::api_actions_pipelines_get()`.
 
 ---
 
-## `runs`
-
-One row per invocation of `main.py`.
+## `runs` -- monitor pass log
 
 ```sql
 CREATE TABLE runs (
-    id            INTEGER PRIMARY KEY AUTOINCREMENT,
-    started_at    TEXT NOT NULL,
-    finished_at   TEXT,
-    profile_name  TEXT NOT NULL,
-    proxy_url     TEXT,
-    status        TEXT,    -- "running" | "ok" | "error" | "aborted"
-    error_message TEXT,
-    ads_total     INTEGER DEFAULT 0,
-    competitors   INTEGER DEFAULT 0,
-    duration_sec  REAL
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    profile_name    TEXT,
+    started_at      TEXT NOT NULL,
+    finished_at     TEXT,
+    exit_code       INTEGER,
+    error           TEXT,
+    total_queries   INTEGER DEFAULT 0,
+    total_ads       INTEGER DEFAULT 0,
+    captchas        INTEGER DEFAULT 0,
+    pid             INTEGER,
+    heartbeat_at    TEXT
 );
-```
-
-Every run starts with `status='running'`. On exit the finalizer writes
-`finished_at`, totals, and final status. If Python crashes hard and
-can't finalize, the next dashboard startup calls `cleanup_stale_runs()`
-which marks any orphaned `running` entries as `error`.
-
----
-
-## `events`
-
-Individual timeline events within a run.
-
-```sql
-CREATE TABLE events (
-    id            INTEGER PRIMARY KEY AUTOINCREMENT,
-    run_id        INTEGER,
-    profile_name  TEXT NOT NULL,
-    timestamp     TEXT NOT NULL,
-    event_type    TEXT NOT NULL,  -- search_ok / search_empty / captcha / blocked / …
-    query         TEXT,
-    details       TEXT,          -- JSON string
-    duration_sec  REAL,
-    results_count INTEGER
-);
-```
-
-Aggregated for the Overview page's 7-day chart via `db.daily_stats()`.
-
----
-
-## `action_events` — per-step script log
-
-One row for every step execution inside the Scripts page's pipelines.
-
-```sql
-CREATE TABLE action_events (
-    id            INTEGER PRIMARY KEY AUTOINCREMENT,
-    run_id        INTEGER,
-    profile_name  TEXT NOT NULL,
-    timestamp     TEXT NOT NULL,
-    query         TEXT,
-    ad_domain     TEXT,
-    ad_class      TEXT,   -- "target" | "my_domain" | "competitor" | "unknown"
-    action_type   TEXT NOT NULL,
-    outcome       TEXT NOT NULL,  -- "ran" | "skipped" | "error"
-    skip_reason   TEXT,           -- "my_domain"/"target"/"not_target"/"not_my_domain"/"probability"/"disabled"
-    duration_sec  REAL,
-    error         TEXT
-);
-```
-
-This table powers:
-
-- Overview → **Actions ran (24h)** hero stat with breakdown by type
-- Overview → **Total actions performed** card
-- Competitors → **Actions** column per domain
-
-Query patterns:
-
-```python
-db.action_events_summary(hours=24)      # {actions_ran, actions_skipped,
-                                         # actions_errored, by_type, by_ad_class}
-db.action_events_by_domain()             # {domain: {ran, skipped, errored, last_action_at}}
-db.action_events_recent(limit=50)        # Raw rows for debugging
 ```
 
 ---
 
-## `competitors`
-
-Every ad observed on a SERP.
+## `competitors` -- ad capture log
 
 ```sql
 CREATE TABLE competitors (
@@ -218,159 +111,207 @@ CREATE TABLE competitors (
     title            TEXT,
     display_url      TEXT,
     clean_url        TEXT,
-    google_click_url TEXT
+    google_click_url TEXT,
+    FOREIGN KEY (run_id) REFERENCES runs(id) ON DELETE SET NULL
 );
+CREATE INDEX idx_comp_domain ON competitors(domain);
+CREATE INDEX idx_comp_query  ON competitors(query);
+CREATE INDEX idx_comp_ts     ON competitors(timestamp DESC);
 ```
 
-The Competitors dashboard aggregates by `domain`, joins with
-`action_events` on `domain = ad_domain` to produce the "Actions"
-column showing how many times we interacted with each advertiser.
+Used by the Competitors page:
+- `competitors_by_domain(days, search)` -- aggregated table
+- `competitors_trend(days, top_n)` -- daily bucket counts (line chart)
+- `competitors_sparklines(days)` -- per-row 7-day mini-charts
+- `competitor_detail(domain, days)` -- drill-down (titles/URLs/queries)
+- `competitors_by_query(days, top_n)` -- share-of-voice tab
 
 ---
 
-## `ip_history` — proxy exit IP tracking
-
-```sql
-CREATE TABLE ip_history (
-    ip                   TEXT PRIMARY KEY,
-    first_seen           TEXT NOT NULL,
-    last_seen            TEXT NOT NULL,
-    total_uses           INTEGER DEFAULT 0,
-    total_captchas       INTEGER DEFAULT 0,
-    consecutive_capchas  INTEGER DEFAULT 0,
-    burned_at            TEXT,       -- ISO timestamp when 3rd captcha hit
-    country              TEXT,
-    city                 TEXT,
-    org                  TEXT,
-    asn                  TEXT
-);
-```
-
-Populated at **two points**:
-
-1. `ip_record_start()` at the beginning of every run, right after
-   proxy diagnostics — catches static (non-rotating) proxy IPs that
-   would otherwise never trigger `ip_report()`.
-2. `ip_report()` after every search: success increments `total_uses`,
-   captcha increments `total_captchas` + `consecutive_capchas`. After
-   3 consecutive captchas `burned_at` is set, which bans the IP from
-   re-use for 12 hours.
-
-Displayed on Proxy → IP Statistics.
-
----
-
-## `fingerprints`
-
-Snapshot of every generated fingerprint payload per profile.
+## `fingerprints` -- Phase 2 coherence snapshots
 
 ```sql
 CREATE TABLE fingerprints (
+    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+    profile_name     TEXT NOT NULL,
+    timestamp        TEXT NOT NULL,
+    template_name    TEXT,
+    template_id      TEXT,
+    payload_json     TEXT NOT NULL,
+    is_current       INTEGER NOT NULL DEFAULT 0,
+    coherence_score  INTEGER,
+    coherence_report TEXT,
+    locked_fields    TEXT,
+    source           TEXT,         -- generated | manual_edit | runtime_observed
+    reason           TEXT
+);
+```
+
+Only one row per profile has `is_current=1`. History preserved so the
+Restore button on the Fingerprint editor can flip an old snapshot back
+to current. Dual-mode toggle (`/api/fingerprint/<name>/mode`) finds
+an existing desktop/mobile FP in this history first; falls back to
+fresh generation when none matches.
+
+---
+
+## `warmup_runs` -- session warmup log
+
+```sql
+CREATE TABLE warmup_runs (
+    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+    profile_name     TEXT NOT NULL,
+    started_at       TEXT NOT NULL,
+    finished_at      TEXT,
+    preset           TEXT,
+    sites_planned    INTEGER NOT NULL DEFAULT 0,
+    sites_visited    INTEGER NOT NULL DEFAULT 0,
+    sites_succeeded  INTEGER NOT NULL DEFAULT 0,
+    duration_sec     REAL,
+    status           TEXT NOT NULL DEFAULT 'running',
+    trigger          TEXT NOT NULL DEFAULT 'manual',
+    notes            TEXT,
+    sites_log        TEXT
+);
+```
+
+`preset`: general | medical | tech | news | mobile | custom
+`status`: running | ok | partial | failed
+`trigger`: manual | scheduled | auto_before_run
+
+---
+
+## `cookie_snapshots` -- cookie pool
+
+```sql
+CREATE TABLE cookie_snapshots (
+    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+    profile_name     TEXT NOT NULL,
+    created_at       TEXT NOT NULL,
+    run_id           INTEGER,
+    trigger          TEXT NOT NULL DEFAULT 'manual',
+    cookies_json     TEXT NOT NULL DEFAULT '[]',
+    storage_json     TEXT NOT NULL DEFAULT '{}',
+    cookie_count     INTEGER NOT NULL DEFAULT 0,
+    domain_count     INTEGER NOT NULL DEFAULT 0,
+    bytes            INTEGER NOT NULL DEFAULT 0,
+    reason           TEXT
+);
+```
+
+`main.py` calls `snapshot_after_run()` at the end of every clean run
+(`exit_code=0` and no captchas). Restore is manual via UI -- writes
+`session.pending_restore.<profile>` to `config_kv`, next browser
+launch reads it and injects via CDP.
+
+---
+
+## `vault_items` -- encrypted credential vault
+
+```sql
+CREATE TABLE vault_items (
+    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+    name             TEXT NOT NULL,
+    kind             TEXT NOT NULL DEFAULT 'account',
+    service          TEXT,
+    identifier       TEXT,
+    secrets_enc      TEXT,                  -- Fernet ciphertext of a JSON object
+    profile_name     TEXT,
+    status           TEXT NOT NULL DEFAULT 'active',
+    tags_json        TEXT,
+    notes            TEXT,
+    last_used_at     TEXT,
+    last_login_at    TEXT,
+    last_login_status TEXT,
+    created_at       TEXT NOT NULL,
+    updated_at       TEXT NOT NULL
+);
+```
+
+Kind values: `account | crypto_wallet | email | social | api_key | totp_only | note | custom`
+
+Encryption goes through `ghost_shell/accounts/vault.py`: master
+password -> PBKDF2-HMAC-SHA256 (200k iterations) + salt -> 32-byte
+Fernet key. Salt + verifier in `config_kv`. DB layer never sees plaintext.
+
+---
+
+## `proxies` -- proxy library
+
+Stores named proxies plus cached diagnostics (geo / ASN / IP type /
+latency / detection risk). See `ghost_shell/proxy/diagnostics.py` for
+the test helper that fills the `last_*` columns.
+
+`proxy.password` is currently plaintext in this table (legacy). Plan
+is to migrate auth into `vault_items`. Keep the SQLite file out of
+public dumps until then.
+
+---
+
+## `scripts` -- pipelines library
+
+```sql
+CREATE TABLE scripts (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    name         TEXT NOT NULL UNIQUE,
+    description  TEXT NOT NULL DEFAULT '',
+    flow         TEXT NOT NULL DEFAULT '[]',
+    is_default   INTEGER NOT NULL DEFAULT 0,
+    created_at   TEXT NOT NULL,
+    updated_at   TEXT NOT NULL
+);
+```
+
+Each profile in `profiles` has optional `script_id` -- null = use the
+script flagged `is_default=1`.
+
+---
+
+## `traffic_stats` -- bandwidth counter
+
+```sql
+CREATE TABLE traffic_stats (
     id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    timestamp     TEXT NOT NULL,
     profile_name  TEXT NOT NULL,
-    timestamp     TEXT NOT NULL,
-    template_name TEXT,
-    chrome_major  TEXT,
-    payload_json  TEXT       -- full payload (base64-wrapped into the --ghost-shell-payload flag)
+    host          TEXT,
+    bytes_down    INTEGER NOT NULL DEFAULT 0,
+    bytes_up      INTEGER NOT NULL DEFAULT 0,
+    requests      INTEGER NOT NULL DEFAULT 0
 );
 ```
 
-The dashboard shows the latest fingerprint under Profile → Detail and
-lets you regenerate it (🎲 button).
+Filled by `ghost_shell/browser/traffic.py` via CDP `Network.*` events.
+Old rows pruned at startup per `traffic.retention_days` (default 90).
 
 ---
 
-## `selfchecks`
+## Recommended cleanup queries
 
-Results of the 29-test fingerprint self-check that runs at the start
-of every monitor run.
+Reset historical data, keep config:
 
 ```sql
-CREATE TABLE selfchecks (
-    id            INTEGER PRIMARY KEY AUTOINCREMENT,
-    run_id        INTEGER,
-    profile_name  TEXT NOT NULL,
-    timestamp     TEXT NOT NULL,
-    passed        INTEGER NOT NULL,
-    total         INTEGER NOT NULL,
-    tests_json    TEXT NOT NULL,       -- {"webdriver_hidden": true, …}
-    actual_json   TEXT,                -- navigator.* snapshot
-    expected_json TEXT                 -- payload values from DB
-);
+DELETE FROM events;
+DELETE FROM competitors;
+DELETE FROM action_events;
+DELETE FROM logs;
+DELETE FROM warmup_runs;
+DELETE FROM cookie_snapshots WHERE trigger != 'manual';
+VACUUM;
 ```
 
-Kept for the last 20 runs per profile.
-
----
-
-## `logs`
-
-Rolling per-line log tail.
+Drop one profile's history (keep its config row):
 
 ```sql
-CREATE TABLE logs (
-    id            INTEGER PRIMARY KEY AUTOINCREMENT,
-    timestamp     TEXT NOT NULL,
-    level         TEXT,
-    profile_name  TEXT,
-    message       TEXT
-);
+DELETE FROM events           WHERE profile_name = 'profile_01';
+DELETE FROM competitors      WHERE run_id IN (SELECT id FROM runs WHERE profile_name='profile_01');
+DELETE FROM action_events    WHERE profile_name = 'profile_01';
+DELETE FROM warmup_runs      WHERE profile_name = 'profile_01';
+DELETE FROM cookie_snapshots WHERE profile_name = 'profile_01';
+DELETE FROM fingerprints     WHERE profile_name = 'profile_01';
+DELETE FROM selfchecks       WHERE profile_name = 'profile_01';
+DELETE FROM runs             WHERE profile_name = 'profile_01';
 ```
 
-Consumed by the Logs page's live stream endpoint.
-
----
-
-## `meta`
-
-Schema versioning and migration markers.
-
-```sql
-CREATE TABLE meta (
-    key   TEXT PRIMARY KEY,
-    value TEXT
-);
-```
-
----
-
-## Export / Import
-
-The Settings page exports all of `config_kv` plus profile metadata
-and the three action pipelines into one portable JSON file. It does
-**not** include `runs`, `events`, `competitors`, `action_events`,
-`selfchecks`, `fingerprints`, `logs`, or `ip_history` — those are
-installation-specific history.
-
-Skipped machine-local keys (never exported, preserved on import):
-
-- `proxy.total_rotations`
-- `proxy.last_rotation_at`
-- `system.first_run_at`
-
-See `dashboard_server.py::api_export_config()` for the exact contract.
-
----
-
-## Resetting
-
-To wipe everything and start fresh:
-
-```powershell
-# Stop the dashboard first
-del ghost_shell.db
-rmdir /s /q profiles
-python dashboard_server.py   # rebuilds DB from DEFAULT_CONFIG
-```
-
-To clear just the history (keep config, profiles, pipelines) — use the
-"Clear history" button on the Runs page, or:
-
-```python
-from db import get_db
-db = get_db()
-conn = db._get_conn()
-for tbl in ("runs", "events", "action_events", "competitors", "logs"):
-    conn.execute(f"DELETE FROM {tbl}")
-conn.commit()
-```
+The dashboard's **Profiles -> row menu -> Delete profile** does this
+plus deletes the on-disk user-data-dir.

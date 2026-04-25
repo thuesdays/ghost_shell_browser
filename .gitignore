@@ -15,3 +15,10 @@ competitor_urls.txt
 chrome_win64/
 $null
 installer/test_write.txt
+Home.md
+installer/assets/repository-template_1280x640.png
+installer/assets/wizard_image.bmp
+installer/assets/wizard_image_2x.bmp
+installer/assets/repository-template.png
+installer/assets/wizard_small_image.bmp
+installer/assets/wizard_small_image_2x.bmp

@@ -11,7 +11,12 @@ The vault must be unlocked for any function that takes plaintext
 sensitive input OR returns decrypted output — those raise
 VaultLockedError otherwise.
 """
+
 from __future__ import annotations
+
+__author__ = "Mykola Kovhanko"
+__email__ = "thuesdays@gmail.com"
+
 import json
 from typing import Optional
 

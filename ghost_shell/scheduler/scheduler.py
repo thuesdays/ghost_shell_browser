@@ -30,6 +30,9 @@ Usage:
     python scheduler.py --quiet  # no stdout (dashboard spawns it that way)
 """
 
+__author__ = "Mykola Kovhanko"
+__email__ = "thuesdays@gmail.com"
+
 import os
 from ghost_shell.core.platform_paths import PROJECT_ROOT
 import sys
@@ -42,6 +45,7 @@ from datetime import datetime, timedelta, time as dtime
 from typing import Optional
 
 from ghost_shell.db.database import get_db
+from ghost_shell.core import runtime as gs_runtime
 
 
 # ──────────────────────────────────────────────────────────────
@@ -490,6 +494,20 @@ def main():
     now_iso = datetime.now().isoformat(timespec="seconds")
     db.config_set("scheduler.started_at", now_iso)
     db.config_set("scheduler.pid", os.getpid())
+
+    # Drop a PID file so the Inno Setup updater can stop us before
+    # replacing files. Mirrors what dashboard server.py does with
+    # runtime.json — see ghost_shell/core/runtime.py for the layout.
+    # This is best-effort: a heartbeat-based scheduler still works
+    # without it; the installer will then fall back to scanning
+    # `tasklist` for a python.exe running our module.
+    try:
+        gs_runtime.write_pid_file("scheduler.pid")
+        import atexit as _atexit
+        _atexit.register(gs_runtime.clear_pid_file, "scheduler.pid")
+    except Exception as e:
+        logging.warning(f"[scheduler] couldn't write PID file: {e}")
+
     heartbeat()
 
     # Background heartbeat ticker — writes scheduler.heartbeat_at every

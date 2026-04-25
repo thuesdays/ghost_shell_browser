@@ -15,7 +15,7 @@ Turns raw log spam into structured banners you can skim at a glance:
      UA         : Mozilla/5.0 (Windows NT 10.0;...) Chrome/132.0.0.0
      Proxy      : 109.236.84.23:16720 (asocks, rotating)
      Exit IP    : 193.32.154.239 [Ukraine / DataWeb]
-     Queries    : гудмедика, гудмедіка, goodmedika
+     Queries    : goodmedika (Latin and brand spellings)
      Targets    : goodmedika.com.ua, goodmedika.ua
     ═══════════════════════════════════════════════════════════════════
 
@@ -29,6 +29,9 @@ Usage:
 
     log_run_end(run_id, duration_sec, stats_dict)
 """
+
+__author__ = "Mykola Kovhanko"
+__email__ = "thuesdays@gmail.com"
 
 import json
 import logging

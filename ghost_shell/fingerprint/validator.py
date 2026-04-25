@@ -32,6 +32,9 @@ Check function signature:
         None   : check skipped (field not present in fp)
 """
 
+__author__ = "Mykola Kovhanko"
+__email__ = "thuesdays@gmail.com"
+
 import re
 
 

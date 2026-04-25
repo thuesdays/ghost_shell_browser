@@ -13,6 +13,9 @@ Each kind has:
 Adding a new kind is one dict literal + (optional) UI preset button.
 """
 
+__author__ = "Mykola Kovhanko"
+__email__ = "thuesdays@gmail.com"
+
 KINDS = {
     "account": {
         "label":      "Account (login + password)",

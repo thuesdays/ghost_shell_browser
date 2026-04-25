@@ -2,7 +2,7 @@
 proxy_forwarder.py — Локальный TCP-форвардер for авторизованных proxy
 
 Решает проблему: Chrome не умеет работать с proxy-аутентификацией напрямую
-without расширений, а расширения не allгyes работают с undetected_chromedriver.
+without расширений, а расширения не всегда работают с undetected_chromedriver.
 
 Как works:
 1. Слушает на 127.0.0.1:<случайный_порт>
@@ -13,6 +13,9 @@ without расширений, а расширения не allгyes работа
 
 Поддерживает HTTPS (CONNECT tunneling) и plain HTTP.
 """
+
+__author__ = "Mykola Kovhanko"
+__email__ = "thuesdays@gmail.com"
 
 import base64
 import logging
@@ -27,7 +30,7 @@ class ProxyForwarder:
     Usage:
         fwd = ProxyForwarder("user:pass@host:port")
         local_port = fwd.start()
-        # Переyesть Chrome: --proxy-server=127.0.0.1:<local_port>
+        # Передать Chrome: --proxy-server=127.0.0.1:<local_port>
         # ...
         fwd.stop()
     """
@@ -110,7 +113,7 @@ class ProxyForwarder:
         """Обрабатывает одно подключение от Chrome"""
         upstream = None
         try:
-            # Читаем первые yesнные от Chrome — this CONNECT or HTTP-query
+            # Читаем первые данные от Chrome — this CONNECT or HTTP-query
             client.settimeout(30)
             data = self._read_headers(client)
             if not data:
@@ -288,7 +291,7 @@ if __name__ == "__main__":
     print(f"Локальный proxy: http://127.0.0.1:{port}")
     print("Теперь можешь check:")
     print(f"  curl -x http://127.0.0.1:{port} https://api.ipify.org")
-    print("Ctrl+C thatбы остановить")
+    print("Ctrl+C тотбы остановить")
     try:
         while True:
             time.sleep(1)

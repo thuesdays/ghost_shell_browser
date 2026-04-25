@@ -96,3 +96,57 @@ Source code stays in the git repo (lean, <50 MB after `.gitignore` covers
       deps/                       ← drop python-3.12.x-amd64.exe here (git-ignored)
       assets/                     ← optional .ico files
       output/                     ← Inno spits GhostShellAntySetup.exe here (git-ignored)
+
+
+---
+
+## Icon branding for chrome.exe (optional but recommended)
+
+The bundled `chrome.exe` has the default Chromium globe icon by default,
+because we don't rebuild Chromium with custom icon resources. To make
+the running browser show the **Ghost Shell** icon instead (matching
+what users see when running from the dev source tree), the installer
+post-processes `chrome.exe` and `chromedriver.exe` with
+[rcedit](https://github.com/electron/rcedit) — a tiny MIT-licensed tool
+that edits Win32 resources.
+
+### Enable
+
+1. Download the latest `rcedit-x64.exe` from
+   <https://github.com/electron/rcedit/releases>
+2. Save it as `installer/deps/rcedit.exe` (rename so the path matches
+   exactly — that's what the .iss looks for)
+3. Rebuild — the installer detects the file and stamps `ghost_shell.ico`
+   onto chrome.exe and chromedriver.exe automatically
+
+The build is **idempotent** — if `rcedit.exe` is missing, the icon
+stamp step is silently skipped (`Check: HasRcedit` short-circuits the
+[Run] entries). Setup still produces a valid installer, just without
+icon branding.
+
+### Re-brand without rebuilding
+
+`installer/brand_chrome.bat` lets you re-stamp the icon onto an
+already-installed copy without rebuilding the .exe. Useful when you
+update `ghost_shell.ico`, or when testing icon changes:
+
+```cmd
+cd installer
+brand_chrome.bat
+```
+
+Defaults to `%LOCALAPPDATA%\GhostShellAnty`. Pass an alternate install
+dir as the first argument:
+
+```cmd
+brand_chrome.bat "C:\ProgramData\GhostShell"
+```
+
+After branding, Windows may show the cached old icon for a few seconds.
+Force-refresh with:
+
+```cmd
+ie4uinit.exe -ClearIconCache
+```
+
+or simply log out and back in.

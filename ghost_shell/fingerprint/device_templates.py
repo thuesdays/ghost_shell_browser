@@ -1,23 +1,26 @@
 """
 NK Browser Core - Device Templates & Stealth Payload Builder (v3)
 -------------------------------------------------------------------
-Детерминированный payload for C++ ядра Ghost Shell Chromium.
+Deterministic payload for the C++ core of Ghost Shell Chromium.
 
-Покрывает all векторы детекта (2026):
+Covers all detection vectors (2026):
 - Hardware (CPU, RAM, platform)
 - Screen (dimensions, DPR, color depth, outer, screen_x/y, orientation)
 - Graphics (WebGL vendor/renderer + WebGPU vendor/arch)
 - Audio (sample rate, base latency)
-- Fonts (full Windows набор, часть рандомно выключена)
+- Fonts (full Windows set, a randomized subset)
 - Navigator (UA, UA-CH, languages, plugins/mimeTypes, battery)
 - Timezone (for V8 Intl override)
 - Network connection (effective type, downlink, rtt)
-- WebRTC (media devices — full набор с default + communications)
+- WebRTC (media devices -- full set with default + communications)
 - Noise seeds (canvas shift, audio offset, clientrect offset)
-- UserAgentMetadata (Sec-CH-UA-* заголовки)
+- UserAgentMetadata (Sec-CH-UA-* headers)
 
-Детерминизм: SHA256(profile_name) → seed → один профиль = один fingerprint.
+Determinism: SHA256(profile_name) -> seed -> one profile = one fingerprint.
 """
+
+__author__ = "Mykola Kovhanko"
+__email__ = "thuesdays@gmail.com"
 
 import json
 import base64
@@ -34,7 +37,7 @@ logger.setLevel(logging.DEBUG)
 
 
 # =============================================================================
-# CONSTANT POOLS — актуальные значения на Q2 2026
+# CONSTANT POOLS -- values current as of Q2 2026
 # =============================================================================
 
 # The Chromium source we're building from. This is the actual engine —
@@ -132,6 +135,7 @@ LANGUAGE_PROFILES = [
 ]
 
 DEVICE_TEMPLATES = [
+    # ─── Mainstream desktop / laptop (original 6) ───
     {
         "name":    "office_desktop_intel",
         "cpu":     {"concurrency": 8, "memory": 8.0},
@@ -140,9 +144,6 @@ DEVICE_TEMPLATES = [
             "gl_renderer":   "ANGLE (Intel, Intel(R) UHD Graphics 770 Direct3D11 vs_5_0 ps_5_0, D3D11)",
             "webgpu_vendor": "intel",
             "webgpu_arch":   "xe",
-            # tier → codec matrix lookup. Values: "integrated_old",
-            # "integrated_modern", "discrete_mid", "discrete_high".
-            # Drives WebGPU adapterInfo + AV1 hardware decode reporting.
             "tier":          "integrated_modern",
         },
         "screen":  {"width": 1920, "height": 1080, "taskbar": 48, "dpr": 1.0},
@@ -219,6 +220,136 @@ DEVICE_TEMPLATES = [
         "battery": {"charging": False, "level": None},
         "weight":  3,
     },
+
+    # ─── High-end / gaming / workstation (added 2026-04) ───
+    # Fills the gap where the catalog had nothing above 32GB RAM /
+    # RTX 4070. Modern PC reality is 32-64GB DDR5 with RTX 40-series.
+    {
+        "name":    "gaming_nvidia_4070_super",
+        "cpu":     {"concurrency": 20, "memory": 32.0},
+        "gpu": {
+            "gl_vendor":     "Google Inc. (NVIDIA)",
+            "gl_renderer":   "ANGLE (NVIDIA, NVIDIA GeForce RTX 4070 SUPER Direct3D11 vs_5_0 ps_5_0, D3D11)",
+            "webgpu_vendor": "nvidia",
+            "webgpu_arch":   "ada-lovelace",
+            "tier":          "discrete_high",
+        },
+        "screen":  {"width": 2560, "height": 1440, "taskbar": 48, "dpr": 1.0},
+        "battery": None,
+        "weight":  3,
+    },
+    {
+        "name":    "gaming_nvidia_4080_super",
+        "cpu":     {"concurrency": 24, "memory": 64.0},
+        "gpu": {
+            "gl_vendor":     "Google Inc. (NVIDIA)",
+            "gl_renderer":   "ANGLE (NVIDIA, NVIDIA GeForce RTX 4080 SUPER Direct3D11 vs_5_0 ps_5_0, D3D11)",
+            "webgpu_vendor": "nvidia",
+            "webgpu_arch":   "ada-lovelace",
+            "tier":          "discrete_high",
+        },
+        "screen":  {"width": 2560, "height": 1440, "taskbar": 48, "dpr": 1.0},
+        "battery": None,
+        "weight":  2,
+    },
+    {
+        "name":    "enthusiast_nvidia_4090_4k",
+        "cpu":     {"concurrency": 32, "memory": 64.0},
+        "gpu": {
+            "gl_vendor":     "Google Inc. (NVIDIA)",
+            "gl_renderer":   "ANGLE (NVIDIA, NVIDIA GeForce RTX 4090 Direct3D11 vs_5_0 ps_5_0, D3D11)",
+            "webgpu_vendor": "nvidia",
+            "webgpu_arch":   "ada-lovelace",
+            "tier":          "discrete_high",
+        },
+        "screen":  {"width": 3840, "height": 2160, "taskbar": 48, "dpr": 1.5},
+        "battery": None,
+        "weight":  1,
+    },
+    {
+        "name":    "workstation_threadripper_a4000",
+        "cpu":     {"concurrency": 48, "memory": 128.0},
+        "gpu": {
+            "gl_vendor":     "Google Inc. (NVIDIA)",
+            "gl_renderer":   "ANGLE (NVIDIA, NVIDIA RTX A4000 Direct3D11 vs_5_0 ps_5_0, D3D11)",
+            "webgpu_vendor": "nvidia",
+            "webgpu_arch":   "ampere",
+            "tier":          "discrete_high",
+        },
+        "screen":  {"width": 3840, "height": 2160, "taskbar": 48, "dpr": 1.5},
+        "battery": None,
+        "weight":  1,
+    },
+    {
+        "name":    "amd_gaming_7900xt_2k",
+        "cpu":     {"concurrency": 24, "memory": 32.0},
+        "gpu": {
+            "gl_vendor":     "Google Inc. (AMD)",
+            "gl_renderer":   "ANGLE (AMD, AMD Radeon RX 7900 XT Direct3D11 vs_5_0 ps_5_0, D3D11)",
+            "webgpu_vendor": "amd",
+            "webgpu_arch":   "rdna-3",
+            "tier":          "discrete_high",
+        },
+        "screen":  {"width": 2560, "height": 1440, "taskbar": 48, "dpr": 1.0},
+        "battery": None,
+        "weight":  2,
+    },
+    {
+        "name":    "gaming_laptop_rtx4060_oled",
+        "cpu":     {"concurrency": 16, "memory": 32.0},
+        "gpu": {
+            "gl_vendor":     "Google Inc. (NVIDIA)",
+            "gl_renderer":   "ANGLE (NVIDIA, NVIDIA GeForce RTX 4060 Laptop GPU Direct3D11 vs_5_0 ps_5_0, D3D11)",
+            "webgpu_vendor": "nvidia",
+            "webgpu_arch":   "ada-lovelace",
+            "tier":          "discrete_mid",
+        },
+        "screen":  {"width": 2880, "height": 1800, "taskbar": 48, "dpr": 1.5},
+        "battery": {"charging": True, "level": None},
+        "weight":  2,
+    },
+    {
+        "name":    "ultrabook_4k_32gb",
+        "cpu":     {"concurrency": 16, "memory": 32.0},
+        "gpu": {
+            "gl_vendor":     "Google Inc. (Intel)",
+            "gl_renderer":   "ANGLE (Intel, Intel(R) Arc(TM) Graphics Direct3D11 vs_5_0 ps_5_0, D3D11)",
+            "webgpu_vendor": "intel",
+            "webgpu_arch":   "xe",
+            "tier":          "integrated_modern",
+        },
+        "screen":  {"width": 3840, "height": 2400, "taskbar": 48, "dpr": 2.0},
+        "battery": {"charging": True, "level": None},
+        "weight":  2,
+    },
+    {
+        "name":    "macbook_pro_16_m3_max",
+        "cpu":     {"concurrency": 16, "memory": 64.0},
+        "gpu": {
+            "gl_vendor":     "Google Inc. (Apple)",
+            "gl_renderer":   "ANGLE (Apple, ANGLE Metal Renderer: Apple M3 Max, Unspecified Version)",
+            "webgpu_vendor": "apple",
+            "webgpu_arch":   "apple-9",
+            "tier":          "discrete_high",
+        },
+        "screen":  {"width": 1728, "height": 1117, "taskbar": 25, "dpr": 2.0},
+        "battery": {"charging": True, "level": None},
+        "weight":  2,
+    },
+    {
+        "name":    "mac_studio_m2_ultra",
+        "cpu":     {"concurrency": 24, "memory": 64.0},
+        "gpu": {
+            "gl_vendor":     "Google Inc. (Apple)",
+            "gl_renderer":   "ANGLE (Apple, ANGLE Metal Renderer: Apple M2 Ultra, Unspecified Version)",
+            "webgpu_vendor": "apple",
+            "webgpu_arch":   "apple-8",
+            "tier":          "discrete_high",
+        },
+        "screen":  {"width": 3008, "height": 1692, "taskbar": 25, "dpr": 2.0},
+        "battery": None,
+        "weight":  1,
+    },
 ]
 
 # ──────────────────────────────────────────────────────────────
@@ -273,7 +404,7 @@ CODEC_MATRIX_BY_TIER: Dict[str, Dict[str, Dict[str, bool]]] = {
     },
 }
 
-# Windows 10/11 шрифты — CORE is allгyes
+# Windows 10/11 fonts -- the CORE set is always present
 WINDOWS_FONTS_CORE = [
     "Arial", "Arial Black", "Calibri", "Cambria", "Cambria Math",
     "Candara", "Comic Sans MS", "Consolas", "Constantia", "Corbel",
@@ -299,7 +430,7 @@ TIMEZONE_PROFILES = [
     {"id": "Europe/Kyiv", "offset_min": -180, "offset_str": "+03:00"},
 ]
 
-# Станyesртные PDF плагины Chrome 90+ (одинаковые у all)
+# Standard PDF plugins, same on every Chrome 90+
 STANDARD_CHROME_PLUGINS = [
     {
         "name":        "PDF Viewer",

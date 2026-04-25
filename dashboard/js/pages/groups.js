@@ -125,15 +125,19 @@ const Groups = {
               </div>
             </div>
             <div class="group-card-actions">
-              <button class="btn btn-primary"
+              <button class="btn btn-primary group-start-btn ${running > 0 ? "is-running" : ""}"
                       onclick="Groups.startGroup(${g.id})"
-                      ${g.member_count === 0 ? "disabled title='No members'" : ""}>
+                      ${g.member_count === 0
+                          ? "disabled title='No members'"
+                          : (running > 0
+                             ? `disabled title='Group already running (${running} member${running === 1 ? "" : "s"}). Stop the group before starting again.'`
+                             : "")}>
                 ▶ Start group
               </button>
-              <button class="btn btn-secondary"
+              <button class="btn btn-danger-strong group-stop-btn"
                       onclick="Groups.stopGroup(${g.id})"
                       ${running === 0 ? "disabled" : ""}>
-                ■ Stop
+                ■ Stop${running > 0 ? ` (${running})` : ""}
               </button>
               <button class="btn btn-secondary"
                       onclick="Groups.openEdit(${g.id})">

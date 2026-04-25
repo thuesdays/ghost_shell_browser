@@ -1,29 +1,35 @@
 """
-config.py — Совместимость со старым API Config via БД
+config.py — Compat shim for the old `Config` API, backed by the DB.
 
-Новый code использует db.get_db().config_get() напрямую.
-Этот модуль нalreadyн thatбы старые импорты `from config import Config` продолжали работать.
+New code calls `db.get_db().config_get()` directly. This module exists
+only so legacy imports like `from config import Config` keep working
+while we migrate callers over.
 """
+
+__author__ = "Mykola Kovhanko"
+__email__ = "thuesdays@gmail.com"
 
 import logging
 from ghost_shell.db.database import get_db
 
 
 class Config:
-    """Обёртка поверх БД — for backward compatibility со старым codeом"""
+    """Thin wrapper around the DB — kept for backward compatibility
+    with the pre-refactor flat-file config layer."""
 
     def __init__(self):
         self._db = get_db()
 
     @classmethod
     def load(cls, path: str = None) -> "Config":
-        """Старый API — игнорирует path, reads from DB. Авто-migrates старые файлы."""
+        """Old API — ignores `path`, reads from DB. Auto-migrates the
+        legacy on-disk files on first use."""
         cfg = cls()
         cfg._db.migrate_from_files(verbose=False)
         return cfg
 
     def get(self, path: str, default=None):
-        """Доступ по точечному пути: cfg.get('search.queries')"""
+        """Dotted-path read: `cfg.get('search.queries')`."""
         return self._db.config_get(path, default)
 
     def set(self, path: str, value):
@@ -34,6 +40,7 @@ class Config:
 
 
 if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO)
     logging.basicConfig(level=logging.INFO)
     cfg = Config.load()
     import json

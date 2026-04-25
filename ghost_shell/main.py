@@ -22,6 +22,9 @@ Custom actions are defined in config.actions.post_ad as a list of dicts:
 On matched target_domains, the actions.on_target_domain list is used instead.
 """
 
+__author__ = "Mykola Kovhanko"
+__email__ = "thuesdays@gmail.com"
+
 import os
 import sys
 import re
@@ -362,9 +365,9 @@ def is_offline_page(driver) -> bool:
             "return (document.body && document.body.innerText || '').substring(0, 300).toLowerCase();"
         )
         markers = [
-            "підключіться до інтернету", "connect to the internet",
+            "підkeyіться до інтернеу", "connect to the internet",
             "в режимі офлайн", "you're offline", "you are offline",
-            "нет соединения", "подключитесь к интернету",
+            "no соединения", "underkeysтесь к интернеу",
         ]
         return any(m in body_text for m in markers)
     except Exception:
@@ -384,7 +387,7 @@ def is_captcha_page(driver) -> bool:
         if any(m in title for m in (
             "unusual traffic",
             "підозрілий трафік",
-            "подозрительный трафик",
+            "underозрительный трафик",
             "before you continue to google",
             "are you a robot",
         )):
@@ -396,7 +399,7 @@ def is_captcha_page(driver) -> bool:
                 document.querySelector('#captcha-form') ||
                 document.querySelector('#recaptcha') ||
                 document.querySelector('div.g-recaptcha') ||
-                (document.body && /unusual traffic|невичайний трафік|нетипичный трафик/i
+                (document.body && /unusual traffic|невичайний трафік|неипичный трафик/i
                     .test(document.body.innerText.substring(0, 500)))
             );
         """)
@@ -418,7 +421,7 @@ def is_ads_preview_page(driver) -> bool:
         markers = [
             "ця сторінка призначена для випробовування",
             "this page is for testing google ads",
-            "эта страница предназначена для тестирования",
+            "эта page предназначена для тестирования",
         ]
         return any(m in body_text for m in markers)
     except Exception:

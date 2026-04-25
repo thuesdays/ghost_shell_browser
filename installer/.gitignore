@@ -4,3 +4,6 @@ deps/
 output/
 # IDE
 *.iss.bak
+
+# Auto-incrementing build counter (each developer's machine has its own)
+.build_number

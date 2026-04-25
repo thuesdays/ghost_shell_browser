@@ -21,6 +21,9 @@ wants to keep Timezone=Europe/Kyiv after regeneration → lock it, all
 other fields regenerate coherently around it.
 """
 
+__author__ = "Mykola Kovhanko"
+__email__ = "thuesdays@gmail.com"
+
 import hashlib
 import random
 import re

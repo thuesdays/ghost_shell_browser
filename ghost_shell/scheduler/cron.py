@@ -33,7 +33,12 @@ in a year, and even naive iteration clears 100k/s — we cap at 1
 year lookahead which means worst-case ~5s blocking. That's fine
 given we call this at startup + after each run, not per-frame.
 """
+
 from __future__ import annotations
+
+__author__ = "Mykola Kovhanko"
+__email__ = "thuesdays@gmail.com"
+
 from datetime import datetime, timedelta
 
 FIELD_BOUNDS = [

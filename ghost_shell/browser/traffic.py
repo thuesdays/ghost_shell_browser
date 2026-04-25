@@ -41,6 +41,9 @@ custom devtools handler. Selenium 4 supports this through script
 injection that listens for CDP events surfaced to window.
 """
 
+__author__ = "Mykola Kovhanko"
+__email__ = "thuesdays@gmail.com"
+
 import threading
 import time
 import logging

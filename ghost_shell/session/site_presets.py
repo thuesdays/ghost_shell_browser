@@ -27,6 +27,10 @@ a fresh install gets.
 """
 
 from __future__ import annotations
+
+__author__ = "Mykola Kovhanko"
+__email__ = "thuesdays@gmail.com"
+
 import random
 from typing import Iterable
 
@@ -68,7 +72,7 @@ MEDICAL = [
      "notes": "US gov — trusted signal"},
     {"url": "https://uk.wikipedia.org/wiki/%D0%9C%D0%B5%D0%B4%D0%B8%D1%86%D0%B8%D0%BD%D0%B0",
      "topic": "med-uk-ref",   "dwell_sec": (8, 14), "scroll": True,
-     "notes": "Ukrainian Wikipedia — Медицина article for ua-geo plausibility"},
+     "notes": "Ukrainian Wikipedia article (Medicine category) for ua-geo plausibility"},
     {"url": "https://en.wikipedia.org/wiki/Health",                    "topic": "med-ref",       "dwell_sec": (6, 12), "scroll": True,
      "notes": "Broad health overview — not a specific condition"},
     {"url": "https://www.ncbi.nlm.nih.gov/",                           "topic": "med-research",  "dwell_sec": (5, 10), "scroll": False,

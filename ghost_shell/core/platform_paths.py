@@ -14,6 +14,9 @@ Usage:
         ...
 """
 
+__author__ = "Mykola Kovhanko"
+__email__ = "thuesdays@gmail.com"
+
 import os
 import sys
 import platform as _platform

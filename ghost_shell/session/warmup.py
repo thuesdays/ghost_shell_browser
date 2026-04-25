@@ -21,6 +21,10 @@ plus (indirectly) populated cookies in the profile's user-data-dir.
 """
 
 from __future__ import annotations
+
+__author__ = "Mykola Kovhanko"
+__email__ = "thuesdays@gmail.com"
+
 import logging
 import random
 import time
@@ -59,6 +63,11 @@ CONSENT_SELECTORS_CSS = [
     'button[class*="cookie-consent"][class*="accept"]',
 ]
 
+# NOTE -- INTENTIONAL CYRILLIC: the text matchers below include
+# Russian and Ukrainian phrases ("Принять все", "Прийняти", etc.).
+# These are the visible labels on cookie-consent buttons of news
+# sites in RU / UA locales. Translating them to English would
+# break consent dismissal on those sites — leave them as-is.
 # Fall-back XPath by visible text (case-insensitive via translate()).
 CONSENT_XPATH_TEXTS = [
     "Accept all", "Accept All", "Accept", "I agree", "Agree",

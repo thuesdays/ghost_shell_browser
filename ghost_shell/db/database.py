@@ -1,8 +1,8 @@
 """
 db.py — Центральная SQLite база Ghost Shell
 
-Один файл ghost_shell.db contains everything: config, запуски, события,
-конкурентов, IP tracker, fingerprint history, логи, selfcheck.
+Один file ghost_shell.db contains everything: config, launchи, события,
+конкурентов, IP tracker, fingerprint history, logs, selfcheck.
 
 Usage:
     from db import DB
@@ -12,6 +12,9 @@ Usage:
     db.event_record(run_id, "profile_01", "search_ok", query="test")
     db.run_finish(run_id, exit_code=0)
 """
+
+__author__ = "Mykola Kovhanko"
+__email__ = "thuesdays@gmail.com"
 
 import os
 import json
@@ -421,7 +424,7 @@ CREATE INDEX IF NOT EXISTS idx_vault_status  ON vault_items(status);
 """
 
 
-# Дефолтные значения configа — используются on первом запуске.
+# Дефолтные values configа — используются on первом launch.
 # Platform-aware chrome path — default subdir and binary differ per OS.
 def _default_chrome_binary_path() -> str:
     try:
@@ -663,7 +666,7 @@ DEFAULT_CONFIG = {
 
 class DB:
     """
-    Потокоwithoutопасная обёртка над SQLite.
+    Потокоwithoutопасная обёртка above SQLite.
     Использует локальные коннекции на поток + WAL for конкурентного доступа.
     """
 
@@ -961,7 +964,7 @@ class DB:
         """, (key, json.dumps(value, ensure_ascii=False), datetime.now().isoformat(timespec="seconds")))
 
     def config_get_all(self) -> dict:
-        """Возвращает all config as вложенный dict"""
+        """Возвращает all config as влонный dict"""
         rows = self._get_conn().execute("SELECT key, value FROM config_kv").fetchall()
         flat = {}
         for row in rows:
@@ -982,7 +985,7 @@ class DB:
         return nested
 
     def config_set_all(self, nested: dict):
-        """Массовое обновление — рекурсивно разворачивает nested dict"""
+        """Массовое update — рекурсивно разворачивает nested dict"""
         def flatten(d: dict, prefix: str = "") -> dict:
             result = {}
             for k, v in d.items():
@@ -2835,7 +2838,7 @@ class DB:
             VALUES (?, ?, ?, ?)
         """, (run_id, datetime.now().isoformat(timespec="seconds"), level, message))
 
-        # Ротация — if больше MAX_LOGS, уyesляем старые
+        # Ротация — if больше MAX_LOGS, удаляем old
         count_row = conn.execute("SELECT COUNT(*) as n FROM logs").fetchone()
         if count_row["n"] > self.MAX_LOGS:
             excess = count_row["n"] - self.MAX_LOGS
@@ -3269,7 +3272,7 @@ class DB:
     # ──────────────────────────────────────────────────────────
 
     def migrate_from_files(self, verbose: bool = True):
-        """Одноразовая migration из старых файлов in DB"""
+        """Одноразовая migration из старых fileов in DB"""
         meta_key = "migrated_from_files"
         existing = self._get_conn().execute(
             "SELECT value FROM meta WHERE key = ?", (meta_key,)
@@ -3489,7 +3492,7 @@ class DB:
 _db_instance: Optional[DB] = None
 
 def get_db() -> DB:
-    """Синглтон — один DB на everything onложение"""
+    """Синглтон — один DB на everything onлоние"""
     global _db_instance
     if _db_instance is None:
         _db_instance = DB()
@@ -3532,9 +3535,9 @@ if __name__ == "__main__":
     elif cmd == "reset":
         if "--yes" in sys.argv:
             os.remove(db.path)
-            print("✓ БД уyesлена")
+            print("✓ БД удалена")
         else:
-            print("Добавь --yes for подтверждения")
+            print("Добавь --yes for underтверждения")
 
     else:
         print("Команды: init | migrate | info | config | competitors | reset --yes")

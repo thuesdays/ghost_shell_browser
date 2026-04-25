@@ -138,6 +138,17 @@
       </div>
 
       <div class="form-group">
+        <label class="form-label">Proxy URL <span class="form-label-optional">(optional)</span></label>
+        <input type="text" class="input" id="np-proxy"
+               placeholder="http://user:pass@host:port"
+               autocomplete="off" spellcheck="false">
+        <div class="form-hint">
+          Sets a per-profile proxy override on creation. Leave empty to inherit
+          the global proxy from the Proxy page. Supports HTTP, HTTPS, SOCKS5.
+        </div>
+      </div>
+
+      <div class="form-group">
         <div class="checkbox-row">
           <input type="checkbox" id="np-enrich" checked>
           <label for="np-enrich">
@@ -148,6 +159,19 @@
         <div class="form-hint">
           Seeds a realistic browsing history. Without this, first visit to Google
           looks like a brand-new browser (detection signal).
+        </div>
+      </div>
+
+      <div class="form-group">
+        <div class="checkbox-row">
+          <input type="checkbox" id="np-open-after" checked>
+          <label for="np-open-after">
+            Open the profile editor after creation
+          </label>
+        </div>
+        <div class="form-hint">
+          Recommended — lets you finish configuration (tags, fingerprint regen,
+          rotation rules, notes) right away.
         </div>
       </div>
     </div>

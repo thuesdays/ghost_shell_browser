@@ -14,6 +14,9 @@ recreated. This is what makes Dolphin-style profiles long-lived — they
 monitor health and swap fingerprint before it's too late.
 """
 
+__author__ = "Mykola Kovhanko"
+__email__ = "thuesdays@gmail.com"
+
 import os
 import json
 import logging

@@ -29,6 +29,9 @@
          data-section="sec-export">📦 Export config</a>
       <a href="#sec-import"   class="settings-nav-link"
          data-section="sec-import">📥 Import config</a>
+      <div class="settings-nav-sep"></div>
+      <a href="#sec-danger"   class="settings-nav-link settings-nav-danger"
+         data-section="sec-danger">⚠ Danger zone</a>
     </aside>
 
     <!-- Right: content, each section is a dense-panel.
@@ -459,6 +462,39 @@
           </button>
 
           <div id="import-result" class="settings-import-result" style="display:none;"></div>
+        </div>
+      </div>
+
+      <!-- Danger zone — destructive global operations.
+           Lives at the bottom so users have to scroll past everything
+           else to get here. Operations cannot be undone. -->
+      <div class="dense-panel dense-panel-danger profile-danger-zone" id="sec-danger">
+        <div class="dense-panel-header dense-panel-header-danger">
+          <div class="dense-panel-title">⚠ Danger zone</div>
+          <div class="dense-panel-hint">destructive — cannot be undone</div>
+        </div>
+        <div class="dense-panel-body">
+          <div class="dense-hint">
+            Global destructive operations. Configuration (profiles, scripts,
+            scheduler, vault, proxies) is <strong>preserved</strong> — only
+            historical counters and logs are wiped.
+          </div>
+
+          <div class="danger-op-row">
+            <div class="danger-op-body">
+              <div class="danger-op-title">Reset stats counters</div>
+              <div class="danger-op-desc">
+                Wipes <code>events</code>, <code>runs</code>,
+                <code>traffic_stats</code>, <code>action_events</code>,
+                <code>logs</code>, and <code>warmup_runs</code>. Profiles,
+                scripts, proxies, vault, and all settings remain. The
+                Overview page tiles will reset to zero.
+              </div>
+            </div>
+            <button class="btn btn-secondary btn-danger" id="btn-reset-stats">
+              ↻ Reset stats
+            </button>
+          </div>
         </div>
       </div>
 

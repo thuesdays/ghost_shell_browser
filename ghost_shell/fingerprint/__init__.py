@@ -1,5 +1,8 @@
 """Fingerprint coherence system: templates, generator, validator, selftest."""
 
+__author__ = "Mykola Kovhanko"
+__email__ = "thuesdays@gmail.com"
+
 from .templates import (
     all_templates,
     get_template,

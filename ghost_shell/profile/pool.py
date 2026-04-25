@@ -9,6 +9,9 @@ profile_pool.py — Оркестратор пула профилей
 работают коммерческие антидетект-системы типа Dolphin Teams.
 """
 
+__author__ = "Mykola Kovhanko"
+__email__ = "thuesdays@gmail.com"
+
 import os
 import json
 import random

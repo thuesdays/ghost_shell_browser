@@ -22,7 +22,12 @@ Not persisted (memory-only while unlocked):
 External deps:
   cryptography >= 42   (standard Fernet + PBKDF2HMAC)
 """
+
 from __future__ import annotations
+
+__author__ = "Mykola Kovhanko"
+__email__ = "thuesdays@gmail.com"
+
 import os, base64, logging, threading
 from datetime import datetime
 from typing import Optional

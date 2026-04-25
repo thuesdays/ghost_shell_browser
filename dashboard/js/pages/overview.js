@@ -1,513 +1,301 @@
 // ═══════════════════════════════════════════════════════════════
-// pages/overview.js — hero stats + 7-day chart + recent activity +
-// top competitors + per-profile health rollup
+// pages/overview.js — operator-focused dashboard home.
+//
+// Five hero tiles (vault / scheduler / active runs / proxies / captchas)
+// + quick actions + live runs strip + profile health table + recent
+// activity feed + fingerprint health.
+//
+// Competitor / search-volume metrics moved to the Competitors page;
+// this file no longer owns the 7-day chart or top-domains table.
 // ═══════════════════════════════════════════════════════════════
 
 const Overview = {
-  chart: null,
   _pollTimer: null,
+  _unsubRunFinished: null,
 
   async init() {
-    // Load everything in parallel
     await Promise.all([
-      this.loadHeadlineStats(),
-      this.loadRecentActivity(),
-      this.loadTopCompetitors(),
+      this.loadVaultTile(),
+      this.loadSchedulerTile(),
+      this.loadActiveRuns(),
+      this.loadProxyTile(),
+      this.loadCaptchaTile(),
       this.loadProfileHealth(),
+      this.loadActivityFeed(),
       this.loadFingerprintHealth(),
-      this.loadTrafficCard(),
     ]);
 
-    // Clicking the traffic card navigates to the full page. We attach
-    // here rather than in HTML because navigate() is a JS function —
-    // cleaner than an onclick handler that calls it.
-    const card = document.getElementById("stat-traffic-card");
-    if (card) {
-      const go = () => navigate("traffic");
-      card.addEventListener("click", go);
-      card.addEventListener("keydown", (e) => {
-        if (e.key === "Enter" || e.key === " ") { e.preventDefault(); go(); }
-      });
-    }
-
-    // Reset-all-stats button in hero top-right. Uses the same
-    // confirmDialog pattern as delete-profile for consistency.
-    const resetBtn = document.getElementById("ov-reset-stats-btn");
-    if (resetBtn) {
-      resetBtn.addEventListener("click", () => this.resetStats());
-    }
-
-    // ── Live invalidation on run completion ─────────────────────
-    // Previously Overview relied solely on a 15s setInterval poll, so
-    // a just-completed run would show stale numbers until the next
-    // tick. Now the server broadcasts a `run_finished` event over the
-    // SSE channel and we refresh the cheap stats immediately.
-    // Unsub stored for teardown().
-    this._unsubRunFinished = onSystemEvent("run_finished", () => {
-      this.loadHeadlineStats();
-      this.loadRecentActivity();
-      this.loadTrafficCard();
-    });
-
-    // ── Auto-refresh loop ───────────────────────────────────────
-    // Previously Overview loaded once on mount and never refreshed.
-    // If a run completed while the user was looking at Overview, they
-    // had to navigate away and back to see updated totals. Now we
-    // re-pull stats every 15s while the page is active. The interval
-    // clears itself as soon as the user moves to a different page
-    // (currentPage !== "overview") to avoid wasted requests.
-    // Backstop poll — the run_finished event handles the common
-    // "run just ended" case instantly. This interval exists for
-    // mid-run metric drift (traffic accumulating, etc) and is the
-    // safety net if an SSE event gets dropped.
+    // Auto-refresh — quick polls, only the cheap stuff
     clearInterval(this._pollTimer);
     this._pollTimer = setInterval(() => {
-      if (currentPage !== "overview") {
-        clearInterval(this._pollTimer);
-        this._pollTimer = null;
-        return;
-      }
-      this.loadHeadlineStats();
-      this.loadRecentActivity();
-      this.loadTrafficCard();
+      if (currentPage !== "overview") { clearInterval(this._pollTimer); return; }
+      this.loadActiveRuns();
+      this.loadVaultTile();
+      this.loadSchedulerTile();
+      this.loadCaptchaTile();
     }, 5000);
+
+    // SSE invalidate on run finish — refresh the heavier pieces
+    if (typeof onSystemEvent === "function") {
+      this._unsubRunFinished = onSystemEvent("run_finished", () => {
+        this.loadProfileHealth();
+        this.loadActivityFeed();
+        this.loadCaptchaTile();
+        this.loadActiveRuns();
+      });
+    }
   },
 
   teardown() {
-    if (this._pollTimer) {
-      clearInterval(this._pollTimer);
-      this._pollTimer = null;
-    }
-    if (this._unsubRunFinished) {
-      this._unsubRunFinished();
-      this._unsubRunFinished = null;
-    }
+    clearInterval(this._pollTimer);
+    if (typeof this._unsubRunFinished === "function") this._unsubRunFinished();
   },
 
-  /** Nuke all stats with a two-stage confirm: first a summary dialog,
-   *  then a final "are you SURE" since it's destructive and can't be
-   *  undone. Refreshes the overview in place on success so the user
-   *  sees the zeroed numbers immediately. */
-  async resetStats() {
-    const btn = document.getElementById("ov-reset-stats-btn");
+  // ─── Hero tiles ────────────────────────────────────────────
 
-    // Stage 1: summary of what gets cleared vs kept
-    if (!await confirmDialog({
-      title: "↻ Reset all statistics?",
-      message:
-        `This clears <strong>all run history and telemetry</strong> and ` +
-        `cannot be undone.<br><br>` +
-        `<strong>Will be deleted:</strong><br>` +
-        `&nbsp;&nbsp;• All runs history (success / failed)<br>` +
-        `&nbsp;&nbsp;• All search events (search_ok, search_empty, captcha)<br>` +
-        `&nbsp;&nbsp;• All collected competitor URLs<br>` +
-        `&nbsp;&nbsp;• All post-click action events<br>` +
-        `&nbsp;&nbsp;• Traffic samples (bandwidth per domain)<br>` +
-        `&nbsp;&nbsp;• IP health history (burn counts, captcha counts per IP)<br>` +
-        `&nbsp;&nbsp;• Self-check cache<br><br>` +
-        `<strong>Will be kept:</strong><br>` +
-        `&nbsp;&nbsp;• All profiles (folders, cookies, history, tags, notes)<br>` +
-        `&nbsp;&nbsp;• All config (proxy, queries, behavior settings)<br>` +
-        `&nbsp;&nbsp;• Current fingerprints (regen is expensive)<br>` +
-        `&nbsp;&nbsp;• Scripts and schedules<br>`,
-      confirmText: "Continue",
-      confirmStyle: "danger",
-    })) return;
-
+  async loadVaultTile() {
+    const stateEl = $("#ov-vault-state");
+    const subEl   = $("#ov-vault-sub");
     try {
-      if (btn) btn.disabled = true;
-      const r = await api("/api/stats/reset", { method: "POST" });
-
-      const total = r.total_rows || 0;
-      const tCount = (r.tables || []).length;
-      toast(
-        `✓ Stats reset — cleared ${total.toLocaleString()} rows ` +
-        `across ${tCount} table${tCount === 1 ? "" : "s"}`
-      );
-
-      // Refresh everything so the user sees zeroed numbers without
-      // a manual reload.
-      await Promise.all([
-        this.loadHeadlineStats(),
-        this.loadRecentActivity(),
-        this.loadTopCompetitors(),
-        this.loadProfileHealth(),
-        this.loadFingerprintHealth(),
-        this.loadTrafficCard(),
-      ]);
-    } catch (e) {
-      toast("Reset failed: " + (e.message || e), true);
-    } finally {
-      if (btn) btn.disabled = false;
-    }
-  },
-
-  // ── Traffic card (24h rollup, clicks through to full page) ──────
-  //
-  // Queries the same /api/traffic/summary endpoint the Traffic page uses.
-  // We show bytes + request count, and flag "heavy" traffic so users
-  // with paid proxies notice before their next bill. Heavy threshold
-  // is 1 GB/day per profile pool — tuned against asocks pricing (~$3/GB
-  // for residential). Users with different price tiers can adjust the
-  // threshold in Settings (not yet wired — see traffic.heavy_threshold_gb).
-
-  async loadTrafficCard() {
-    const bytesEl = document.getElementById("stat-traffic-bytes");
-    const subEl   = document.getElementById("stat-traffic-sub");
-    const chipEl  = document.getElementById("stat-traffic-chip");
-    if (!bytesEl) return;
-    try {
-      const s = await api("/api/traffic/summary?hours=24");
-      const b = s.total_bytes || 0;
-      // formatBytes is the canonical helper from utils.js — loaded
-      // before page scripts, always available on window.
-      bytesEl.textContent = formatBytes(b);
-      subEl.textContent   = `${(s.total_requests || 0).toLocaleString()} requests`;
-      // Heavy = >1 GB in 24h. Chip is hint, not a blocker.
-      if (chipEl) {
-        chipEl.style.display = b > 1024 * 1024 * 1024 ? "" : "none";
+      const v = await api("/api/vault/status");
+      if (!v.initialized) {
+        stateEl.textContent = "Not set";
+        subEl.textContent   = "click to initialize";
+        return;
+      }
+      if (v.unlocked) {
+        stateEl.textContent = "🔓 Unlocked";
+        // Pull item count for a useful sub-line
+        try {
+          const items = await api("/api/vault/items");
+          const total = (items.items || []).length;
+          subEl.textContent = `${total} item${total === 1 ? "" : "s"} in vault`;
+        } catch { subEl.textContent = "ready"; }
+      } else {
+        stateEl.textContent = "🔒 Locked";
+        subEl.textContent   = "click to unlock";
       }
     } catch (e) {
-      bytesEl.textContent = "—";
-      subEl.textContent   = "no data";
-      console.warn("Traffic card load:", e);
+      stateEl.textContent = "—";
+      subEl.textContent   = "vault unavailable";
     }
   },
 
-  // ── Headline stats (hero + big cards + chart) ────────────────
+  async loadSchedulerTile() {
+    const stateEl = $("#ov-sched-state");
+    const subEl   = $("#ov-sched-sub");
+    try {
+      const s = await api("/api/scheduler/status");
+      if (s.is_running && (s.health || "ok") === "ok") {
+        stateEl.textContent = "Running";
+        if (s.next_run_at) {
+          const d = new Date(s.next_run_at);
+          subEl.textContent = `next: ${d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}`;
+        } else {
+          subEl.textContent = `${s.runs_today ?? 0}/${s.target_runs_per_day ?? "—"} today`;
+        }
+      } else if (s.is_running) {
+        stateEl.textContent = "Wedged";
+        subEl.textContent   = "click to recover";
+      } else {
+        stateEl.textContent = "Stopped";
+        subEl.textContent   = "click to start";
+      }
+    } catch (e) {
+      stateEl.textContent = "—";
+      subEl.textContent   = "—";
+    }
+  },
 
-  async loadHeadlineStats() {
+  async loadActiveRuns() {
+    const countEl = $("#ov-active-count");
+    const subEl   = $("#ov-active-sub");
+    const panel   = $("#ov-active-panel");
+    const list    = $("#ov-active-runs");
+    try {
+      const data = await api("/api/runs/active").catch(() => ({ active: [] }));
+      const active = data.active || data || [];
+      const n = Array.isArray(active) ? active.length : 0;
+      countEl.textContent = n;
+      subEl.textContent   = n ? `live · click to monitor` : "everything quiet";
+
+      if (n > 0) {
+        panel.style.display = "block";
+        list.innerHTML = active.map(r => {
+          const profile = r.profile_name || r.profile || "—";
+          const queries = r.queries_done != null
+            ? `${r.queries_done}/${r.queries_total ?? "?"} queries`
+            : "starting…";
+          const dur = r.started_at
+            ? timeAgo(r.started_at)
+            : "—";
+          return `
+            <div class="ov-run-card">
+              <div class="ov-run-card-name">
+                <span class="ov-run-card-pulse"></span>
+                ${escapeHtml(profile)}
+              </div>
+              <div class="ov-run-card-meta">${escapeHtml(dur)} · run #${r.id ?? "?"}</div>
+              <div class="ov-run-card-progress">${escapeHtml(queries)}</div>
+            </div>`;
+        }).join("");
+      } else {
+        panel.style.display = "none";
+      }
+    } catch (e) {
+      countEl.textContent = "—";
+      subEl.textContent   = "—";
+      panel.style.display = "none";
+    }
+  },
+
+  async loadProxyTile() {
+    const countEl = $("#ov-proxy-count");
+    const subEl   = $("#ov-proxy-sub");
+    try {
+      const data = await api("/api/proxies");
+      const list = Array.isArray(data) ? data : (data.proxies || []);
+      const total = list.length;
+      const ok    = list.filter(p => p.last_status === "ok").length;
+      const err   = list.filter(p => p.last_status === "error").length;
+      countEl.textContent = `${ok}/${total}`;
+      const parts = [];
+      if (err) parts.push(`${err} error`);
+      const untested = total - ok - err;
+      if (untested) parts.push(`${untested} untested`);
+      subEl.textContent = parts.length ? parts.join(" · ") : "all healthy";
+    } catch (e) {
+      countEl.textContent = "—";
+      subEl.textContent   = "—";
+    }
+  },
+
+  async loadCaptchaTile() {
+    const countEl = $("#ov-captcha-count");
+    const subEl   = $("#ov-captcha-sub");
     try {
       const stats = await api("/api/stats");
-
-      // Hero title — friendly greeting
-      const hour = new Date().getHours();
-      const greet = hour < 5 ? "Good night" :
-                    hour < 12 ? "Good morning" :
-                    hour < 17 ? "Good afternoon" :
-                    hour < 22 ? "Good evening" : "Good night";
-      $("#ov-hero-title").textContent = `${greet}!`;
-      $("#ov-hero-sub").textContent =
-        `${stats.active_profiles ?? stats.total_profiles ?? 0} profile(s) active · ` +
-        `${stats.total_competitors || 0} competitors tracked`;
-
-      // Hero stats (24h)
-      const d = stats.daily || [];
-      const today = d[d.length - 1] || {};
-      const yday  = d[d.length - 2] || {};
-
-      $("#hero-searches").textContent = today.searches ?? 0;
-      this._renderTrend("hero-searches-trend",
-                        today.searches ?? 0, yday.searches ?? 0);
-
-      $("#hero-ads").textContent = today.ads ?? 0;
-      this._renderTrend("hero-ads-trend",
-                        today.ads ?? 0, yday.ads ?? 0);
-
-      $("#hero-captchas").textContent = today.captchas ?? 0;
-      this._renderTrend("hero-captchas-trend",
-                        today.captchas ?? 0, yday.captchas ?? 0,
-                        true);   // inverted: less captchas = better
-
-      // Actions (24h): clicks / visits / reads ran
-      const a24 = stats.actions_24h || {};
-      const ranH = a24.actions_ran || 0;
-      const skH  = a24.actions_skipped || 0;
-      $("#hero-actions").textContent = ranH;
-      // Build breakdown by type: "5 click_ad · 3 visit_link …"
-      const byType = a24.by_type || {};
-      const breakdown = Object.entries(byType)
-        .slice(0, 3)
-        .map(([t, n]) => `${n} ${t.replace(/_/g, " ")}`)
-        .join(" · ");
-      const trendEl = $("#hero-actions-trend");
-      if (trendEl) {
-        if (breakdown) {
-          trendEl.textContent = breakdown + (skH ? ` · ${skH} skipped` : "");
-        } else if (skH) {
-          trendEl.textContent = `${skH} skipped (no clicks yet)`;
-        } else {
-          trendEl.textContent = "no actions yet";
-        }
-      }
-
-      // Success rate (24h)
-      const totalToday = (today.searches ?? 0) + (today.empty ?? 0)
-                       + (today.captchas ?? 0);
-      const rateToday = totalToday > 0
-        ? (today.searches ?? 0) / totalToday
-        : 0;
-      const totalYday = (yday.searches ?? 0) + (yday.empty ?? 0)
-                      + (yday.captchas ?? 0);
-      const rateYday = totalYday > 0
-        ? (yday.searches ?? 0) / totalYday
-        : 0;
-
-      $("#hero-rate").textContent = (rateToday * 100).toFixed(0) + "%";
-      this._renderTrend("hero-rate-trend",
-                        rateToday, rateYday, false, "%");
-
-      // Totals block — field names match what /api/stats returns.
-      // total_searches / total_ads / total_captchas come from the runs
-      // table now (previously from events, which silently undercounted).
-      $("#stat-searches").textContent    = stats.total_searches ?? 0;
-      $("#stat-ads").textContent         = stats.total_ads ?? 0;
-      $("#stat-competitors").textContent = stats.total_competitors ?? 0;
-      // "Active profiles" card — label says "active", so show distinct
-      // profiles that had a run in the last 7 days, not total-ever-seen.
-      $("#stat-profiles").textContent    = stats.active_profiles ?? 0;
-
-      // All-time actions performed
-      const at = stats.actions_total || {};
-      const ranAll = at.actions_ran || 0;
-      const skAll  = at.actions_skipped || 0;
-      const errAll = at.actions_errored || 0;
-      const statActions = $("#stat-actions");
-      if (statActions) statActions.textContent = ranAll;
-      const statActionsSub = $("#stat-actions-sub");
-      if (statActionsSub) {
-        const parts = [];
-        if (skAll)  parts.push(`${skAll} skipped`);
-        if (errAll) parts.push(`${errAll} errored`);
-        statActionsSub.textContent = parts.length
-          ? parts.join(" · ")
-          : "no skipped / errored";
-      }
-
-      const badge = $("#badge-competitors");
-      if (badge) badge.textContent = stats.total_competitors;
-
-      this.renderChart(stats.daily || []);
+      const c = stats?.captchas_24h ?? stats?.captchas ?? 0;
+      const r = stats?.searches_24h ?? 0;
+      countEl.textContent = c;
+      const rate = (c + r) > 0 ? (100 * c / (c + r)).toFixed(1) : "0.0";
+      subEl.textContent = c
+        ? `${rate}% rate · ${r} searches`
+        : "clean — no captchas in 24h";
     } catch (e) {
-      console.error("overview stats:", e);
-      $("#ov-hero-sub").textContent = "Failed to load statistics";
+      countEl.textContent = "—";
+      subEl.textContent   = "—";
     }
   },
 
-  _renderTrend(elId, current, previous, invert = false, suffix = "") {
-    const el = $("#" + elId);
-    if (!el) return;
-    if (previous == null || previous === 0) {
-      if (current > 0) {
-        el.textContent = "new";
-        el.className = "ov-hero-stat-trend up";
-      } else {
-        el.textContent = "—";
-        el.className = "ov-hero-stat-trend flat";
-      }
-      return;
-    }
-    const diff = current - previous;
-    if (diff === 0) {
-      el.textContent = "no change";
-      el.className = "ov-hero-stat-trend flat";
-      return;
-    }
-    const pct = Math.round((diff / Math.abs(previous)) * 100);
-    const isGood = invert ? diff < 0 : diff > 0;
-    el.textContent = (diff > 0 ? "▲" : "▼") + " "
-      + Math.abs(pct) + "% vs yesterday";
-    el.className = "ov-hero-stat-trend " + (isGood ? "up" : "down");
-  },
-
-  renderChart(daily) {
-    const canvas = $("#chart-daily");
-    if (!canvas) return;
-    const ctx = canvas.getContext("2d");
-    if (this.chart) this.chart.destroy();
-    this.chart = new Chart(ctx, {
-      type: "line",
-      data: {
-        labels: daily.map(d => d.date),
-        datasets: [
-          {
-            label: "Searches",
-            data: daily.map(d => d.searches),
-            borderColor: "#34d399",
-            backgroundColor: "rgba(52, 211, 153, 0.12)",
-            fill: true, tension: 0.4, borderWidth: 2,
-            pointRadius: 3, pointBackgroundColor: "#34d399",
-          },
-          {
-            label: "Captchas",
-            data: daily.map(d => d.captchas),
-            borderColor: "#fbbf24",
-            backgroundColor: "rgba(251, 191, 36, 0.12)",
-            fill: true, tension: 0.4, borderWidth: 2,
-            pointRadius: 3, pointBackgroundColor: "#fbbf24",
-          },
-          {
-            label: "Empty",
-            data: daily.map(d => d.empty),
-            borderColor: "#6b7280",
-            backgroundColor: "rgba(107, 114, 128, 0.08)",
-            fill: true, tension: 0.4, borderWidth: 1,
-            borderDash: [4, 4],
-            pointRadius: 2, pointBackgroundColor: "#6b7280",
-          },
-        ],
-      },
-      options: {
-        responsive: true,
-        maintainAspectRatio: false,
-        plugins: {
-          legend: {
-            labels: { color: "#cbd5e1", usePointStyle: true,
-                      boxWidth: 8, boxHeight: 8 },
-          },
-          tooltip: {
-            backgroundColor: "rgba(15, 20, 25, 0.95)",
-            borderColor: "rgba(99, 102, 241, 0.3)",
-            borderWidth: 1,
-          },
-        },
-        scales: {
-          x: { ticks: { color: "#8a93a6" },
-               grid: { color: "rgba(255, 255, 255, 0.04)" } },
-          y: { ticks: { color: "#8a93a6" },
-               grid: { color: "rgba(255, 255, 255, 0.04)" },
-               beginAtZero: true },
-        },
-      },
-    });
-  },
-
-  // ── Recent activity feed ─────────────────────────────────────
-
-  async loadRecentActivity() {
-    try {
-      const runs = await api("/api/runs?limit=8");
-      const el = $("#ov-activity");
-      if (!runs || !runs.length) {
-        el.innerHTML = `<div class="empty-state" style="padding: 20px 0;">
-          No runs yet. Start your first one!
-        </div>`;
-        return;
-      }
-      el.innerHTML = runs.slice(0, 8).map(r => this._renderActivityItem(r)).join("");
-    } catch (e) {
-      console.error("recent activity:", e);
-    }
-  },
-
-  _renderActivityItem(run) {
-    let dotClass = "neutral";
-    let title;
-    if (run.exit_code == null) {
-      dotClass = "neutral";
-      title = `Running… #${run.id}`;
-    } else if (run.exit_code === 0) {
-      dotClass = "ok";
-      title = `Run #${run.id} completed`;
-    } else {
-      dotClass = "err";
-      title = `Run #${run.id} failed`;
-    }
-    const when   = formatAgo(run.started_at);
-    const ads    = run.total_ads ?? 0;
-    const caps   = run.captchas ?? 0;
-    const prof   = run.profile_name || "—";
-    return `
-      <div class="ov-activity-item">
-        <div class="ov-activity-dot ${dotClass}"></div>
-        <div class="ov-activity-body">
-          <div class="ov-activity-title">${escapeHtml(title)}</div>
-          <div class="ov-activity-meta">
-            ${escapeHtml(prof)} · ${ads} ad(s)${caps > 0 ? ` · ${caps} captcha(s)` : ""} · ${when}
-          </div>
-        </div>
-      </div>
-    `;
-  },
-
-  // ── Top competitors ──────────────────────────────────────────
-
-  async loadTopCompetitors() {
-    try {
-      const comps = await api("/api/competitors");
-      const tbody = $("#top-competitors-tbody");
-      const badge = $("#top-competitors-badge");
-      const list  = Array.isArray(comps) ? comps
-                  : (comps.items || comps.list || []);
-      if (badge) badge.textContent = list.length;
-
-      if (!list.length) {
-        tbody.innerHTML = `<tr><td colspan="4" class="empty-state">No competitors tracked yet</td></tr>`;
-        return;
-      }
-
-      // Top 10 by frequency
-      const top = list
-        .sort((a, b) => (b.count || b.queries_count || 0) - (a.count || a.queries_count || 0))
-        .slice(0, 10);
-
-      tbody.innerHTML = top.map(c => `
-        <tr>
-          <td><strong>${escapeHtml(c.domain || "—")}</strong></td>
-          <td class="muted">${escapeHtml((c.title || c.sample_title || "—").slice(0, 60))}</td>
-          <td>${c.count ?? c.queries_count ?? "—"}</td>
-          <td class="muted">${escapeHtml(formatAgo(c.last_seen))}</td>
-        </tr>
-      `).join("");
-    } catch (e) {
-      console.error("competitors:", e);
-    }
-  },
-
-  // ── Per-profile health rollup ────────────────────────────────
+  // ─── Profile health (left column) ──────────────────────────
 
   async loadProfileHealth() {
+    const tbody = $("#profile-health-tbody");
     try {
       const profiles = await api("/api/profiles");
-      const tbody = $("#profile-health-tbody");
       if (!profiles || !profiles.length) {
-        tbody.innerHTML = `<tr><td colspan="6" class="empty-state">No profiles yet</td></tr>`;
+        tbody.innerHTML =
+          `<tr><td colspan="6" class="dense-empty-cell">No profiles yet — create one on the Profiles page.</td></tr>`;
         return;
       }
+      // Pull FP scores in parallel — saves one round-trip per row
+      let fpByName = {};
+      try {
+        const summary = await api("/api/fingerprints/summary");
+        for (const r of (summary.profiles || [])) fpByName[r.profile_name] = r;
+      } catch {}
 
       tbody.innerHTML = profiles.map(p => {
-        const passed = p.selfcheck_passed ?? "—";
-        const total  = p.selfcheck_total  ?? "—";
-        const scText = (passed != null && total != null)
-                        ? `${passed}/${total}` : "—";
-        const scClass = (passed != null && total != null)
-                        ? (passed === total ? "pill pill-ok"
-                         : passed > total * 0.8 ? "pill pill-warn"
-                         : "pill pill-err")
-                        : "pill";
-
-        const captchas  = p.captchas_24h ?? 0;
-        const searches  = p.searches_24h ?? 0;
-        const rate      = (searches + captchas) > 0
-                          ? (captchas / (searches + captchas))
-                          : 0;
-        const rateStr   = (rate * 100).toFixed(1) + "%";
-        const rateClass = rate > 0.2 ? "pill pill-err"
-                        : rate > 0.05 ? "pill pill-warn"
-                        : "pill pill-ok";
-
-        const status  = p.status || "ready";
+        const status   = (p.status || "idle").toLowerCase();
+        const blocks   = p.consecutive_blocks || 0;
+        const captchas = p.captchas_24h ?? 0;
+        const searches = p.searches_24h ?? 0;
+        const rate     = (searches + captchas) > 0
+                         ? (100 * captchas / (searches + captchas)).toFixed(1) + "%"
+                         : "—";
+        const rateCls  = (searches + captchas) > 0
+                         ? (captchas / (searches + captchas) > 0.2 ? "pill-err"
+                          : captchas / (searches + captchas) > 0.05 ? "pill-warn"
+                          : "pill-ok")
+                         : "pill-idle";
+        const fp     = fpByName[p.name] || {};
+        const score  = fp.coherence_score;
+        const fpCls  = score == null ? "pill-idle"
+                     : score >= 90   ? "pill-ok"
+                     : score >= 75   ? ""
+                     : "pill-err";
+        const fpHtml = score == null
+          ? '<span class="pill pill-idle">—</span>'
+          : `<span class="pill ${fpCls}">${score}</span>`;
+        const lastRun = p.last_run_at ? timeAgo(p.last_run_at) : "—";
+        const rowCls = `profile-status-${status === "running" ? "running" :
+                                          blocks >= 3        ? "blocked" :
+                                          status === "active" ? "active"  : "idle"}`;
         return `
-          <tr style="cursor: pointer;" onclick="navigate('profile')">
-            <td><strong>${escapeHtml(p.name || "—")}</strong></td>
-            <td class="muted">${escapeHtml(p.template || "—")}</td>
-            <td><span class="${scClass}">${scText}</span></td>
-            <td>${searches}</td>
-            <td><span class="${rateClass}">${rateStr}</span></td>
-            <td><span class="pill pill-${status}">${status}</span></td>
-          </tr>
-        `;
+          <tr class="${rowCls}" style="cursor: pointer;"
+              onclick="(function(){configCache.browser=configCache.browser||{};configCache.browser.profile_name='${escapeHtml(p.name)}';navigate('profile');})()">
+            <td><strong>${escapeHtml(p.name)}</strong>
+              ${blocks ? `<span class="pill pill-warn" style="margin-left:6px;">⚠ ${blocks} blocks</span>` : ""}
+            </td>
+            <td><span class="pill pill-${status}">${escapeHtml(status)}</span></td>
+            <td>${fpHtml}</td>
+            <td class="num">${searches}</td>
+            <td class="num"><span class="pill ${rateCls}">${rate}</span></td>
+            <td class="muted" style="font-family: ui-monospace, monospace; font-size: 11px;">
+              ${escapeHtml(lastRun)}
+            </td>
+          </tr>`;
       }).join("");
     } catch (e) {
       console.error("profile health:", e);
+      tbody.innerHTML = `<tr><td colspan="6" class="dense-empty-cell">Failed to load: ${escapeHtml(e.message)}</td></tr>`;
     }
   },
 
-  // ── Fingerprint health rollup (Phase 2 coherence system) ──────
-  // Per-profile view of coherence scores. Uses /api/fingerprints/summary
-  // which joins profiles ⟕ fingerprints (LEFT JOIN) so profiles without
-  // a fingerprint still appear — that's actually the interesting case
-  // because it means the user hasn't adopted the new system yet.
+  // ─── Activity feed (right column) ──────────────────────────
+
+  async loadActivityFeed() {
+    const host = $("#ov-activity");
+    if (!host) return;
+    try {
+      // Mix recent runs + recent warmups + recent fingerprint events
+      // into a single timeline. /api/runs gives us the bulk of it.
+      const runs = await api("/api/runs?limit=15").catch(() => []);
+      const items = (Array.isArray(runs) ? runs : runs.runs || []).map(r => ({
+        kind:  r.exit_code === 0 ? "run-ok" : "run-fail",
+        icon:  r.exit_code === 0 ? "✓" : "✗",
+        title: r.exit_code === 0
+                 ? `Run #${r.id} ok — ${r.profile_name}`
+                 : `Run #${r.id} failed — ${r.profile_name}`,
+        meta:  `${r.total_queries ?? 0} queries · ${r.captchas ?? 0} captchas`,
+        at:    r.finished_at || r.started_at,
+      }));
+
+      if (!items.length) {
+        host.innerHTML = '<div class="dense-empty" style="padding: 24px 18px;">No activity yet — start your first run.</div>';
+        return;
+      }
+
+      // Take 12 most-recent
+      items.sort((a, b) => (a.at < b.at ? 1 : -1));
+      host.innerHTML = items.slice(0, 12).map(it => `
+        <div class="ov-feed-item">
+          <div class="ov-feed-icon ${it.kind}">${it.icon}</div>
+          <div>
+            <div class="ov-feed-body">${escapeHtml(it.title)}</div>
+            <div class="ov-feed-meta">${escapeHtml(it.meta || "")}</div>
+          </div>
+          <div class="ov-feed-when">${escapeHtml(it.at ? timeAgo(it.at) : "—")}</div>
+        </div>
+      `).join("");
+    } catch (e) {
+      host.innerHTML = `<div class="dense-empty" style="padding: 24px 18px;">Feed unavailable: ${escapeHtml(e.message)}</div>`;
+    }
+  },
+
+  // ─── Fingerprint health rollup ─────────────────────────────
+
   async loadFingerprintHealth() {
     try {
       const resp = await api("/api/fingerprints/summary");
@@ -516,41 +304,30 @@ const Overview = {
 
       if (!rows.length) {
         tbody.innerHTML = `<tr><td colspan="5" class="dense-empty-cell">No profiles yet</td></tr>`;
-        document.getElementById("ov-fp-avg-score").textContent = "—";
-        document.getElementById("ov-fp-warn-count").textContent = "—";
-        document.getElementById("ov-fp-missing-count").textContent = "—";
+        $("#ov-fp-avg-score").textContent     = "—";
+        $("#ov-fp-warn-count").textContent    = "—";
+        $("#ov-fp-missing-count").textContent = "—";
         return;
       }
 
-      // Aggregate — average across profiles that HAVE a fingerprint;
-      // missing ones counted separately as they have no score to include.
-      const withFp = rows.filter(r => r.coherence_score != null);
+      const withFp  = rows.filter(r => r.coherence_score != null);
       const missing = rows.length - withFp.length;
-      const warn = withFp.filter(r => r.coherence_score < 75).length;
-      const avg = withFp.length
-        ? Math.round(withFp.reduce((s, r) => s + r.coherence_score, 0) / withFp.length)
-        : null;
+      const warn    = withFp.filter(r => r.coherence_score < 75).length;
+      const avg     = withFp.length
+                      ? Math.round(withFp.reduce((s, r) => s + r.coherence_score, 0) / withFp.length)
+                      : null;
 
-      const avgEl = document.getElementById("ov-fp-avg-score");
-      const warnEl = document.getElementById("ov-fp-warn-count");
-      const missEl = document.getElementById("ov-fp-missing-count");
-      avgEl.textContent = avg == null ? "—" : avg;
-      warnEl.textContent = warn;
-      missEl.textContent = missing;
+      $("#ov-fp-avg-score").textContent     = avg == null ? "—" : avg;
+      $("#ov-fp-warn-count").textContent    = warn;
+      $("#ov-fp-missing-count").textContent = missing;
 
-      // Colour each aggregate tile by its own severity
-      const avgTile  = document.getElementById("ov-fp-tile-avg");
-      const warnTile = document.getElementById("ov-fp-tile-warn");
-      const missTile = document.getElementById("ov-fp-tile-missing");
-      avgTile.className  = "overview-fp-summary-tile "
-        + (avg == null ? "" : avg >= 90 ? "ok" : avg >= 75 ? "" : avg >= 55 ? "warn" : "bad");
-      warnTile.className = "overview-fp-summary-tile "
-        + (warn > 0 ? "warn" : "ok");
-      missTile.className = "overview-fp-summary-tile "
-        + (missing > 0 ? "bad" : "ok");
+      const tileCls = (n) => n > 0 ? "warn" : "ok";
+      $("#ov-fp-tile-avg").className     = "overview-fp-summary-tile " +
+        (avg == null ? "" : avg >= 90 ? "ok" : avg >= 75 ? "" : avg >= 55 ? "warn" : "bad");
+      $("#ov-fp-tile-warn").className    = "overview-fp-summary-tile " + tileCls(warn);
+      $("#ov-fp-tile-missing").className = "overview-fp-summary-tile " + (missing ? "bad" : "ok");
 
-      // Sort: missing first (most actionable), then by score ascending
-      // (worst fingerprints float up so they're immediately visible).
+      // Sort: missing first, then by score asc
       rows.sort((a, b) => {
         const aMiss = a.coherence_score == null;
         const bMiss = b.coherence_score == null;
@@ -559,58 +336,33 @@ const Overview = {
       });
 
       tbody.innerHTML = rows.map(r => {
-        const score = r.coherence_score;
-        const hasFp = score != null;
-        const rowCls = !hasFp ? "fp-row-bad"
-                    : score < 55 ? "fp-row-bad"
-                    : score < 75 ? "fp-row-warn"
-                    : "";
-        const scoreCls = !hasFp ? "bad"
-                    : score >= 90 ? "ok"
-                    : score >= 75 ? ""
-                    : score >= 55 ? "warn"
-                    : "bad";
-        const scoreTxt = hasFp ? score : "—";
-        const tmpl = r.template_name || r.template_id
-                     || (hasFp ? "unknown" : "no fingerprint");
+        const score   = r.coherence_score;
+        const hasFp   = score != null;
+        const rowCls  = !hasFp ? "fp-row-bad"
+                       : score < 55 ? "fp-row-bad"
+                       : score < 75 ? "fp-row-warn" : "";
+        const scoreCls = !hasFp ? "bad" : score >= 90 ? "ok" : score >= 75 ? "" : score >= 55 ? "warn" : "bad";
+        const tmpl = r.template_name || r.template_id || (hasFp ? "unknown" : "no fingerprint");
         return `
-          <tr class="${rowCls}" data-profile="${escapeHtml(r.profile_name)}"
-              style="cursor: pointer;">
+          <tr class="${rowCls}" data-profile="${escapeHtml(r.profile_name)}" style="cursor: pointer;">
             <td><strong>${escapeHtml(r.profile_name)}</strong></td>
             <td class="muted">${escapeHtml(tmpl)}</td>
-            <td class="col-score num ${scoreCls}">${scoreTxt}</td>
+            <td class="col-score num ${scoreCls}">${hasFp ? score : "—"}</td>
             <td class="col-snaps num">${r.history_count ?? 0}</td>
             <td class="col-when muted">${r.current_ts ? timeAgo(r.current_ts) : "—"}</td>
-          </tr>
-        `;
+          </tr>`;
       }).join("");
 
-      // Click a row → jump to fingerprint editor pre-scoped to that profile
-      tbody.querySelectorAll("tr[data-profile]").forEach(tr => {
+      tbody.querySelectorAll("tr[data-profile]").forEach(tr =>
         tr.addEventListener("click", () => {
-          const p = tr.dataset.profile;
-          location.hash = `#fingerprint?profile=${encodeURIComponent(p)}`;
+          location.hash = `#fingerprint?profile=${encodeURIComponent(tr.dataset.profile)}`;
           navigate("fingerprint");
-        });
-      });
+        })
+      );
     } catch (e) {
       console.error("fingerprint health:", e);
       const tbody = $("#overview-fp-tbody");
-      if (tbody) {
-        tbody.innerHTML = `<tr><td colspan="5" class="dense-empty-cell">Failed to load: ${escapeHtml(e.message)}</td></tr>`;
-      }
+      if (tbody) tbody.innerHTML = `<tr><td colspan="5" class="dense-empty-cell">Failed: ${escapeHtml(e.message)}</td></tr>`;
     }
   },
 };
-
-// Simple "time ago" helper (e.g. "3 min ago", "2 days ago")
-function formatAgo(iso) {
-  if (!iso) return "—";
-  const d = new Date(iso);
-  const diff = Math.round((Date.now() - d.getTime()) / 1000);
-  if (isNaN(diff)) return "—";
-  if (diff < 60)    return `${diff}s ago`;
-  if (diff < 3600)  return `${Math.round(diff / 60)}m ago`;
-  if (diff < 86400) return `${Math.round(diff / 3600)}h ago`;
-  return `${Math.round(diff / 86400)}d ago`;
-}

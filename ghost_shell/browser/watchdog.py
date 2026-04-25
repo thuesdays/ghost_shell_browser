@@ -34,6 +34,9 @@ Usage (manual):
         dog.stop()
 """
 
+__author__ = "Mykola Kovhanko"
+__email__ = "thuesdays@gmail.com"
+
 import os
 import time
 import signal

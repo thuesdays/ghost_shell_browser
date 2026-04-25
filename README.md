@@ -1,285 +1,318 @@
-# Ghost Shell
+# Ghost Shell Anty
 
-> Antidetect Chromium + Flask dashboard for competitive intelligence on
-> Google Search. Uses a custom-patched Chromium (149) to mask the
-> browser at the C++ engine level — no JavaScript shims, no Playwright,
-> no undetected-chromedriver tricks.
+> Self-hosted antidetect browser + control dashboard for Google Ads
+> competitive intelligence. Patched Chromium 149 at the C++ level —
+> no JavaScript shims, no `undetected-chromedriver` tricks. Runs each
+> profile through its own coherent fingerprint, proxy, cookie pool,
+> and behavior pipeline.
 
-**Status:** 29/30 self-check tests passing · Chromium 149 engine ·
-UA spoofed as Chrome 147 stable · production-ready for monitoring
-
-![Ghost Shell banner](./ghost-shell-banner.png)
-
----
-
-## What it does
-
-1. You list some **search queries** and your **own domains**.
-2. Ghost Shell spins up the patched Chromium behind a proxy, goes to
-   Google, runs each query, and records every sponsored ad on the SERP.
-3. For each ad it finds, it runs a **Script** — an ordered pipeline
-   of actions you build visually in the dashboard. Click the ad, dwell
-   20 s, scroll, close tab — as a real user would.
-4. Everything goes to a SQLite database you can review in the
-   dashboard: who's advertising on your keywords, how often, which
-   copy they use, how many times you interacted with them.
-
-This is a tool for **paid-search competitive monitoring**. It's what
-you'd do manually in 10 minutes a day, automated 24/7 with a
-fingerprint clean enough to not trigger Google's bot defenses.
+| | |
+|---|---|
+| **Engine** | Chromium 149.0.7805 (custom build, stealth patches in C++) |
+| **Stack** | Python 3.11+ · Flask dashboard · SQLite · Selenium 4 + CDP |
+| **Platform** | Windows 10/11 (x64) — Linux/macOS source-buildable |
+| **Status** | Production-ready · 11 device templates · 8 vault kinds · cron scheduler |
 
 ---
 
-## Why custom Chromium and not just Selenium
+## Install (end users — Windows)
 
-Selenium out of the box leaves a dozen detection markers:
-`navigator.webdriver`, specific UA-CH header gaps, `$cdc_...` properties
-on `window`, Canvas/WebGL noise patterns, timezone mismatches, empty
-`navigator.mediaDevices`, broken Battery API, etc. Most "antidetect"
-browsers patch these with **JavaScript shims** that themselves leave
-detectable patterns — the shim itself is a fingerprint.
+1. Download **`GhostShellAntySetup.exe`** from the
+   [Releases page](https://github.com/thuesdays/ghost_shell_browser/releases).
+2. Double-click. The wizard:
+   - picks `%LOCALAPPDATA%\GhostShellAnty` as install folder (changeable),
+   - silently installs Python 3.13 if you don't already have 3.11+,
+   - copies the patched Chromium binary (`chrome_win64\` ≈ 600 MB),
+   - creates a venv and pip-installs every Python dependency,
+   - drops Desktop + Start menu shortcuts,
+   - on the last page: optional **Launch dashboard now** checkbox.
+3. After install the dashboard opens at `http://127.0.0.1:5000`.
 
-Ghost Shell patches the **C++ engine directly**. Every masked API
-returns its faked value from the payload before JavaScript ever sees
-it — identical to a real Chrome install from the outside. The patch
-set covers:
-
-- `navigator.webdriver`, plugins, UA, platform
-- Canvas/WebGL/Audio fingerprint noise at the draw-call level
-- Timezone + locale at Intl level
-- UA Client Hints (JS API + `Sec-CH-UA-*` HTTP headers)
-- Battery API, Permissions API, MediaDevices, SpeechSynthesis
-- `performance.now()` sub-millisecond jitter
-- MouseEvent `timeStamp` sub-millisecond jitter
-- WebRTC IP leak hardening (command-line flag)
----
-
-## Stack
-
-| Layer          | Tech                                                 |
-|----------------|------------------------------------------------------|
-| Engine         | **Chromium 149** built from source with our patches  |
-| UA spoof       | **Chrome 147 stable** (most common real version)     |
-| Orchestration  | Python 3.11+ with Selenium                           |
-| Dashboard      | Flask + vanilla JS SPA (no build step)               |
-| State          | SQLite (`ghost_shell.db`)                            |
-| Target OS      | Windows · macOS · Linux (build host-specific)        |
+Uninstall via Settings → Apps & features. The uninstaller stops any
+running browser, removes the venv + DB + logs.
 
 ---
 
-## Getting started
-
-### 1. Clone
+## Develop from source
 
 ```powershell
-cd F:\projects\
 git clone https://github.com/thuesdays/ghost_shell_browser.git
 cd ghost_shell_browser
-```
 
-On macOS/Linux the layout is identical; use `~/projects/ghost_shell_browser`
-or wherever you prefer.
+python -m venv .venv
+.\.venv\Scripts\activate
 
-### 2. Install Python deps
-
-```powershell
+# Pulls every dep including cryptography (vault) and selenium
 pip install -r requirements.txt
+
+# Chromium binary lives outside git (too large for GitHub).
+# Either copy your local build into chrome_win64\, or:
+.\scripts\download_chromium.ps1                    # pulls latest release asset
+
+python -m ghost_shell dashboard                    # → http://127.0.0.1:5000
 ```
 
-### 3. Build the patched Chromium (one-time, ~2-4 hours)
+Three CLI entrypoints:
 
-Short version:
+| Command | What it does |
+|---|---|
+| `python -m ghost_shell monitor` | runs one ad-monitoring pass for the active profile |
+| `python -m ghost_shell dashboard` | starts the Flask dashboard on `:5000` (auto-opens browser) |
+| `python -m ghost_shell scheduler` | background loop that fires `monitor` runs on a schedule |
+
+VS Code launch configs for all three are in `.vscode/launch.json`.
+
+---
+
+## Architecture
+
+```
+ghost_shell/
+├── core/         platform paths, log banners, process reaper
+├── db/           SQLite layer (3500+ LOC, migrations idempotent)
+├── fingerprint/  device templates · generator · validator · selftest
+├── proxy/        diagnostics · forwarder · pool · rotation provider
+├── profile/      manager · enricher · validator · pool
+├── session/      cookies · cookie pool (resurrection) · warmup robot
+├── browser/      runtime (CDP-driven) · watchdog · traffic collector
+├── actions/      script flow runner (15+ actions, 15+ conditions)
+├── scheduler/    pure-Python cron parser + 3 schedule modes
+├── dashboard/    Flask server (4500+ LOC, 70+ endpoints)
+├── accounts/     Fernet-encrypted vault (8 kinds: account/wallet/api_key/…)
+├── __main__.py   runpy dispatcher for monitor|dashboard|scheduler
+└── main.py       monitor entrypoint
+```
+
+Standalone scripts live in `scripts/`, tests in `tests/`, and the
+Inno Setup installer recipe in `installer/`. Originals from the pre-
+package-refactor live in `_legacy/` (kept for reference; not shipped).
+
+---
+
+## Features (dashboard pages)
+
+- **Overview** — 24h KPIs, 7-day chart, fingerprint health rollup,
+  per-profile self-check status, traffic-card.
+- **Profiles** — table of profiles with per-row Start/Stop, status
+  badges, "Set as default", quick-jump links to fingerprint/session.
+- **Profile detail** — script + proxy + fingerprint assignments,
+  cookies/session summary, **Danger zone** at the bottom (reset
+  blocks / clear history / delete profile).
+- **Fingerprint** — coherence editor: 11 device templates (7 desktop +
+  4 mobile), category filter, score badge with grade colours,
+  field-by-field editor with locks, history with restore, live
+  self-test that launches a real browser and compares configured vs
+  actual, **dual-mode toggle** (desktop ↔ mobile, switches active FP
+  instantly).
+- **🍪 Session/Cookies** — left-side profile nav (vertical card list
+  with active-border accent), 4 tabs:
+  - **Warmup robot** — 5 categorized presets (general, medical, tech,
+    news, mobile), preset cards, run-now + history table. Real-browser
+    visits with cookie-consent auto-clicker.
+  - **Cookies** — live table per next-run, filter, import/export,
+    flag indicators (S/H/N/L).
+  - **Snapshots** — cookie pool with auto-snapshot after clean runs;
+    restore queues injection at next launch.
+  - **Chrome import** — pulls real history/bookmarks from your own
+    Chrome install (WAL-safe even while Chrome is open).
+- **Proxy** — library of named proxies with cached diagnostics
+  (geo/ISP/latency/risk), bulk import (9 formats), per-profile
+  assignment.
+- **Domains** — your own domains (skipped as competitors), targets
+  (trigger on-target action chain), block list.
+- **Competitors** — ad-intel dashboard: trend chart (line/stacked),
+  activity badges (NEW/ACTIVE/QUIETING), per-row 7-day sparklines,
+  expandable rows with titles + display URLs + matched queries,
+  share-of-voice tab, inline 🎯/🏠/🚫 actions to push a domain into
+  the Domains lists, CSV/JSON export.
+- **Behavior** — typing/dwell/scroll/refresh timing knobs, captcha
+  recovery policy, traffic block-list patterns.
+- **Scripts** — visual flow builder for the per-ad pipeline. 15+
+  actions (click, dwell, scroll, type, swipe, touch_click, …) and
+  15+ conditions (ads_found, captcha_present, var_*, …). Library
+  with named scripts, one is default, profiles can override.
+- **🔐 Accounts & Vault** — encrypted local password manager. Master
+  password unlocks an in-memory key (PBKDF2-HMAC-SHA256, 200k iters →
+  Fernet). 8 kinds:
+  - `account` (login + password + 2FA),
+  - `email` (with IMAP/SMTP fields),
+  - `social`, `crypto_wallet` (seed + private key),
+  - `api_key`, `totp_only`, `note`, `custom` (free-form fields).
+  Each kind has its own form layout. TOTP code revealed inline,
+  one-click copy. RFC 6238 compliant.
+- **Runs** — table of every monitor run with exit code, captcha count,
+  duration, profile, log link.
+- **Traffic** — per-profile + per-host bandwidth tracker; Network.*
+  CDP events drive the counters.
+- **Scheduler** — three modes:
+  - **Simple** (density) — N runs/day spread over active hours w/ jitter,
+  - **Interval** — fixed gap between runs,
+  - **Cron** — full 5-field cron expression with live "next 5 runs"
+    preview. Active days-of-week (Mon-Sun) chips on top of all modes.
+  Profile selection card-grid with search + bulk (All/None/Invert/✓Healthy).
+  Group launch (parallel/serial) when monitoring needs to fire several
+  profiles per iteration.
+- **Logs** — terminal-style live tail with level filter + grep,
+  per-run timestamp grouping, ring buffer (10k lines).
+- **Settings** — VSCode-style sidebar: paths · UA spoof range · proxy
+  settings · self-check cadence · auto-enrich · session retention ·
+  traffic retention · danger-zone wipe.
+
+---
+
+## Anti-detection layers
+
+Stacked top-to-bottom — each layer hides a different signal:
+
+1. **C++ Chromium patches** (in the binary itself):
+   - `navigator.webdriver` → `false`
+   - canvas/WebGL/audio noise (sub-pixel ratio, ±1 LSB)
+   - sub-millisecond timing jitter (`performance.now`, `Date.now`)
+   - User-Agent + UA-CH + sec-ch-ua-platform spoof
+   - Battery / Permissions / Bluetooth presence
+2. **Fingerprint coherence** — UA, GPU vendor, fonts, timezone all
+   come from one device template; can't drift.
+3. **CDP runtime emulation** — for mobile profiles: viewport, touch,
+   DeviceMotion, DeviceOrientation, mobile UA + UA-CH platform.
+4. **Behavior** — randomized typing speed, mouse paths with
+   curve-fitting, dwell times sampled from human distributions,
+   gentle scroll with pauses, on mobile profiles → CDP touch swipes.
+5. **Session warmup** — fresh profiles visit 7-8 realistic sites
+   first (cookie-consent banners auto-clicked) so Google sees
+   organic history before the first SERP query.
+6. **Cookie pool** — clean-run snapshots; if a session degrades,
+   restore the last good one rather than starting cold.
+7. **Proxy intelligence** — geo/ASN/IP-type validation per run,
+   exit-IP gating against expected country/timezone.
+
+---
+
+## Building the installer
+
+See [`installer/README.md`](installer/README.md) for the full guide.
+TL;DR:
 
 ```powershell
-# Pull the Chromium source to F:\projects\chromium\ (~100 GB disk!)
-# Apply the three patch sets from CHROMIUM_PATCHES*.md
-# Build:
-cd F:\projects\chromium\src
-autoninja -C out\GhostShell chrome chromedriver
+# one-time setup
+choco install innosetup
+# OR download Inno Setup 6/7 from jrsoftware.org/isinfo.php
+# Then drop a python-3.13.x-amd64.exe into installer\deps\
 
-# Deploy the binary into this repo:
-cd F:\projects\ghost_shell_browser
-.\deploy-ghost-shell-flat.bat      # Windows
-./deploy-ghost-shell-flat.sh       # macOS/Linux
+cd installer
+build.bat
+
+# output: installer\output\GhostShellAntySetup.exe   (~620 MB)
 ```
 
-**No time to build?** Run the dashboard in "headless control" mode: the
-UI works with stock Chrome for browsing stats, but the monitor run
-needs the patched binary to avoid detection.
-
-### 4. Start the dashboard
-
-```powershell
-python dashboard_server.py
-```
-
-Browser opens to <http://127.0.0.1:5000> automatically.
-
-### 5. Configure
-
-In the dashboard:
-
-1. **Domains page** → set your own domains, target domains, and
-   optional block list. (Search queries are now configured inside
-   `loop` steps on the Scripts page, not here.)
-2. **Proxy page** → enter a proxy URL (residential rotating works
-   best — static datacenter IPs catch captchas fast).
-3. **Profiles page** → Create a profile. Pick a device template
-   (office laptop, gaming desktop, etc.) — Ghost Shell auto-generates
-   a consistent fingerprint payload.
-4. **Scripts page** → build your run.
-
-### 6. Build a script
-
-The Scripts page has three sections:
-
-- **Main script** — top-level action list that drives the whole run.
-  The key action here is `loop`: you supply a list of items (query
-  strings, URLs, whatever) and a set of nested steps to run for each
-  item. Inside nested steps, reference the current item with
-  `{item}` (or a custom variable name). Other top-level actions:
-  `search_query` · `rotate_ip` · `pause` · `visit_url`.
-- **Per-ad: competitor ads** — what to do when an ad is detected
-  that's not your own. `click_ad`, `read`, `scroll`, `back`,
-  `close_tab` — realistic user exploration.
-- **Per-ad: target-domain ads** — same but for ads whose domain is
-  in your Target Domains list. Typically lighter (record-only) so
-  you don't waste CPC money interacting with yourself.
-
-**If Main script is empty**, Ghost Shell runs a legacy default:
-iterate every query in Domains, run the competitor pipeline for each
-ad found, sleep between queries. Leave it empty if you don't need the
-extra control.
-
-#### Example Main script
-
-```
-loop:
-  items:    ["best laptops", "gaming chair", "smart home hub"]
-  item_var: query
-  shuffle:  true
-  steps:
-    - pause          (min_sec: 2, max_sec: 5)
-    - search_query   (query: "{query}")
-    - rotate_ip      (wait_after_sec: 3)
-```
-
-Each iteration picks one query, sleeps a random 2–5 s, runs the search
-(which dispatches the per-ad pipeline for every ad found), then forces
-a proxy rotation before moving on.
-
-### 7. Run it
-
-Click the green **▶ Start** button in the sidebar. Watch live logs on
-the Logs page or stats on Overview.
+Distribute the `.exe` via GitHub Releases. End users never need git
+or pip — installer handles everything.
 
 ---
 
-## Dashboard tour
+## Tech notes
 
-| Page        | What's inside                                                |
-|-------------|--------------------------------------------------------------|
-| Overview    | 24h hero stats, 7-day chart, top competitors, profile health |
-| Profiles    | Create / regenerate / preview fingerprints                   |
-| Domains     | My domains · target domains · block list                     |
-| Proxy       | Live IP diagnostics · rotation test · per-IP usage stats     |
-| Competitors | Every ad ever captured, aggregated by domain                 |
-| Behavior    | Timing ranges · naturalness toggles · captcha key            |
-| Scripts     | Visual builder for the three pipelines                       |
-| Runs        | History of every monitor run with outcome                    |
-| Scheduler   | Cron-like runs                                               |
-| Logs        | Live tail + historical                                       |
-| Settings    | Export / import config as a portable JSON bundle             |
-
-The sidebar shows a small pill under "Ghost Shell" with the current
-engine and UA versions — e.g. `Chromium 149 · UA Chrome 147`.
-
----
-
-## Project layout
-
-```
-F:\projects\ghost_shell_browser\
-├─ main.py                      # Entry point of a run
-├─ dashboard_server.py          # Flask app
-├─ ghost_shell_browser.py       # Chromium + Selenium wrapper
-├─ action_runner.py             # Script + per-ad pipeline executor
-├─ device_templates.py          # Fingerprint generator
-├─ db.py                        # SQLite schema + ops
-├─ rotating_proxy.py            # Proxy pool + IP tracking
-├─ proxy_diagnostics.py         # Live IP / geo / WebRTC leak probes
-├─ session_quality.py           # Per-profile captcha/block tracking
-├─ platform_paths.py            # Windows/macOS/Linux path resolution
-├─ scheduler.py                 # Cron-like runs
-├─ watchdog.py                  # Kills stuck runs
-│
-├─ ghost_shell_config.h/.cc     # C++ code that lives in Chromium too
-├─ ghost_shell_ua_override.h/.cc # Browser-process UA hook
-│
-├─ dashboard/                   # Static SPA
-│   ├─ index.html
-│   ├─ css/main.css
-│   ├─ js/
-│   │   ├─ app.js               # Router
-│   │   └─ pages/               # One file per tab
-│   └─ pages/                   # HTML fragments
-│
-├─ chrome_win64/                # Deployed custom Chromium (git-ignored)
-│   ├─ chrome.exe
-│   └─ chromedriver.exe
-│
-├─ profiles/                    # Per-profile data (git-ignored)
-│   └─ <name>/
-│       ├─ user_data/           # Chrome profile dir
-│       ├─ payload_debug.json
-│       ├─ selfcheck.json
-│       └─ logs/
-│
-└─ ghost_shell.db               # SQLite state (git-ignored)
-```
-
----
-
-## Export / Import configuration
-
-Settings page → Download bundle. Produces a single JSON file with:
-
-- Dashboard config (queries, domains, behavior timings, proxy URL)
-- Profile definitions
-- All three pipelines (main_script, post_ad, on_target)
-
-History (runs, events, logs, IP history, captured competitors) is
-**not** included — bundles are portable "setup snapshots".
-
-Importing supports **merge** (default, safe) and **replace** (wipes
-current config first).
-
----
-
-## Requirements
-
-- **Python 3.11+**
-- **~500 MB** on disk for this repo
-- **~100 GB** on disk if you build Chromium locally
-- **Residential or mobile proxy** strongly recommended — datacenter
-  IPs hit captcha walls within minutes on Google
+- **DB migrations** are idempotent: every `_ensure_column` checks
+  before adding. Safe to upgrade in-place across versions.
+- **Chromium binary is NOT in git** — too large for GitHub's 100MB-
+  per-file limit. `chrome_win64/` is `.gitignore`-d; the installer
+  bundles it from your local copy. Source-only checkout: use
+  `scripts/download_chromium.ps1` (pulls the matching release asset).
+- **Refactor v0.2.0**: project moved from 39 flat files at the root
+  into a proper `ghost_shell/` package. Old paths preserved in
+  `_legacy/` for reference only — not on `sys.path`, not shipped.
+- **Vault crypto**: master password → PBKDF2-HMAC-SHA256 (200k iters)
+  → 32-byte key → Fernet (AES-128-CBC + HMAC-SHA256). Key is in
+  process memory only; lost on restart, user re-unlocks. Salt and a
+  short verification token live in `config_kv` so we can confirm the
+  master without decrypting anything real.
+- **Cron parser** is pure-stdlib (no `croniter` dependency). Supports
+  `*`, `*/N`, `N-M`, `N,M,P`, `N-M/S` across the standard 5 fields.
 
 ---
 
 ## License
 
-Personal / research use. This repo doesn't distribute Chromium binaries
-— you build them from source using Google's BSD-licensed Chromium tree
-and our patches.
+MIT — see [`LICENSE`](LICENSE).
+
+This software is provided for legitimate uses (competitive intelligence
+on your own ad spend, QA, accessibility automation, etc). Users are
+responsible for compliance with the terms of service of any sites they
+automate against.
 
 ---
 
-## Documentation
+## Contributing
 
-- [`DATABASE.md`](./DATABASE.md) — SQLite schema reference
-- [`MACOS_BUILD.md`](./MACOS_BUILD.md) — Chromium build on macOS
-- [`MACOS_SETUP.md`](./MACOS_SETUP.md) — dashboard-only mode and SSH-tunnel usage
+Contributions are very welcome — bug reports, doc fixes, new device
+templates, UX polish, translations, feature ideas. You don't need to be
+a fingerprint expert to help.
+
+**Easy first contributions:**
+
+- A new device template (RTX 5080 desktop, M4 MacBook, current flagship
+  Android) in [`device_templates.py`](ghost_shell/fingerprint/device_templates.py)
+  with a coherence test
+- A new warmup preset for a vertical you understand (e-commerce,
+  fashion, gambling, …)
+- CSS polish on the dashboard
+- Issues with reproduction steps when something breaks
+
+**Before opening a PR:**
+
+1. `pytest tests/` must pass
+2. New `.py` files include the author header (`__author__` / `__email__`)
+3. New comments and docstrings in English
+4. New device templates need the full field set + a unit test asserting
+   the generated fingerprint scores ≥70 in the validator
+
+For larger architectural changes, open an issue first.
 
 ---
 
-**Engine:** Chromium 149 · **UA pool:** Chrome 143–147 (weighted toward current stable) · **Python:** 3.11+ · **Cross-platform:** Windows · macOS · Linux
+## Support the project
+
+Ghost Shell Anty is MIT-licensed and free forever — no per-profile fees,
+no cloud subscription, no unlock tiers. It's maintained on personal time.
+If the tool saves you money you'd otherwise spend on a commercial
+antidetect browser, consider chipping in to keep development active.
+
+Donations directly fund Chromium rebases (every major release means
+re-applying the C++ stealth patches), new device templates, selfcheck
+rule updates as anti-detection sites move, and CI infrastructure.
+
+### Crypto wallets
+
+| Network | Address | |
+|---|---|---|
+| **Ethereum / EVM** (ERC-20 USDC, USDT, ETH) | `0xbd9b0b717139542632b5c45df7096dB2484976D5` | [Etherscan](https://etherscan.io/address/0xbd9b0b717139542632b5c45df7096dB2484976D5) |
+| **Solana** (SOL, SPL USDC, USDT) | `FbK1eZHPhQM8NYKntRZsUqQ3FWxgj9mWwEXr2o54Qdck` | [Solscan](https://solscan.io/account/FbK1eZHPhQM8NYKntRZsUqQ3FWxgj9mWwEXr2o54Qdck) |
+
+For copy/paste convenience:
+
+```text
+ETH / ERC-20 :  0xbd9b0b717139542632b5c45df7096dB2484976D5
+Solana       :  FbK1eZHPhQM8NYKntRZsUqQ3FWxgj9mWwEXr2o54Qdck
+```
+
+Any amount is appreciated. If you donate from a vanity wallet you'd
+like credited in the README, drop an email below — happy to add a
+Sponsors row in the next release.
+
+### Other ways to help
+
+- ⭐ **Star the repo** — costs nothing, helps with discovery
+- 📣 **Tell a friend** running ad ops at scale — word of mouth is most
+  of how this tool finds users
+- 🐛 **Report bugs with logs** — the dashboard's Logs page has a
+  Download button that captures everything maintainers need
+- 📝 **Write a blog post / video** if you build something interesting
+  on top of Ghost Shell — happy to link back
+
+---
+
+## Links
+
+- **Issues**: [GitHub Issues](https://github.com/thuesdays/ghost_shell_browser/issues)
+- **Wiki**: [Ghost Shell Anty Wiki](https://github.com/thuesdays/ghost_shell_browser/wiki)
+- **Releases**: [Latest installer](https://github.com/thuesdays/ghost_shell_browser/releases)
+- **Maintainer**: [@thuesdays](https://github.com/thuesdays) · thuesdays@gmail.com

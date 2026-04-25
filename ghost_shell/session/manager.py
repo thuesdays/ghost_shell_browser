@@ -13,6 +13,9 @@ by GhostShellBrowser._auto_save_session / _restore_session. This module
 is useful for manual operations and the "seed from real Chrome" flow.
 """
 
+__author__ = "Mykola Kovhanko"
+__email__ = "thuesdays@gmail.com"
+
 import os
 import json
 import shutil

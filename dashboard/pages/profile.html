@@ -1,40 +1,77 @@
 <section>
   <div class="page-header">
-    <div>
-      <div class="page-title">Edit profile</div>
-      <div class="page-subtitle">Fingerprint, health, session quality — everything about the selected profile</div>
+    <div class="page-header-left">
+      <a href="#profiles" class="btn-icon-back" data-nav="profiles"
+         title="Back to all profiles" aria-label="Back to all profiles">←</a>
+      <div>
+        <div class="page-title">
+          Edit profile<span class="page-title-sep" id="profile-name-sep"></span><span
+            class="page-title-name" id="profile-name-display"></span>
+        </div>
+        <div class="page-subtitle">
+          Fingerprint, health, session quality — everything about
+          this profile.
+        </div>
+      </div>
     </div>
-    <select class="select" id="profile-selector" style="width: 240px;"></select>
   </div>
 
-  <div class="card">
+  <!-- ─── IDENTITY: tags, notes, language, session toggle ──────
+       Per-profile metadata. Keep this near the top so the human-readable
+       labels are the first thing the user sees on the edit page. -->
+  <div class="card profile-identity-card">
     <div class="card-title">
-      Main settings
-      <span class="muted">— active profile, language, session</span>
+      🪪 Identity
+      <span class="muted">— tags, notes, language &amp; session</span>
     </div>
-    <div class="input-row">
-      <div class="form-group">
-        <label class="form-label">Active profile name</label>
-        <input type="text" class="input" data-config="browser.profile_name">
-      </div>
-      <div class="form-group">
+
+    <div class="input-row" style="margin-bottom: 14px;">
+      <div class="form-group" style="margin-bottom: 0;">
         <label class="form-label">Preferred language</label>
         <input type="text" class="input" data-config="browser.preferred_language"
                placeholder="uk-UA">
+        <div class="form-hint">Used for <code>navigator.language</code>
+          and <code>Accept-Language</code>. BCP-47 format.</div>
+      </div>
+      <div class="form-group" style="margin-bottom: 0;">
+        <label class="form-label">Session behaviour</label>
+        <div class="checkbox-row">
+          <input type="checkbox" id="cfg-auto-session"
+                 data-config="browser.auto_session">
+          <label for="cfg-auto-session">Auto-save / restore cookies between runs</label>
+        </div>
       </div>
     </div>
-    <div class="checkbox-row">
-      <input type="checkbox" id="cfg-auto-session" data-config="browser.auto_session">
-      <label for="cfg-auto-session">Auto save/restore session</label>
+
+    <div class="profile-tags-row">
+      <label class="form-label">Tags</label>
+      <div class="form-hint" style="margin-bottom: 8px;">
+        Free-form labels — used to filter the Profiles page and bulk-select
+        for actions (e.g. <code>us-accounts</code>, <code>warmup</code>).
+      </div>
+      <div class="tag-editor-chips" id="pp-tags-chips">
+        <span class="muted" style="font-size: 12px;">Loading…</span>
+      </div>
+      <div style="display: flex; gap: 8px; margin-top: 10px; align-items: stretch;">
+        <input type="text" class="input" id="pp-tag-input"
+               placeholder="add a tag and press Enter"
+               style="flex: 1;">
+        <button class="btn btn-primary btn-add-tag" id="pp-tag-add-btn">
+          <span style="font-weight: 600;">+</span>
+          <span>Add</span>
+        </button>
+      </div>
     </div>
-    <div class="checkbox-row">
-      <input type="checkbox" id="cfg-enrich" data-config="browser.enrich_on_create">
-      <label for="cfg-enrich">Enrich new profiles with fake history/bookmarks</label>
+
+    <div class="form-group" style="margin-top: 16px; margin-bottom: 0;">
+      <label class="form-label">Notes</label>
+      <textarea class="input" id="pp-notes" rows="2"
+                placeholder="e.g. 'main Facebook for US account, do not warm up before Tuesday'"></textarea>
     </div>
-    <div class="form-hint" style="margin-top: 10px;">
-      The Chromium binary path is a global install-level setting — configure it once
-      in <a href="#" data-nav="settings" class="inline-link">Settings</a>,
-      not per profile.
+
+    <div style="display: flex; gap: 10px; margin-top: 16px; align-items: center;">
+      <button class="btn btn-primary" id="pp-save-btn">💾 Save identity</button>
+      <span class="muted" style="font-size: 12px;" id="pp-save-status"></span>
     </div>
   </div>
 
@@ -144,119 +181,83 @@
     </div>
   </div>
 
-  <!-- ─── PER-PROFILE OVERRIDES ──────────────────────────────── -->
-  <div class="card">
+  <!-- ─── PROXY / NETWORK ─────────────────────────────────────
+       Per-profile network override. Empty proxy URL = inherit the
+       global setting from the Proxy page. The "rotating" toggle
+       reveals the rotation API config block — keeping it collapsed
+       by default avoids overwhelming users who just want a static
+       proxy. -->
+  <div class="card profile-proxy-card">
     <div class="card-title">
-      Per-profile overrides
-      <span class="muted">— tags, custom proxy, notes</span>
+      🌐 Proxy &amp; network override
+      <span class="muted">— exit IP for this profile</span>
     </div>
-    <div class="form-hint" style="margin-bottom: 16px;">
-      These settings apply ONLY to the selected profile and override the
-      global values. Leave proxy empty to inherit the global
-      <code>proxy.url</code>. Useful for running many profiles through
-      different exit IPs simultaneously (e.g. Facebook multi-account).
+    <div class="form-hint" style="margin-bottom: 14px;">
+      Leave the URL blank to use the global <code>proxy.url</code>.
+      Useful when each profile needs a different exit (e.g. one
+      profile per country, multi-account on the same site).
     </div>
 
-    <!-- ── Tags (metadata) ─────────────────────────────────── -->
-    <div class="override-row override-row-tags">
-      <div class="override-row-header">
-        <span class="override-icon">🏷️</span>
-        <div class="override-row-titles">
-          <div class="override-title">Tags</div>
-          <div class="override-desc">
-            Label this profile so you can filter it on the Profiles
-            page (e.g. <code>us-accounts</code>, <code>test</code>).
-          </div>
-        </div>
-      </div>
-      <div class="override-row-body">
-        <div class="tag-editor-chips" id="pp-tags-chips">
-          <span class="muted" style="font-size: 12px;">Loading…</span>
-        </div>
-        <div style="display: flex; gap: 8px; margin-top: 10px; align-items: stretch;">
-          <input type="text" class="input" id="pp-tag-input"
-                 placeholder="add a tag and press Enter"
-                 style="flex: 1;">
-          <button class="btn btn-primary btn-add-tag" id="pp-tag-add-btn">
-            <span style="font-weight: 600;">+</span>
-            <span>Add</span>
-          </button>
-        </div>
+    <div class="form-group">
+      <label class="form-label">Proxy URL</label>
+      <input type="text" class="input" id="pp-proxy-url"
+             placeholder="http://user:pass@host:port"
+             autocomplete="off" spellcheck="false">
+      <div class="form-hint">
+        Supports <code>http://</code>, <code>https://</code>,
+        <code>socks5://</code>. User and password are URL-encoded
+        in-band.
       </div>
     </div>
 
-    <!-- ── Proxy URL (network) ─────────────────────────────── -->
-    <div class="override-row override-row-proxy">
-      <div class="override-row-header">
-        <span class="override-icon">🌐</span>
-        <div class="override-row-titles">
-          <div class="override-title">Proxy URL</div>
-          <div class="override-desc">
-            Dedicated exit for this profile. Empty = use the global
-            <code>proxy.url</code> from the Proxy page.
-          </div>
-        </div>
-      </div>
-      <div class="override-row-body">
-        <input type="text" class="input" id="pp-proxy-url"
-               placeholder="http://user:pass@host:port">
-      </div>
+    <div class="checkbox-row" style="margin-top: 14px;">
+      <input type="checkbox" id="pp-proxy-rotating">
+      <label for="pp-proxy-rotating">
+        This is a <strong>rotating</strong> proxy — call a rotate API between runs
+      </label>
     </div>
 
-    <!-- ── Rotation override (network / advanced) ─────────── -->
-    <div class="override-row override-row-rotation">
-      <div class="override-row-header">
-        <span class="override-icon">🔄</span>
-        <div class="override-row-titles">
-          <div class="override-title">Rotation override</div>
-          <div class="override-desc">
-            Custom rotation endpoint just for this profile. Leave
-            blank on both fields to inherit the global rotation config.
-          </div>
+    <div class="profile-rotation-block" id="pp-rotation-block" style="display: none;">
+      <div class="form-hint" style="margin-bottom: 10px;">
+        Custom rotation endpoint just for this profile. Leave both
+        fields blank to inherit the global rotation config from the
+        Proxy page.
+      </div>
+      <div class="input-row">
+        <div class="form-group" style="margin-bottom: 0;">
+          <label class="form-label">Rotation API URL</label>
+          <input type="text" class="input" id="pp-rotation-url"
+                 placeholder="empty = inherit global"
+                 autocomplete="off" spellcheck="false">
+        </div>
+        <div class="form-group" style="margin-bottom: 0;">
+          <label class="form-label">Rotation provider</label>
+          <select class="select" id="pp-rotation-provider">
+            <option value="">— inherit global —</option>
+            <option value="none">None</option>
+            <option value="asocks">asocks</option>
+            <option value="brightdata">Bright Data</option>
+            <option value="generic">Generic</option>
+          </select>
         </div>
       </div>
-      <div class="override-row-body">
-        <div class="input-row">
-          <div class="form-group" style="margin-bottom: 0;">
-            <label class="form-label">Rotation API URL</label>
-            <input type="text" class="input" id="pp-rotation-url"
-                   placeholder="empty = inherit global">
-          </div>
-          <div class="form-group" style="margin-bottom: 0;">
-            <label class="form-label">Rotation provider</label>
-            <select class="select" id="pp-rotation-provider">
-              <option value="">— inherit global —</option>
-              <option value="none">None</option>
-              <option value="asocks">asocks</option>
-              <option value="brightdata">Bright Data</option>
-              <option value="generic">Generic</option>
-            </select>
-          </div>
+      <div class="form-group" style="margin-top: 12px; margin-bottom: 0;">
+        <label class="form-label">Provider API key <span class="form-label-optional">(if required)</span></label>
+        <input type="password" class="input" id="pp-rotation-api-key"
+               placeholder="leave empty if the URL contains the token"
+               autocomplete="off" spellcheck="false">
+        <div class="form-hint">
+          Bright Data / asocks: stored encrypted in the vault. Generic
+          providers usually pass auth in the URL itself.
         </div>
-      </div>
-    </div>
-
-    <!-- ── Notes (info) ────────────────────────────────────── -->
-    <div class="override-row override-row-notes">
-      <div class="override-row-header">
-        <span class="override-icon">📝</span>
-        <div class="override-row-titles">
-          <div class="override-title">Notes</div>
-          <div class="override-desc">
-            Free-form notes for your own reference — not used by the
-            runner anywhere.
-          </div>
-        </div>
-      </div>
-      <div class="override-row-body">
-        <textarea class="input" id="pp-notes" rows="2"
-                  placeholder="e.g. 'main Facebook for US account'"></textarea>
       </div>
     </div>
 
     <div style="display: flex; gap: 10px; margin-top: 16px; align-items: center;">
-      <button class="btn btn-primary" id="pp-save-btn">💾 Save overrides</button>
-      <span class="muted" style="font-size: 12px;" id="pp-save-status"></span>
+      <button class="btn btn-primary" id="pp-proxy-save-btn-new">💾 Save proxy</button>
+      <button class="btn btn-secondary btn-small" id="pp-proxy-test-btn-new"
+              title="Test the URL above against ipinfo">🔬 Test</button>
+      <span class="muted" style="font-size: 12px;" id="pp-proxy-save-status"></span>
     </div>
   </div>
 

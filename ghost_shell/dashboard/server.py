@@ -1,13 +1,16 @@
 """
-dashboard_server.py — Flask сервер with DB-бекендом
+dashboard_server.py — Flask server with DB backend
 
-Все yesнные читаются/пишутся via db.py. Ниasих файлов кроме ghost_shell.db
-(плюс payload_debug.json в профиле for C++ ядра).
+All data is read/written via db.py. No files other than ghost_shell.db
+(plus payload_debug.json in the profile for the C++ core).
 
-Overпуск:
+Run:
     python dashboard_server.py
     → http://127.0.0.1:5000
 """
+
+__author__ = "Mykola Kovhanko"
+__email__ = "thuesdays@gmail.com"
 
 import os
 from ghost_shell.core.platform_paths import PROJECT_ROOT
@@ -41,6 +44,19 @@ except ImportError:
 
 from ghost_shell.db.database import get_db
 from ghost_shell.core.platform_paths import popen_flags_no_console, terminate_process_tree
+from ghost_shell.core import runtime as gs_runtime
+
+
+# ──────────────────────────────────────────────────────────────
+# In-memory shutdown token
+#
+# Set by main() right before app.run() — so we know the value to
+# accept on POST /api/admin/shutdown. The full record is also written
+# to runtime.json so the installer can read it back without us being
+# alive. Stored in-memory too because reading runtime.json on every
+# shutdown request would race against installer-side cleanup.
+# ──────────────────────────────────────────────────────────────
+_SHUTDOWN_TOKEN: Optional[str] = None
 
 
 def _popen_no_console_flags():
@@ -603,6 +619,82 @@ def api_stats_reset():
     })
 
 
+@app.route("/api/admin/health", methods=["GET"])
+def api_admin_health():
+    """Liveness probe — used by the installer to wait until the new server
+    has come back up after an update, and by tooling to confirm the dashboard
+    is reachable. Public, no token: returning {"ok": true} is harmless."""
+    return jsonify({
+        "ok":      True,
+        "pid":     os.getpid(),
+        "version": gs_runtime._read_version_safe(),
+    })
+
+
+@app.route("/api/admin/shutdown", methods=["POST"])
+def api_admin_shutdown():
+    """Graceful shutdown endpoint, called by the installer before it
+    replaces files during an update.
+
+    Security:
+      • Loopback-only — refuses anything that isn't 127.0.0.1 / ::1
+      • Token-gated   — requires X-Shutdown-Token header matching the
+                        one written to runtime.json at startup. This
+                        prevents a hostile webpage running in the user's
+                        regular browser from killing the server via fetch().
+
+    Behaviour:
+      1. Validate origin + token. Reject with 403 on mismatch.
+      2. Write a "going down" flag, return 200 immediately.
+      3. Schedule actual exit on a background thread so Flask can
+         finish flushing the response to the caller before we die.
+    """
+    # Belt: reject anything not from the loopback adapter. Werkzeug puts
+    # the peer IP in request.remote_addr regardless of any X-Forwarded-For
+    # we might choose to honour elsewhere.
+    addr = request.remote_addr or ""
+    if addr not in ("127.0.0.1", "::1", "localhost"):
+        return jsonify({"error": "shutdown only allowed from loopback"}), 403
+
+    # Suspenders: token must match the one we wrote at startup. Constant-time
+    # compare in case a future caller leaks timing info via remote logs.
+    token = request.headers.get("X-Shutdown-Token", "")
+    expected = _SHUTDOWN_TOKEN or ""
+    import hmac as _hmac
+    if not expected or not _hmac.compare_digest(token, expected):
+        return jsonify({"error": "invalid shutdown token"}), 403
+
+    # Optional grace period — installer can request "wait N seconds before
+    # actually exiting" so the human user has time to see the toast in the
+    # dashboard. Capped to keep installer flows snappy.
+    try:
+        grace = float((request.get_json(silent=True) or {}).get("grace", 0.5))
+    except (TypeError, ValueError):
+        grace = 0.5
+    grace = max(0.0, min(grace, 5.0))
+
+    logging.info(f"[shutdown] received from {addr}, exiting in {grace}s")
+
+    def _delayed_exit():
+        # Sleep on a daemon thread so we don't block the response.
+        try:
+            time.sleep(grace)
+        finally:
+            try:
+                gs_runtime.clear_runtime_info()
+            except Exception:
+                pass
+            # os._exit bypasses Flask's clean-up hooks, but those are not
+            # required here — the installer is about to overwrite files
+            # underneath us anyway. SystemExit / sys.exit() inside a
+            # request handler is intercepted by Werkzeug, which is why
+            # we pick the harder hammer.
+            os._exit(0)
+
+    threading.Thread(target=_delayed_exit, daemon=True).start()
+    return jsonify({"ok": True, "exit_in_sec": grace, "pid": os.getpid()})
+
+
 @app.route("/api/traffic/summary", methods=["GET"])
 def api_traffic_summary():
     """Global traffic totals + hourly time series.
@@ -676,7 +768,7 @@ def api_profiles():
 def api_profile_selfcheck(name: str):
     sc = get_db().selfcheck_latest(name)
     if not sc:
-        return jsonify({"error": "Нет selfcheck. Overпусти мониторинг"}), 404
+        return jsonify({"error": "No selfcheck data yet. Run a monitor pass first."}), 404
     return jsonify(sc)
 
 
@@ -689,7 +781,7 @@ def api_profile_selfcheck_history(name: str):
 def api_profile_fingerprint(name: str):
     fp = get_db().fingerprint_current(name)
     if not fp:
-        return jsonify({"error": "Нет fingerprint"}), 404
+        return jsonify({"error": "no fingerprint stored for this profile"}), 404
     return jsonify(fp["payload"])
 
 
@@ -2080,7 +2172,7 @@ def api_logs_history():
 
 @app.route("/api/db/migrate", methods=["POST"])
 def api_db_migrate():
-    """Ручной запуск миграции из файлов"""
+    """Manually trigger the legacy on-disk-config migration."""
     try:
         get_db().migrate_from_files(verbose=True)
         return jsonify({"ok": True})
@@ -2223,13 +2315,21 @@ def api_profile_create():
     """
     from ghost_shell.fingerprint.device_templates import DeviceTemplateBuilder
     data = request.get_json(silent=True) or {}
-    name     = (data.get("name") or "").strip()
-    template = data.get("template") or None
-    language = data.get("language") or "uk-UA"
-    enrich   = bool(data.get("enrich", True))
+    name      = (data.get("name") or "").strip()
+    template  = data.get("template") or None
+    language  = data.get("language") or "uk-UA"
+    enrich    = bool(data.get("enrich", True))
+    # Optional per-profile proxy override accepted on creation. Empty
+    # string / None = no override (inherit global). The format is the
+    # same string that the Proxy page accepts. We do a coarse client-side
+    # check then a stricter scheme check here.
+    proxy_url = (data.get("proxy_url") or "").strip()
 
     if not name or not re.match(r"^[A-Za-z0-9_\-]+$", name):
         return jsonify({"error": "invalid name (letters, digits, _ and - only)"}), 400
+
+    if proxy_url and not re.match(r"^(https?|socks5)://", proxy_url, re.IGNORECASE):
+        return jsonify({"error": "proxy URL must use http://, https:// or socks5://"}), 400
 
     db = get_db()
     existing = db.profile_get(name) if hasattr(db, "profile_get") else None
@@ -2256,6 +2356,13 @@ def api_profile_create():
                 "enrich_on_create":   enrich,
                 "status":             "ready",
             })
+
+        # Save the per-profile proxy override if the user provided one
+        # in the create dialog. profile_meta_upsert is the same code
+        # path used by the Edit Profile page's "Save overrides" button,
+        # so format expectations stay consistent.
+        if proxy_url and hasattr(db, "profile_meta_upsert"):
+            db.profile_meta_upsert(name, proxy_url=proxy_url)
 
         # Create user data dir on disk
         import os as _os
@@ -4804,11 +4911,39 @@ if __name__ == "__main__":
 
     port = int(os.environ.get("PORT", 5000))
     url  = f"http://127.0.0.1:{port}"
-    print("╔══════════════════════════════════════════════════════════╗")
+    print("╔" + "═"*58 + "╗")
     print("║  Ghost Shell Dashboard                                    ║")
     print(f"║  → {url:<55}║")
     print("║  Ctrl+C to stop                                           ║")
-    print("╚══════════════════════════════════════════════════════════╝\n")
+    print("╚" + "═"*58 + "╝" + "\n")
+
+    # ────────────────────────────────────────────────────────────
+    # Runtime metadata for the installer / external supervisors.
+    #
+    # Writes %LOCALAPPDATA%\GhostShellAnty\runtime.json with our PID,
+    # bind port, and a one-shot shutdown token. The Inno Setup updater
+    # reads this file to (a) confirm the dashboard is running and (b)
+    # call POST /api/admin/shutdown gracefully before replacing files.
+    #
+    # The file is removed on graceful exit, but if we crash it sticks
+    # around — that's why is_pid_alive() is used on the installer side
+    # to disambiguate "stale file" from "really running".
+    # ────────────────────────────────────────────────────────────
+    try:
+        info = gs_runtime.write_runtime_info(
+            port=port,
+            install_dir=PROJECT_ROOT,
+        )
+        _SHUTDOWN_TOKEN = info["shutdown_token"]
+        print(f"[startup] runtime info → {gs_runtime.runtime_path('runtime.json')}")
+
+        import atexit as _atexit
+        _atexit.register(gs_runtime.clear_runtime_info)
+    except Exception as e:
+        # Non-fatal: dashboard still serves even if we can't write the
+        # runtime file. The installer will fall back to taskkill on PID
+        # discovery via process enumeration.
+        print(f"[startup] couldn't write runtime info: {e}")
 
     # Auto-open the dashboard in the user's default browser.
     # Disable via env: GHOST_SHELL_NO_BROWSER=1 (useful for headless hosts).
@@ -4823,4 +4958,6 @@ if __name__ == "__main__":
                 print(f"[warn] couldn't auto-open browser: {e}")
         threading.Thread(target=_open_after_ready, daemon=True).start()
 
+    # Final hand-off to Flask's dev server. Threaded so multiple HTTP
+    # clients (dashboard tabs + SSE streams) can be served concurrently.
     app.run(host="127.0.0.1", port=port, debug=False, threaded=True)

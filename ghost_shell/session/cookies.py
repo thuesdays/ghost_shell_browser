@@ -16,6 +16,9 @@ running, Chrome's own SQLite DB is authoritative — changes here take
 effect on the NEXT start. The dashboard should warn the user about this.
 """
 
+__author__ = "Mykola Kovhanko"
+__email__ = "thuesdays@gmail.com"
+
 import os
 import json
 import time

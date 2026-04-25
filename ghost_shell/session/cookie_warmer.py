@@ -9,12 +9,15 @@ cookie_warmer.py — Мгновенный прогрев via готовые cook
 - Preference cookies (языки, регион)
 - localStorage for крупных сайтов
 
-Это yesёт тот же сигнал "я here already бывал" without траты времени на real прогрев.
+Это даёт тот же сигнал "я here already бывал" without траты времени на real прогрев.
 
 ВАЖНО: cookies here сгенерированы по correctlyму формату но со случайными
 значениями — они не валидны for авторизации. Они работают as "onсутствие",
 а не "авторизация". Google видит that browser имеет историю настроек.
 """
+
+__author__ = "Mykola Kovhanko"
+__email__ = "thuesdays@gmail.com"
 
 import time
 import random
@@ -196,7 +199,7 @@ class CookieWarmer:
                 self.driver.execute_cdp_cmd("Network.setCookie", params)
                 injected += 1
             except Exception as e:
-                logging.debug(f"[CookieWarmer] Не уyesлось установить {c['name']}: {e}")
+                logging.debug(f"[CookieWarmer] Не удалось установить {c['name']}: {e}")
         return injected
 
     def fast_warmup(self):
@@ -272,7 +275,7 @@ class CookieWarmer:
                 # Проверяем that не whileзалась офлайн-страница
                 if self._is_offline_page():
                     logging.warning(f"[CookieWarmer] {url} whileзал офлайн — пропускаем визиты")
-                    # Возвращаемся на blank thatбы не оставлять офлайн-страницу
+                    # Возвращаемся на blank тотбы не оставлять офлайн-страницу
                     try:
                         self.driver.get("about:blank")
                     except Exception:
@@ -314,9 +317,9 @@ class CookieWarmer:
                 "return (document.body && document.body.innerText || '').substring(0, 200).toLowerCase();"
             )
             offline_markers = [
-                "підключіться до інтерnoу", "connect to the internet",
+                "підключіться до інтернеу", "connect to the internet",
                 "в режимі офлайн", "you're offline", "you are offline",
-                "no соединения", "подключитесь к интерnoу",
+                "no соединения", "подключитесь к интернеу",
             ]
             return any(m in body_text for m in offline_markers)
         except Exception:

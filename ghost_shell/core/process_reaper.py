@@ -21,6 +21,9 @@ walks the tree correctly on all three OSes.
 
 from __future__ import annotations
 
+__author__ = "Mykola Kovhanko"
+__email__ = "thuesdays@gmail.com"
+
 import logging
 import os
 import time

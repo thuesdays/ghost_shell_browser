@@ -22,6 +22,9 @@ fingerprint_tester.py — Проверка стабильности фингер
     tester.print_report(report)
 """
 
+__author__ = "Mykola Kovhanko"
+__email__ = "thuesdays@gmail.com"
+
 import os
 import time
 import json

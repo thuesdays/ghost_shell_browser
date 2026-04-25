@@ -49,6 +49,38 @@ const Settings = {
 
     this.bindExport();
     this.bindImport();
+    this.bindDangerZone();
+  },
+
+  /** Danger zone — Reset stats counters (was previously on Overview).
+   *  Wipes historical tables but keeps every config row. */
+  bindDangerZone() {
+    const btn = document.getElementById("btn-reset-stats");
+    if (!btn) return;
+    btn.addEventListener("click", async () => {
+      const ok = await confirmDialog({
+        title: "Reset stats counters?",
+        message:
+          "This wipes events, runs, traffic, action history, logs, and warmup "
+          + "history. Profiles, scripts, proxies, vault, and all settings are "
+          + "preserved.\n\nThis cannot be undone. Continue?",
+        confirmText: "Reset stats",
+        confirmStyle: "danger",
+      });
+      if (!ok) return;
+      btn.disabled = true;
+      const orig = btn.textContent;
+      btn.textContent = "⏳ Resetting…";
+      try {
+        await api("/api/stats/reset", { method: "POST" });
+        toast("✓ Stats counters reset");
+      } catch (e) {
+        toast("Reset failed: " + e.message, true);
+      } finally {
+        btn.disabled = false;
+        btn.textContent = orig;
+      }
+    });
   },
 
   /** Live count of how many URL patterns would be blocked with the

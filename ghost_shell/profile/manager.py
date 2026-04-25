@@ -3,6 +3,9 @@ profile_manager.py — Управление профилями NK Browser
 Создание, листинг, клонирование, удаление профилей
 """
 
+__author__ = "Mykola Kovhanko"
+__email__ = "thuesdays@gmail.com"
+
 import os
 import json
 import shutil

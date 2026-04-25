@@ -8,7 +8,12 @@ Public API:
     compute_totp(secret_b32)  → 6-digit code
     remaining_seconds()       → how many seconds until the current code rolls
 """
+
 from __future__ import annotations
+
+__author__ = "Mykola Kovhanko"
+__email__ = "thuesdays@gmail.com"
+
 import base64, hmac, hashlib, struct, time
 
 

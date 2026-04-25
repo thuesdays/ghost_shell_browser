@@ -19,6 +19,9 @@ opens about:blank, runs the probe script, closes. Target duration
 < 8 seconds per test.
 """
 
+__author__ = "Mykola Kovhanko"
+__email__ = "thuesdays@gmail.com"
+
 import json
 import logging
 import time

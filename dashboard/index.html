@@ -119,18 +119,11 @@
         </div>
       </div>
 
-      <button id="run-btn" class="run-btn"
-              title="Run the default profile (configured in Behavior page). Individual profiles have their own Start button on the Profiles page.">
-        <span id="run-btn-icon">▶</span>
-        <span id="run-btn-text">Run default profile</span>
-      </button>
-      <button id="stop-btn" class="run-btn stop-btn" style="display:none"
-              title="Forcefully terminate the default profile's run">
-        <span>■</span> <span>Stop default</span>
-      </button>
-      <div class="run-status" id="run-status">Ready</div>
-      <div class="run-status-sub" id="run-status-sub"
-           title="Default profile from Behavior → Profile section">—</div>
+      <!-- "Run default profile" sidebar button removed 2026-04. All
+           profile launches now happen from the Profiles page (per-row
+           Start button + bulk-start). The active-runs panel above is
+           kept since it's a global indicator and lets users stop runs
+           without navigating. -->
     </div>
   </aside>
 

@@ -1,23 +1,23 @@
 // ═══════════════════════════════════════════════════════════════
-// runner.js — sidebar run widgets + SSE log stream
+// runner.js — sidebar active-runs panel + SSE log stream
 //
-// Owns two pieces of sidebar UI:
+// Owns one piece of sidebar UI:
 //
-//   1. "Run default profile" / "Stop default" button pair.
-//      Starts the profile configured in browser.profile_name.
-//      Stop button only fires when THAT profile is the one running.
+//   • Active-runs panel — appears when ≥1 slot is active, shows a row
+//     per run with profile name, elapsed time, and a Stop button.
+//     "Stop all" kills every active run.
 //
-//   2. Active-runs panel — appears when ≥1 slot is active, shows a row
-//      per run with profile name, elapsed time, and a Stop button.
-//      "Stop all" kills every active run.
+// History: this file used to also own a "Run default profile" /
+// "Stop default" button pair in the sidebar footer. That was removed
+// 2026-04 because all profile launching now flows through the
+// Profiles page (per-row Start + bulk-start). Keeping the global
+// active-runs panel + Stop-all is still valuable: it lets users see
+// what's running from any page and bail out without navigating.
 //
-// Both update every 3s by polling /api/run/status and /api/runs/active.
+// The panel polls /api/runs/active + /api/scheduler/status every 3s
+// for liveness. The SSE log stream is independent and used by the
+// Logs page.
 // ═══════════════════════════════════════════════════════════════
-
-const runBtn     = () => document.getElementById("run-btn");
-const stopBtn    = () => document.getElementById("stop-btn");
-const runBtnText = () => document.getElementById("run-btn-text");
-const runStatus  = () => document.getElementById("run-status");
 
 // Global log buffer — shared with the Logs page. Lives for the whole
 // dashboard session so we don't lose messages when switching pages.
@@ -111,56 +111,11 @@ function startLogStream() {
   };
 }
 
-// ─── Start/Stop for the sidebar's "default profile" button ──────
-
-async function startRun(profileName) {
-  // Dimmed-button guard — the UI already disables the button via the
-  // `run-btn-dim` class when scheduler is active or other profiles are
-  // running, but the HTML click event still fires on some browsers
-  // (particularly when the user held the button focused from before
-  // dashboard update). Explain why nothing happens.
-  const btn = runBtn();
-  if (btn && btn.classList.contains("run-btn-dim")) {
-    toast(
-      "Can't start now — scheduler or another run is active. " +
-      "Stop them first (🧹 Clean zombies on Scheduler page if needed).",
-      true
-    );
-    return;
-  }
-  try {
-    const body = profileName ? JSON.stringify({ profile_name: profileName }) : "{}";
-    await api("/api/run", { method: "POST", body });
-    toast("✓ Monitor started");
-    updateRunStatus();
-  } catch (e) {
-    toast("Error: " + e.message, true);
-  }
-}
-
-async function stopRun() {
-  const ok = await confirmDialog({
-    title:        "Stop monitor",
-    message:      "This stops the default profile's run. Other active runs are unaffected — use 'Stop all' to kill everything.",
-    confirmText:  "Stop",
-    cancelText:   "Keep running",
-    confirmStyle: "danger",
-  });
-  if (!ok) return;
-
-  try {
-    const result = await api("/api/run/stop", { method: "POST" });
-    const killed = (result && result.killed) || [];
-    if (killed.length) {
-      toast(`✓ Stopped (killed ${killed.length} process${killed.length !== 1 ? "es" : ""})`);
-    } else {
-      toast("✓ Stopped");
-    }
-    updateRunStatus();
-  } catch (e) {
-    toast("Error: " + e.message, true);
-  }
-}
+// ─── Stop helpers ───────────────────────────────────────────────
+// Exposed globally because the active-runs panel renders inline
+// onclick handlers that call into them. (The panel rebuilds on every
+// status poll, so a delegated listener would need extra plumbing for
+// no real win.)
 
 async function stopSpecificRun(runId, profileName) {
   const ok = await confirmDialog({
@@ -212,90 +167,17 @@ function _elapsedShort(isoStr) {
 
 async function updateRunStatus() {
   try {
-    // Pull three endpoints in parallel — legacy default-profile state,
-    // the full active-runs list, AND scheduler status so the sidebar
-    // Run button reflects reality (previously the big green "Run" stayed
-    // the same whether scheduler was spinning up profiles or not, which
-    // led users to click it and get confusing "already running" errors).
-    const [s, active, sched] = await Promise.all([
-      api("/api/run/status"),
+    // Two endpoints in parallel — full active-runs list AND scheduler
+    // status. The scheduler badge gets painted onto the sidebar
+    // Scheduler nav item below.
+    const [active, sched] = await Promise.all([
       api("/api/runs/active"),
       api("/api/scheduler/status").catch(() => ({ is_running: false })),
     ]);
 
     const activeRuns = active?.runs || [];
-    const activeCount = activeRuns.length;
-    const schedRunning = !!sched?.is_running;
-
-    // Default-profile control (sidebar Start/Stop pair). It shows Stop
-    // ONLY if the active-run list contains the default profile name.
-    const defaultProfile =
-      (typeof configCache?.browser?.profile_name === "string")
-        ? configCache.browser.profile_name
-        : null;
-
-    const defaultIsRunning = defaultProfile
-      && activeRuns.some(r => r.profile_name === defaultProfile);
-
-    if (defaultIsRunning) {
-      runBtn().style.display = "none";
-      stopBtn().style.display = "flex";
-      const match = activeRuns.find(r => r.profile_name === defaultProfile);
-      runStatus().textContent = `Running (#${match?.run_id || "?"})`;
-    } else if (activeCount > 0 || schedRunning) {
-      // Something IS running — another profile, or the scheduler is
-      // orchestrating profiles on its own schedule. Either way, the
-      // big sidebar "Run default profile" button becomes misleading:
-      // clicking it would try to spawn ANOTHER run on top, which is
-      // almost never what the user wants. So we dim+disable it and
-      // show what's going on.
-      runBtn().style.display = "flex";
-      runBtn().disabled      = true;
-      runBtn().classList.add("run-btn-dim");
-      stopBtn().style.display = "none";
-      if (schedRunning) {
-        const profPart = activeCount
-          ? ` · ${activeRuns[0].profile_name}`
-          : "";
-        runStatus().textContent = `Scheduler active${profPart}`;
-      } else {
-        runStatus().textContent =
-          `${activeCount} other run${activeCount === 1 ? "" : "s"} active`;
-      }
-    } else {
-      // Fully idle — restore the button to its pristine green state.
-      runBtn().style.display = "flex";
-      runBtn().disabled      = false;
-      runBtn().classList.remove("run-btn-dim");
-      stopBtn().style.display = "none";
-      if (s.finished_at) {
-        const code = s.last_exit_code === 0 ? "ok" : `code ${s.last_exit_code}`;
-        runStatus().textContent = `Finished (${code})`;
-      } else {
-        runStatus().textContent = "Ready";
-      }
-    }
-
-    // Subtitle under the default button
-    const sub = document.getElementById("run-status-sub");
-    if (sub) {
-      if (schedRunning && !defaultIsRunning) {
-        // Scheduler does its own profile picking; the default-profile
-        // label here would be misleading. Show runs-today progress
-        // instead — matches what the user set as their daily target.
-        const target = sched.target_runs_per_day || "?";
-        sub.textContent = `scheduler: ${sched.runs_today ?? 0}/${target} today`;
-      } else if (defaultIsRunning) {
-        sub.textContent = `profile: ${defaultProfile}`;
-      } else {
-        sub.textContent = defaultProfile
-          ? `default: ${defaultProfile}`
-          : "no default profile set";
-      }
-    }
 
     // Active runs panel — show only if there's at least one run.
-    // Lists every active slot independent of default-profile logic.
     _renderActiveRunsPanel(activeRuns);
 
     // Scheduler badge on the sidebar nav item — subtle dot on the
@@ -383,9 +265,6 @@ function _renderActiveRunsPanel(activeRuns) {
 
 // Init
 document.addEventListener("DOMContentLoaded", () => {
-  runBtn().addEventListener("click", () => startRun());
-  stopBtn().addEventListener("click", () => stopRun());
-
   const stopAllBtn = document.getElementById("btn-stop-all");
   if (stopAllBtn) stopAllBtn.addEventListener("click", () => stopAllRuns());
 

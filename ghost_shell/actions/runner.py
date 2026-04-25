@@ -124,6 +124,9 @@ Each action is a dict like:
     }
 """
 
+__author__ = "Mykola Kovhanko"
+__email__ = "thuesdays@gmail.com"
+
 import logging
 import random
 import re

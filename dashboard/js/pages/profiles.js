@@ -31,7 +31,12 @@ const Profiles = {
   selectedNames: new Set(),   // multi-selection for bulk actions
 
   async init() {
-    // Load visible columns preference from localStorage
+    // Load visible columns preference from localStorage. The "select"
+    // (checkbox) column was added later — older saved preferences don't
+    // include it, so users with cached state never see the bulk-action
+    // checkboxes. Force-add it back if it's missing. Same forward-compat
+    // pattern can rescue any future required column.
+    const REQUIRED_COLS = ["select"];
     try {
       const stored = localStorage.getItem("profiles.visible_columns");
       this.visibleColumns = stored
@@ -39,6 +44,22 @@ const Profiles = {
         : this.ALL_COLUMNS.filter(c => c.default).map(c => c.key);
     } catch {
       this.visibleColumns = this.ALL_COLUMNS.filter(c => c.default).map(c => c.key);
+    }
+    // Migrate stored prefs: prepend any required col that's absent.
+    let migrated = false;
+    for (const col of REQUIRED_COLS) {
+      if (!this.visibleColumns.includes(col)) {
+        this.visibleColumns.unshift(col);
+        migrated = true;
+      }
+    }
+    if (migrated) {
+      try {
+        localStorage.setItem(
+          "profiles.visible_columns",
+          JSON.stringify(this.visibleColumns)
+        );
+      } catch {}
     }
 
     $("#reload-profiles-btn").addEventListener("click", () => this.reload());
@@ -809,33 +830,56 @@ const CreateProfileModal = {
     const modal = $("#profile-create-modal");
     if (!modal) return;
 
-    // Wire up once
-    if (!this._wired) {
-      this._wired = true;
+    // Wire on every open. The router replaces #content's innerHTML on
+    // every page navigation, which means the modal DOM (it lives inside
+    // profiles.html) is rebuilt fresh each time. A previously-attached
+    // listener was on the OLD button element, which is now garbage —
+    // hence the user-reported "Create profile click does nothing" bug.
+    // We use _replaceWith on each element so re-binding doesn't pile up
+    // duplicate handlers across rapid open/close cycles within the same
+    // page lifetime.
+    const rebind = (id, ev, fn) => {
+      const el = document.getElementById(id);
+      if (!el) return;
+      const clone = el.cloneNode(true);
+      el.parentNode.replaceChild(clone, el);
+      clone.addEventListener(ev, fn);
+    };
 
-      // Close handlers
-      modal.querySelectorAll("[data-close]").forEach(el => {
-        el.addEventListener("click", () => this.close());
-      });
+    // Close handlers — re-attached fresh
+    modal.querySelectorAll("[data-close]").forEach(el => {
+      el.addEventListener("click", () => this.close());
+    });
+    if (!this._escWired) {
+      // The Esc-key handler lives on document, which IS persistent
+      // across navigations, so only attach it once for the whole
+      // dashboard session.
+      this._escWired = true;
       document.addEventListener("keydown", (e) => {
         if (e.key === "Escape" && modal.style.display !== "none") this.close();
       });
+    }
 
-      $("#np-name-random").addEventListener("click", () => {
-        $("#np-name").value = this._randomName();
+    rebind("np-name-random", "click", () => {
+      $("#np-name").value = this._randomName();
+      $("#np-preview-panel").style.display = "none";
+    });
+    rebind("np-preview-btn", "click", () => this.preview());
+    rebind("np-create-btn",  "click", () => this.create());
+
+    // Live preview reset if any field changes
+    ["np-name", "np-template", "np-language"].forEach(id => {
+      const el = document.getElementById(id);
+      if (el) el.addEventListener("change", () => {
         $("#np-preview-panel").style.display = "none";
       });
-      $("#np-preview-btn").addEventListener("click",  () => this.preview());
-      $("#np-create-btn").addEventListener("click",   () => this.create());
+    });
 
-      // Live preview reset if any field changes
-      ["np-name", "np-template", "np-language"].forEach(id => {
-        $("#" + id).addEventListener("change", () => {
-          $("#np-preview-panel").style.display = "none";
-        });
-      });
-
-      // Populate template dropdown with rich specs (CPU / RAM / GPU)
+    // Populate template dropdown — only once per page-load. Re-running it
+    // would append duplicate <option> entries, since rebind() above
+    // doesn't recreate the <select>.
+    if (!this._templatesLoaded) {
+      this._templatesLoaded = true;
       try {
         const templates = await api("/api/profile-templates");
         const sel = $("#np-template");
@@ -945,10 +989,12 @@ const CreateProfileModal = {
   },
 
   async create() {
-    const name     = $("#np-name").value.trim();
-    const template = $("#np-template").value;
-    const language = $("#np-language").value;
-    const enrich   = $("#np-enrich").checked;
+    const name      = $("#np-name").value.trim();
+    const template  = $("#np-template").value;
+    const language  = $("#np-language").value;
+    const enrich    = $("#np-enrich").checked;
+    const openAfter = $("#np-open-after")?.checked ?? true;
+    const proxyUrl  = ($("#np-proxy")?.value || "").trim();
 
     if (!name) {
       toast("Name is required", true);
@@ -959,6 +1005,14 @@ const CreateProfileModal = {
       toast("Invalid name: letters, digits, _ and - only", true);
       return;
     }
+    // Light client-side validation of the proxy URL — server does the
+    // authoritative check. This catches the most common typos before we
+    // round-trip a creation.
+    if (proxyUrl && !/^(https?|socks5):\/\//i.test(proxyUrl)) {
+      toast("Proxy URL must start with http://, https:// or socks5://", true);
+      $("#np-proxy").focus();
+      return;
+    }
 
     const btn = $("#np-create-btn");
     btn.disabled = true;
@@ -967,14 +1021,29 @@ const CreateProfileModal = {
     try {
       const r = await api("/api/profiles", {
         method: "POST",
-        body: JSON.stringify({ name, template, language, enrich }),
+        body: JSON.stringify({ name, template, language, enrich,
+                               proxy_url: proxyUrl || undefined }),
       });
-      if (r.ok) {
-        toast(`✓ Created "${name}" (${r.template})`);
-        this.close();
-        await Profiles.reload();
-      } else {
+      if (!r.ok) {
         toast(r.error || "create failed", true);
+        return;
+      }
+
+      toast(`✓ Created "${name}" (${r.template})`);
+      this.close();
+
+      if (openAfter) {
+        // Set this as the active profile for the Edit Profile page,
+        // then navigate. profile-detail.js reads configCache.browser.profile_name
+        // on init to pick which profile to populate.
+        if (typeof configCache !== "undefined" && configCache) {
+          configCache.browser = configCache.browser || {};
+          configCache.browser.profile_name = name;
+        }
+        location.hash = `#profile?name=${encodeURIComponent(name)}`;
+        if (typeof navigate === "function") navigate("profile");
+      } else {
+        await Profiles.reload();
       }
     } catch (e) {
       toast(e.message || "create failed", true);
@@ -984,7 +1053,7 @@ const CreateProfileModal = {
     }
   },
 
-  // Helpers ────────────────────────────────────────────────────
+  // Helpers ───────────────────────────────────────────────────────────
 
   _randomName() {
     const adjs = ["swift", "quiet", "crisp", "brave", "lucky", "nimble",

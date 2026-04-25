@@ -9,19 +9,31 @@ const ProfileDetail = {
     if (!configCache) await loadConfig();
     bindConfigInputs($("#content"));
 
-    // Populate profile selector
-    await this.populateSelector();
+    // Pick profile from URL hash (#profile?name=...) first; fall back to
+    // the active profile in config. The dropdown picker is gone — users
+    // navigate here from the Profiles page per-row, so the URL is the
+    // single source of truth for which profile we're editing.
+    const params = new URLSearchParams(
+      (location.hash.split("?")[1] || "")
+    );
+    const fromHash = params.get("name");
+    const fromCache = configCache?.browser?.profile_name;
+    this.currentProfile = fromHash || fromCache || null;
+    this._renderHeader(this.currentProfile);
 
-    $("#profile-selector").addEventListener("change", (e) => {
-      this.currentProfile = e.target.value;
-      this.loadSelfcheck(this.currentProfile);
-      this.loadFingerprint(this.currentProfile);
-      this.loadSessionSummary(this.currentProfile);
-      this.loadProfileMeta(this.currentProfile);
-      this.loadCookies(this.currentProfile);
-      this.loadActiveScript(this.currentProfile);
-      this.loadActiveProxy(this.currentProfile);
-    });
+    // Wire the rotation-toggle checkbox in the new Proxy card so the
+    // rotation block expands/collapses cleanly. Default = collapsed.
+    document.getElementById("pp-proxy-rotating")
+      ?.addEventListener("change", (e) => {
+        const block = document.getElementById("pp-rotation-block");
+        if (block) block.style.display = e.target.checked ? "" : "none";
+      });
+    // Separate Save button on the Proxy card — distinct from the
+    // Identity card's Save (different scope, less surprising for users).
+    document.getElementById("pp-proxy-save-btn-new")
+      ?.addEventListener("click", () => this.saveProfileMeta());
+    document.getElementById("pp-proxy-test-btn-new")
+      ?.addEventListener("click", () => this._testProxyOverride());
 
     $("#reset-health-btn").addEventListener("click", () => this.resetHealth());
     $("#clear-history-btn").addEventListener("click", () => this.clearHistory());
@@ -86,10 +98,10 @@ const ProfileDetail = {
     document.getElementById("chrome-import-run-btn")
       ?.addEventListener("click", () => this._runChromeImport());
 
-    // Pre-load for current active profile
-    this.currentProfile = configCache?.browser?.profile_name;
+    // Initial data load for the picked profile. If we somehow landed
+    // here without a name (deep-linked from another tool), bail loudly
+    // — the page shows an empty state, and a Back button.
     if (this.currentProfile) {
-      $("#profile-selector").value = this.currentProfile;
       await Promise.all([
         this.loadSelfcheck(this.currentProfile),
         this.loadFingerprint(this.currentProfile),
@@ -99,18 +111,61 @@ const ProfileDetail = {
         this.loadActiveScript(this.currentProfile),
         this.loadActiveProxy(this.currentProfile),
       ]);
+    } else {
+      toast("No profile selected — redirecting to the Profiles list", true);
+      if (typeof navigate === "function") {
+        setTimeout(() => navigate("profiles"), 600);
+      }
     }
   },
 
-  async populateSelector() {
+  /** Fill the page header's "Edit profile: <name>" label.
+   *  Called once on init — the page reloads (different name) come via
+   *  navigation from the Profiles page, not via in-page state. */
+  _renderHeader(name) {
+    const sep = document.getElementById("profile-name-sep");
+    const lbl = document.getElementById("profile-name-display");
+    if (!lbl) return;
+    if (name) {
+      sep.textContent = ": ";
+      lbl.textContent = name;
+    } else {
+      sep.textContent = "";
+      lbl.textContent = "";
+    }
+  },
+
+  /** Test button on the Proxy card. Just hits ipinfo via the existing
+   *  /api/proxy/test endpoint, passing the proxy URL we have in the form
+   *  rather than the global one. */
+  async _testProxyOverride() {
+    const url = (document.getElementById("pp-proxy-url")?.value || "").trim();
+    if (!url) {
+      toast("Set a proxy URL first, then test", true);
+      return;
+    }
+    const status = document.getElementById("pp-proxy-save-status");
+    if (status) { status.textContent = "Testing…"; status.className = "muted"; }
     try {
-      const profiles = await api("/api/profiles");
-      const select = $("#profile-selector");
-      select.innerHTML = profiles
-        .map(p => `<option value="${escapeHtml(p.name)}">${escapeHtml(p.name)}</option>`)
-        .join("");
+      const r = await api("/api/proxy/test-url", {
+        method: "POST", body: JSON.stringify({ url }),
+      });
+      if (r.ok) {
+        if (status) {
+          status.textContent = `OK · ${r.exit_ip || "?"} · ${r.country || "?"} · ${r.latency_ms || "?"}ms`;
+          status.className = "muted profile-proxy-test-ok";
+        }
+      } else {
+        if (status) {
+          status.textContent = `FAIL · ${r.error || "unreachable"}`;
+          status.className = "muted profile-proxy-test-fail";
+        }
+      }
     } catch (e) {
-      console.error(e);
+      if (status) {
+        status.textContent = `FAIL · ${e.message}`;
+        status.className = "muted profile-proxy-test-fail";
+      }
     }
   },
 

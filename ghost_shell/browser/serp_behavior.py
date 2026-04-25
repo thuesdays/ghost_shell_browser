@@ -40,6 +40,9 @@ a nice-to-have, not a hard requirement, so failures never abort
 the parent search loop.
 """
 
+__author__ = "Mykola Kovhanko"
+__email__ = "thuesdays@gmail.com"
+
 import logging
 import random
 import time

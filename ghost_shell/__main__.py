@@ -10,6 +10,10 @@ their existing `if __name__ == "__main__":` blocks handle signal setup,
 run-finish persistence, and error banners. Without runpy those blocks
 would be skipped and Chrome zombies would leak on SIGTERM.
 """
+
+__author__ = "Mykola Kovhanko"
+__email__ = "thuesdays@gmail.com"
+
 import runpy
 import sys
 

@@ -20,6 +20,10 @@ worse by injecting stale cookies, so a human confirms.
 """
 
 from __future__ import annotations
+
+__author__ = "Mykola Kovhanko"
+__email__ = "thuesdays@gmail.com"
+
 import json
 import logging
 import time

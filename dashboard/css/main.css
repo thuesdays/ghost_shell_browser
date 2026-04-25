@@ -19,6 +19,20 @@
   --critical:   #ef4444;
   --idle:       #6b7280;
   --purple:     #a855f7;
+
+  /* Extended accent palette — domain-coloured tiles on Overview.
+     Each "domain" gets its own hue so a glance at the page tells
+     you what KIND of thing you're looking at: Vault is violet,
+     Proxy is teal, Runs is orange, etc. */
+  --hue-primary:  #818cf8;   /* indigo  — generic / scheduler         */
+  --hue-success:  #34d399;   /* green   — healthy / clean run         */
+  --hue-warning:  #fbbf24;   /* amber   — warning / quieting          */
+  --hue-danger:   #f87171;   /* red     — failed / banned             */
+  --hue-info:     #22d3ee;   /* cyan    — fingerprint / identity      */
+  --hue-magenta:  #ec4899;   /* pink    — captcha / sensitive         */
+  --hue-orange:   #fb923c;   /* orange  — runs / activity             */
+  --hue-violet:   #a78bfa;   /* violet  — vault / accounts            */
+  --hue-teal:     #2dd4bf;   /* teal    — proxy / network             */
 }
 
 * { box-sizing: border-box; margin: 0; padding: 0; }
@@ -8054,4 +8068,430 @@ input[type="range"] {
   color: #6ee7b7;
   font-family: ui-monospace, monospace;
   margin-left: 4px;
+}
+
+
+/* ════════════════════════════════════════════════════════════
+ * OVERVIEW page — operator-focused redesign
+ * ════════════════════════════════════════════════════════════
+ * Hero tiles colour-coded by domain (Vault=violet, Proxy=teal,
+ * Runs=orange, Scheduler=indigo, Captchas=magenta).
+ * Layout drops the competitor-tracking blocks (Searches·7d chart,
+ * Top competitors table, Total ads/searches counters) — those
+ * already live on the Competitors page.
+ */
+.content:has(.overview-workspace) {
+  max-width: none;
+  padding-left: 18px;
+  padding-right: 18px;
+}
+
+/* ── Operational status hero (5 tiles, each its own hue) ── */
+.ov-hero {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(190px, 1fr));
+  gap: 10px;
+  margin-bottom: 14px;
+}
+.ov-tile {
+  position: relative;
+  padding: 14px 16px 14px 18px;
+  border-radius: 6px;
+  background: linear-gradient(140deg, var(--card) 0%, var(--card-alt) 100%);
+  border: 1px solid rgba(148, 163, 184, 0.12);
+  overflow: hidden;
+  transition: transform 0.1s, border-color 0.1s;
+}
+.ov-tile::before {
+  /* Left accent strip — coloured by tile-hue */
+  content: "";
+  position: absolute;
+  left: 0; top: 0; bottom: 0;
+  width: 3px;
+  background: var(--tile-hue, var(--hue-primary));
+}
+.ov-tile:hover {
+  transform: translateY(-1px);
+  border-color: var(--tile-hue, var(--hue-primary));
+}
+.ov-tile-label {
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--text-muted);
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-bottom: 6px;
+}
+.ov-tile-label .dot {
+  width: 6px; height: 6px;
+  border-radius: 50%;
+  background: var(--tile-hue, var(--hue-primary));
+  box-shadow: 0 0 8px var(--tile-hue, var(--hue-primary));
+}
+.ov-tile-value {
+  font-size: 22px;
+  font-weight: 700;
+  color: var(--text);
+  font-family: ui-monospace, monospace;
+  line-height: 1.1;
+}
+.ov-tile-value.tile-color { color: var(--tile-hue, var(--hue-primary)); }
+.ov-tile-sub {
+  font-size: 11px;
+  color: var(--text-muted);
+  margin-top: 4px;
+  font-family: ui-monospace, monospace;
+}
+.ov-tile-action {
+  position: absolute;
+  top: 10px; right: 10px;
+  font-size: 10px;
+  font-weight: 600;
+  color: var(--tile-hue, var(--hue-primary));
+  text-decoration: none;
+  opacity: 0.7;
+  transition: opacity 0.1s;
+}
+.ov-tile:hover .ov-tile-action { opacity: 1; }
+
+/* Hue presets */
+.ov-tile-vault     { --tile-hue: var(--hue-violet);  }
+.ov-tile-proxy     { --tile-hue: var(--hue-teal);    }
+.ov-tile-scheduler { --tile-hue: var(--hue-primary); }
+.ov-tile-runs      { --tile-hue: var(--hue-orange);  }
+.ov-tile-captcha   { --tile-hue: var(--hue-magenta); }
+.ov-tile-fp        { --tile-hue: var(--hue-info);    }
+.ov-tile-success   { --tile-hue: var(--hue-success); }
+
+/* ── Quick action bar (Run / Warmup / etc) ─────────────── */
+.ov-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  padding: 10px 14px;
+  margin-bottom: 14px;
+  background: linear-gradient(90deg, rgba(129, 140, 248, 0.06), rgba(34, 211, 238, 0.04));
+  border: 1px solid rgba(148, 163, 184, 0.14);
+  border-radius: 6px;
+}
+.ov-actions-label {
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: var(--text-muted);
+  margin-right: 4px;
+  align-self: center;
+}
+.ov-action-btn {
+  background: rgba(99, 102, 241, 0.12);
+  border: 1px solid rgba(99, 102, 241, 0.3);
+  color: #c7d2fe;
+  padding: 6px 12px;
+  border-radius: 4px;
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: background 0.1s;
+  text-decoration: none;
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  font-family: inherit;
+}
+.ov-action-btn:hover {
+  background: rgba(99, 102, 241, 0.22);
+  border-color: #818cf8;
+}
+
+/* ── Two-column area: profiles (left) + activity feed (right) ── */
+.ov-cols {
+  display: grid;
+  grid-template-columns: 2fr 1fr;
+  gap: 12px;
+  margin-bottom: 12px;
+}
+@media (max-width: 1100px) { .ov-cols { grid-template-columns: 1fr; } }
+
+/* ── Compact profile-health table (tinted rows by status) ── */
+.ov-profiles-table tbody tr.profile-status-active   { box-shadow: inset 2px 0 0 var(--hue-success); }
+.ov-profiles-table tbody tr.profile-status-running  { box-shadow: inset 2px 0 0 var(--hue-orange); }
+.ov-profiles-table tbody tr.profile-status-blocked  { box-shadow: inset 2px 0 0 var(--hue-danger); }
+.ov-profiles-table tbody tr.profile-status-warmed   { box-shadow: inset 2px 0 0 var(--hue-info); }
+.ov-profiles-table .pill {
+  font-size: 9.5px;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  padding: 2px 7px;
+  border-radius: 3px;
+  font-family: ui-monospace, monospace;
+}
+.ov-profiles-table .pill-active  { background: rgba(52,211,153,0.18); color: #6ee7b7; }
+.ov-profiles-table .pill-running { background: rgba(251,146,60,0.18); color: #fdba74; }
+.ov-profiles-table .pill-idle    { background: rgba(148,163,184,0.14); color: var(--text-muted); }
+.ov-profiles-table .pill-blocked { background: rgba(248,113,113,0.18); color: #fca5a5; }
+.ov-profiles-table .pill-ok      { background: rgba(52,211,153,0.18); color: #6ee7b7; }
+.ov-profiles-table .pill-warn    { background: rgba(251,191,36,0.18); color: #fcd34d; }
+.ov-profiles-table .pill-err     { background: rgba(248,113,113,0.18); color: #fca5a5; }
+
+/* ── Activity feed — small icon + line per event ─────── */
+.ov-feed {
+  padding: 4px 0;
+}
+.ov-feed-item {
+  display: grid;
+  grid-template-columns: 26px 1fr auto;
+  gap: 10px;
+  padding: 8px 14px;
+  border-bottom: 1px solid rgba(148, 163, 184, 0.06);
+  align-items: center;
+  font-size: 12px;
+}
+.ov-feed-item:last-child { border-bottom: none; }
+.ov-feed-icon {
+  width: 26px; height: 26px;
+  border-radius: 50%;
+  display: flex; align-items: center; justify-content: center;
+  font-size: 13px;
+  background: rgba(148, 163, 184, 0.1);
+}
+.ov-feed-icon.run-ok      { background: rgba(52, 211, 153, 0.18); color: #6ee7b7; }
+.ov-feed-icon.run-fail    { background: rgba(248, 113, 113, 0.18); color: #fca5a5; }
+.ov-feed-icon.captcha     { background: rgba(236, 72, 153, 0.18);  color: #f9a8d4; }
+.ov-feed-icon.warmup      { background: rgba(34, 211, 238, 0.18);  color: #67e8f9; }
+.ov-feed-icon.fingerprint { background: rgba(167, 139, 250, 0.18); color: #c4b5fd; }
+.ov-feed-icon.proxy       { background: rgba(45, 212, 191, 0.18);  color: #5eead4; }
+.ov-feed-icon.scheduler   { background: rgba(129, 140, 248, 0.18); color: #a5b4fc; }
+.ov-feed-body {
+  color: var(--text);
+}
+.ov-feed-meta {
+  font-size: 10.5px;
+  color: var(--text-muted);
+  font-family: ui-monospace, monospace;
+}
+.ov-feed-when {
+  font-size: 10.5px;
+  color: var(--text-muted);
+  font-family: ui-monospace, monospace;
+  white-space: nowrap;
+}
+
+/* ── Active runs strip ─────────────────────────────────── */
+.ov-active-runs {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(260px, 1fr));
+  gap: 8px;
+  padding: 12px;
+}
+.ov-run-card {
+  padding: 10px 12px;
+  background: linear-gradient(135deg, rgba(251, 146, 60, 0.08), rgba(236, 72, 153, 0.04));
+  border: 1px solid rgba(251, 146, 60, 0.3);
+  border-radius: 5px;
+}
+.ov-run-card-name {
+  font-size: 12.5px;
+  font-weight: 600;
+  color: var(--text);
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.ov-run-card-pulse {
+  width: 7px; height: 7px;
+  border-radius: 50%;
+  background: var(--hue-orange);
+  box-shadow: 0 0 8px var(--hue-orange);
+  animation: ov-pulse 1.5s ease-in-out infinite;
+}
+@keyframes ov-pulse {
+  0%, 100% { opacity: 1; }
+  50%      { opacity: 0.4; }
+}
+.ov-run-card-meta {
+  font-size: 10.5px;
+  color: var(--text-muted);
+  margin-top: 4px;
+  font-family: ui-monospace, monospace;
+}
+.ov-run-card-progress {
+  font-size: 11px;
+  color: #fdba74;
+  margin-top: 4px;
+}
+
+
+/* ════════════════════════════════════════════════════════════
+ * Profile EDIT page (2026-04 redesign) — header back button,
+ * Identity card, Proxy card, rotation block toggle.
+ * Replaces the old ".profile-selector dropdown + override-row"
+ * pattern. Added classes: .page-header-left, .btn-icon-back,
+ * .page-title-name, .profile-identity-card, .profile-proxy-card,
+ * .profile-tags-row, .profile-rotation-block, .profile-proxy-test-ok,
+ * .profile-proxy-test-fail, .form-label-optional.
+ * ════════════════════════════════════════════════════════════ */
+
+.page-header-left {
+  display: flex;
+  align-items: flex-start;
+  gap: 14px;
+}
+
+.btn-icon-back {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 36px;
+  height: 36px;
+  border-radius: 6px;
+  background: rgba(148, 163, 184, 0.08);
+  border: 1px solid rgba(148, 163, 184, 0.18);
+  color: var(--text);
+  font-size: 18px;
+  font-weight: 600;
+  text-decoration: none;
+  margin-top: 2px;
+  transition: background 0.12s, border-color 0.12s, transform 0.08s;
+}
+.btn-icon-back:hover {
+  background: rgba(99, 102, 241, 0.12);
+  border-color: rgba(99, 102, 241, 0.45);
+}
+.btn-icon-back:active {
+  transform: translateX(-1px);
+}
+
+.page-title-sep {
+  color: var(--text-muted);
+  font-weight: 400;
+}
+.page-title-name {
+  color: #93c5fd;
+  font-weight: 600;
+}
+
+.profile-identity-card .profile-tags-row {
+  margin-top: 6px;
+}
+.profile-identity-card .tag-editor-chips {
+  min-height: 32px;
+  padding: 6px 8px;
+  background: rgba(15, 20, 25, 0.6);
+  border: 1px solid rgba(148, 163, 184, 0.14);
+  border-radius: 6px;
+}
+
+.profile-proxy-card .profile-rotation-block {
+  margin-top: 14px;
+  padding: 14px;
+  border-left: 3px solid rgba(99, 102, 241, 0.45);
+  background: rgba(99, 102, 241, 0.04);
+  border-radius: 0 6px 6px 0;
+}
+
+.profile-proxy-test-ok   { color: #4ade80 !important; }
+.profile-proxy-test-fail { color: #f87171 !important; }
+
+.form-label-optional {
+  font-weight: 400;
+  color: var(--text-muted);
+  font-size: 11px;
+}
+
+/* Bulk actions bar — keep it visually subordinate to the toolbar above */
+.bulk-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 14px;
+  padding: 8px 12px;
+  margin: 8px 0 10px 0;
+  background: rgba(99, 102, 241, 0.08);
+  border: 1px solid rgba(99, 102, 241, 0.28);
+  border-radius: 6px;
+}
+.bulk-bar-info {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  font-size: 13px;
+  color: var(--text);
+}
+.bulk-bar-info strong {
+  color: #c4b5fd;
+}
+.bulk-bar-actions {
+  display: flex;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+.btn-link {
+  background: none;
+  border: none;
+  color: #93c5fd;
+  cursor: pointer;
+  font-size: 12px;
+  padding: 0;
+  text-decoration: underline;
+}
+.btn-link:hover { color: #bfdbfe; }
+
+
+/* ════════════════════════════════════════════════════════════
+ * Profile groups — action button states (added 2026-04)
+ *
+ * Visual hierarchy on a row where members are running:
+ *   • Start group  — dimmed + disabled (can't start a started group)
+ *   • Stop         — saturated red, prominent
+ *
+ * The user explicitly asked for the Stop button to be more visible
+ * because they couldn't tell whether the group was running.
+ * ════════════════════════════════════════════════════════════ */
+
+.group-start-btn.is-running {
+  opacity: 0.45;
+  filter: grayscale(0.4);
+  cursor: not-allowed;
+  /* Subtle inset shadow keeps the disabled state from looking like a
+     glitch — communicates "intentionally inactive". */
+  box-shadow: inset 0 0 0 1px rgba(148, 163, 184, 0.12);
+}
+.group-start-btn.is-running:hover {
+  /* No hover lift on disabled — Tailwind-ish "no surprise" rule. */
+  transform: none;
+  background: var(--accent);
+}
+
+/* Saturated red Stop button — appears when group has 1+ active runs */
+.btn-danger-strong {
+  background: #dc2626;        /* red-600 */
+  color: #ffffff;
+  border: 1px solid #b91c1c;  /* red-700 */
+  font-weight: 600;
+  box-shadow: 0 1px 2px rgba(220, 38, 38, 0.25);
+  transition: background 0.12s, box-shadow 0.12s, transform 0.06s;
+}
+.btn-danger-strong:hover:not(:disabled) {
+  background: #ef4444;        /* red-500 */
+  border-color: #dc2626;
+  box-shadow: 0 2px 6px rgba(239, 68, 68, 0.35);
+}
+.btn-danger-strong:active:not(:disabled) {
+  transform: translateY(1px);
+  box-shadow: 0 1px 1px rgba(220, 38, 38, 0.4);
+}
+.btn-danger-strong:disabled {
+  /* When NO runs in the group — keep the button visible but obviously
+     not actionable. Using a muted slate so it doesn't compete for
+     attention with other buttons. */
+  background: rgba(148, 163, 184, 0.12);
+  border-color: rgba(148, 163, 184, 0.2);
+  color: var(--text-muted);
+  box-shadow: none;
+  cursor: not-allowed;
 }

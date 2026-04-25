@@ -11,6 +11,9 @@ proxy_pool.py — Пул прокси с ротацией по здоровью
 ]
 """
 
+__author__ = "Mykola Kovhanko"
+__email__ = "thuesdays@gmail.com"
+
 import os
 import json
 import random
