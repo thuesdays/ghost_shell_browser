@@ -1,0 +1,22 @@
+{
+  "name": "Amazon product search",
+  "description": "Goes to amazon.com, searches for a product (substitute {{search_query}} via Variables), browses the results page, clicks one of the top items and dwells on the product page. Useful for shopping-intent profile warmup.",
+  "category": "browse",
+  "tags": ["amazon", "shopping", "ecommerce"],
+  "flow": [
+    { "type": "visit", "url": "https://www.amazon.com" },
+    { "type": "dwell", "min": 3, "max": 7 },
+    { "type": "click_selector", "selector": "input#twotabsearchtextbox" },
+    { "type": "type", "selector": "input#twotabsearchtextbox", "text": "{{search_query}}", "clear_first": true },
+    { "type": "press_key", "key": "Enter" },
+    { "type": "wait_for", "selector": "[data-component-type='s-search-result'], .s-result-list", "timeout": 15 },
+    { "type": "dwell", "min": 5, "max": 12 },
+    { "type": "scroll", "amount_min": 600, "amount_max": 1400 },
+    { "type": "dwell", "min": 4, "max": 9 },
+    { "type": "click_selector", "selector": "[data-component-type='s-search-result'] h2 a, .s-result-list a.a-link-normal" },
+    { "type": "wait_for", "selector": "#productTitle, #title", "timeout": 15 },
+    { "type": "dwell", "min": 8, "max": 18 },
+    { "type": "scroll", "amount_min": 500, "amount_max": 1100 },
+    { "type": "dwell", "min": 5, "max": 10 }
+  ]
+}

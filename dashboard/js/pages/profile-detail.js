@@ -963,12 +963,30 @@ const ProfileDetail = {
       // the resolved script (falling back to default), so to know
       // whether the profile has an explicit assignment we'd need a
       // separate flag. Simplest: mark the resolved one as selected.
-      // If the user actually had no assignment, they'll see the
-      // default entry pre-selected — which matches reality.
       if (active?.id) {
         select.value = String(active.id);
       } else {
         select.value = "";
+      }
+
+      // Phase 5.1: load use_script_on_launch from profile meta and
+      // sync the toggle + picker visibility. Default OFF when meta
+      // hasn't been written yet (e.g. legacy profiles upgraded in
+      // place from before the column existed).
+      try {
+        const meta = await api(`/api/profiles/${encodeURIComponent(name)}/meta`);
+        const useScript = !!meta.meta?.use_script_on_launch;
+        const toggle = document.getElementById("profile-use-script-toggle");
+        const wrap   = document.getElementById("profile-script-pick-wrap");
+        if (toggle) {
+          toggle.checked = useScript;
+          toggle.onchange = () => {
+            if (wrap) wrap.style.display = toggle.checked ? "" : "none";
+          };
+        }
+        if (wrap) wrap.style.display = useScript ? "" : "none";
+      } catch (e) {
+        console.warn("use_script_on_launch load failed:", e);
       }
 
       // Hint updates on change
@@ -998,19 +1016,32 @@ const ProfileDetail = {
     }
     const select = document.getElementById("profile-script-select");
     if (!select) return;
+    const toggle = document.getElementById("profile-use-script-toggle");
+    const useScript = toggle ? !!toggle.checked : false;
     const raw = select.value;
     const scriptId = raw === "" ? null : Number(raw);
     const btn = document.getElementById("profile-script-save-btn");
     btn.disabled = true;
     try {
+      // Persist both: the script_id binding AND the opt-in flag.
+      // Two endpoints because they target different SQL columns and
+      // we don't want to fold meta-write into /script (which has
+      // its own validation).
       await api(
         `/api/profiles/${encodeURIComponent(this.currentProfile)}/script`,
         {
           method: "POST",
-          body: JSON.stringify({ script_id: scriptId }),
+          body: JSON.stringify({ script_id: useScript ? scriptId : null }),
         }
       );
-      toast("✓ Script assigned");
+      await api(
+        `/api/profiles/${encodeURIComponent(this.currentProfile)}/meta`,
+        {
+          method: "POST",
+          body: JSON.stringify({ use_script_on_launch: useScript ? 1 : 0 }),
+        }
+      );
+      toast(useScript ? "✓ Script enabled on launch" : "✓ Script-on-launch disabled");
     } catch (e) {
       toast("Save failed: " + e.message, true);
     } finally {

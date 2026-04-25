@@ -2095,6 +2095,23 @@ class RunContext:
         # "save in one step, use in another" wouldn't work across
         # different containers).
         self.vars        = parent.vars if parent else {}
+        # Phase 5.1: at the root scope, seed `vars["vault"]` from env
+        # so {vault.<id>.<field>} placeholders resolve through the
+        # standard template-resolution machinery (head="vault" falls
+        # to the unknown-root branch, which looks up self.vars["vault"]).
+        # The dashboard pre-decrypts referenced items at run-launch
+        # time and passes them as JSON env -- subprocess never sees
+        # the master password.
+        if parent is None:
+            try:
+                import json as _json_v, os as _os_v
+                _raw = _os_v.environ.get("GHOST_SHELL_VAULT_RESOLVED")
+                if _raw:
+                    _bag = _json_v.loads(_raw)
+                    if isinstance(_bag, dict):
+                        self.vars["vault"] = _bag
+            except Exception:
+                pass
         self.ad          = parent.ad   if parent else None
         self.ads         = parent.ads  if parent else []
         self.item        = parent.item if parent else None
@@ -2394,6 +2411,51 @@ def _exec_single(step: dict, ctx: RunContext):
             log.warning(f"  [flow] {act_type} needs an ad in context — "
                         f"wrap in foreach_ad or run after search_query")
             return
+
+        # ── SAFETY-CRITICAL: ad-class skip/only filter ──────────────
+        #
+        # The legacy pipeline (`_run_action_pipeline_for_ad`) honours
+        # skip_on_my_domain / skip_on_target / only_on_target /
+        # only_on_my_domain flags before invoking the action. The
+        # unified runtime delegates to the same handlers via the
+        # legacy bridge below, but historically did NOT apply those
+        # filters here. Result: a user who set "skip_on_my_domain"
+        # on a click_ad inside foreach_ad would still click their
+        # OWN ad, burning CPC budget.
+        #
+        # We apply the filter against ctx.ad (current ad in foreach
+        # loop). Domain match is exact OR wildcard subdomain
+        # (ad_domain endswith "." + my_domain) -- same logic as the
+        # legacy pipeline so behavior is identical between modes.
+        # If ctx.ad is None (we're not inside a foreach_ad), the
+        # filter is skipped silently -- meaningless without an ad.
+        if ctx.ad:
+            ad_domain = (ctx.ad.get("domain") or "").lower().strip()
+            my_doms = {d.lower().strip()
+                       for d in (ctx.loop_ctx.get("my_domains") or [])}
+            is_mine = bool(ad_domain and any(
+                ad_domain == d or ad_domain.endswith("." + d)
+                for d in my_doms
+            ))
+            is_target = bool(ctx.ad.get("is_target"))
+
+            if is_mine and step.get("skip_on_my_domain"):
+                log.info(f"  [flow] skip {act_type} "
+                         f"(ad on my_domain: {ad_domain})")
+                return
+            if is_target and step.get("skip_on_target"):
+                log.info(f"  [flow] skip {act_type} "
+                         f"(ad on target domain: {ad_domain})")
+                return
+            if step.get("only_on_target") and not is_target:
+                log.info(f"  [flow] skip {act_type} "
+                         f"(only_on_target, ad not target: {ad_domain})")
+                return
+            if step.get("only_on_my_domain") and not is_mine:
+                log.info(f"  [flow] skip {act_type} "
+                         f"(only_on_my_domain, ad not mine: {ad_domain})")
+                return
+
         try:
             legacy_handler(ctx.driver, step, legacy_ctx)
         except Exception as e:

@@ -1,0 +1,15 @@
+{
+  "name": "Proxy / IP smoke test",
+  "description": "Quickest possible sanity check. Hits an IP-echo service to confirm the profile's proxy is alive and routing correctly, then dwells briefly so the run shows up as not-instant in the run history. Great as the first script you assign to a freshly-created profile.",
+  "category": "diagnostic",
+  "tags": ["proxy", "smoke-test", "diagnostic"],
+  "flow": [
+    { "type": "visit", "url": "https://api.ipify.org/?format=json" },
+    { "type": "dwell", "min": 1, "max": 3 },
+    { "type": "extract_text", "selector": "body", "store_as": "exit_ip_json" },
+    { "type": "visit", "url": "https://browserleaks.com/ip" },
+    { "type": "dwell", "min": 4, "max": 8 },
+    { "type": "scroll", "amount_min": 200, "amount_max": 600 },
+    { "type": "dwell", "min": 3, "max": 6 }
+  ]
+}

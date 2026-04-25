@@ -1,0 +1,29 @@
+{
+  "name": "Human browsing warmup",
+  "description": "Visits 4 random news sites with realistic dwells + scrolls. Use as a daily warmup before any monitoring run -- builds plausible browsing history that takes the heat off the actual workload.",
+  "category": "warmup",
+  "tags": ["warmup", "human-like", "daily"],
+  "flow": [
+    { "type": "visit", "url": "https://www.bbc.com/news" },
+    { "type": "random_delay", "min": 2, "max": 5 },
+    { "type": "scroll", "amount_min": 400, "amount_max": 1200 },
+    { "type": "dwell", "min": 8, "max": 20 },
+    { "type": "scroll", "amount_min": 200, "amount_max": 800 },
+    { "type": "dwell", "min": 5, "max": 12 },
+
+    { "type": "visit", "url": "https://www.theguardian.com/international" },
+    { "type": "random_delay", "min": 3, "max": 7 },
+    { "type": "scroll", "amount_min": 600, "amount_max": 1400 },
+    { "type": "dwell", "min": 10, "max": 25 },
+
+    { "type": "visit", "url": "https://www.reuters.com" },
+    { "type": "random_delay", "min": 2, "max": 5 },
+    { "type": "scroll", "amount_min": 300, "amount_max": 900 },
+    { "type": "dwell", "min": 6, "max": 15 },
+
+    { "type": "visit", "url": "https://en.wikipedia.org/wiki/Main_Page" },
+    { "type": "random_delay", "min": 2, "max": 4 },
+    { "type": "scroll", "amount_min": 200, "amount_max": 600 },
+    { "type": "dwell", "min": 4, "max": 10 }
+  ]
+}

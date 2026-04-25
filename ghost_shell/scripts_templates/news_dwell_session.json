@@ -1,0 +1,32 @@
+{
+  "name": "News dwell session (multi-source)",
+  "description": "Reads 3 news headlines across major outlets with realistic article-page dwell times (60-180s each) and inter-article delays. Builds a substantial reader-profile footprint -- works well as a once-a-day habit-builder for ad-targeting profiles.",
+  "category": "browse",
+  "tags": ["news", "warmup", "long-session"],
+  "flow": [
+    { "type": "visit", "url": "https://www.nytimes.com" },
+    { "type": "dwell", "min": 5, "max": 12 },
+    { "type": "scroll", "amount_min": 400, "amount_max": 900 },
+    { "type": "dwell", "min": 4, "max": 10 },
+    { "type": "click_selector", "selector": "a[href*='/2'], section a h3" },
+    { "type": "wait_for", "selector": "article, main", "timeout": 15 },
+    { "type": "dwell", "min": 60, "max": 140 },
+    { "type": "scroll", "amount_min": 800, "amount_max": 2000 },
+    { "type": "dwell", "min": 30, "max": 70 },
+
+    { "type": "visit", "url": "https://www.washingtonpost.com" },
+    { "type": "dwell", "min": 5, "max": 11 },
+    { "type": "click_selector", "selector": "a[data-qa='homepage-link'], main a h3, main a h2" },
+    { "type": "wait_for", "selector": "article, main", "timeout": 15 },
+    { "type": "dwell", "min": 50, "max": 120 },
+    { "type": "scroll", "amount_min": 800, "amount_max": 1800 },
+    { "type": "dwell", "min": 25, "max": 60 },
+
+    { "type": "visit", "url": "https://www.economist.com" },
+    { "type": "dwell", "min": 4, "max": 10 },
+    { "type": "click_selector", "selector": "a[data-test='headline-link'], main a h3, main a h2" },
+    { "type": "wait_for", "selector": "article, main", "timeout": 15 },
+    { "type": "dwell", "min": 70, "max": 180 },
+    { "type": "scroll", "amount_min": 600, "amount_max": 1500 }
+  ]
+}

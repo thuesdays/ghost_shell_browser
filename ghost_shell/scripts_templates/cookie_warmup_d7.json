@@ -1,0 +1,30 @@
+{
+  "name": "Cookie warmup -- day 7 of 7",
+  "description": "Final day of a 7-day cookie warmup cycle. Shifts emphasis to commerce + lifestyle sites for diversity. Run after the d1 / mid-week templates to round out the cookie-pool footprint.",
+  "category": "warmup",
+  "tags": ["warmup", "cookies", "day-7"],
+  "flow": [
+    { "type": "visit", "url": "https://www.amazon.com" },
+    { "type": "dwell", "min": 6, "max": 12 },
+    { "type": "scroll", "amount_min": 500, "amount_max": 1100 },
+
+    { "type": "visit", "url": "https://www.bestbuy.com" },
+    { "type": "dwell", "min": 5, "max": 11 },
+    { "type": "scroll", "amount_min": 400, "amount_max": 900 },
+
+    { "type": "visit", "url": "https://www.expedia.com" },
+    { "type": "dwell", "min": 5, "max": 12 },
+    { "type": "scroll", "amount_min": 400, "amount_max": 1000 },
+
+    { "type": "visit", "url": "https://www.airbnb.com" },
+    { "type": "dwell", "min": 5, "max": 11 },
+    { "type": "scroll", "amount_min": 600, "amount_max": 1300 },
+
+    { "type": "visit", "url": "https://www.tripadvisor.com" },
+    { "type": "dwell", "min": 4, "max": 10 },
+    { "type": "scroll", "amount_min": 300, "amount_max": 800 },
+
+    { "type": "visit", "url": "https://www.netflix.com" },
+    { "type": "dwell", "min": 4, "max": 9 }
+  ]
+}

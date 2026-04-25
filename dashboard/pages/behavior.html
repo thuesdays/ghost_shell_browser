@@ -5,6 +5,8 @@
       <div class="page-subtitle">Timing, delays, and realistic-user options.</div>
     </div>
     <div class="behavior-header-actions">
+      <input type="text" id="behavior-search" class="input behavior-search-input"
+             placeholder="🔍  Filter settings…">
       <button class="btn btn-secondary" id="reset-timings-btn"
               title="Restore all timing values to defaults">
         ↺ Reset defaults
@@ -12,7 +14,15 @@
     </div>
   </div>
 
-  <!-- ── Search loop timings ───────────────────────────────── -->
+  <!-- ── Tab strip ──────────────────────────────────────────────── -->
+  <nav class="behavior-tabstrip" role="tablist">
+    <button class="behavior-tab-btn is-active" data-tab="timings"     role="tab">⏱  Timings</button>
+    <button class="behavior-tab-btn"           data-tab="naturalness" role="tab">🎭  Naturalness</button>
+    <button class="behavior-tab-btn"           data-tab="captcha"     role="tab">🧩  Captcha</button>
+  </nav>
+
+  <!-- ── Tab: TIMINGS ──────────────────────────────────────────── -->
+  <div class="behavior-tab-content is-visible" data-tab="timings" role="tabpanel">
   <div class="dense-panel">
     <div class="dense-panel-header">
       <div class="dense-panel-title">🔎 Search loop timings</div>
@@ -244,7 +254,10 @@
     </div>
   </div>
 
-  <!-- ── Naturalness options ───────────────────────────────── -->
+  </div>  <!-- /tab[timings] -->
+
+  <!-- ── Tab: NATURALNESS ──────────────────────────────────────── -->
+  <div class="behavior-tab-content" data-tab="naturalness" role="tabpanel">
   <div class="dense-panel">
     <div class="dense-panel-header">
       <div class="dense-panel-title">🎭 Naturalness</div>
@@ -286,30 +299,12 @@
         </label>
       </div>
 
-      <details class="deprecated-section">
-        <summary>Deprecated (handled by C++ patches)</summary>
-        <div class="dense-hint" style="margin-bottom: 12px;">
-          These options existed before the native Chromium patches landed.
-          They used to inject JS to mask <code>webdriver</code>, spoof
-          plugins, and add canvas noise. All of that is now done at the
-          C++ engine level — turning these back on adds no value and may
-          <em>increase</em> detection risk.
-        </div>
-        <ul class="deprecated-list">
-          <li>✓ <code>navigator.webdriver</code> spoof → C++ patch</li>
-          <li>✓ Canvas / WebGL / Audio fingerprint noise → C++ patches</li>
-          <li>✓ Plugin & MIME-type list injection → C++ patch</li>
-          <li>✓ Timezone / Intl.DateTimeFormat override → C++ patch</li>
-          <li>✓ UA / UA-CH / platform spoof → C++ patch (browser process)</li>
-          <li>✓ <code>performance.now()</code> sub-ms jitter → C++ patch 1.3</li>
-          <li>✓ MouseEvent timestamp jitter → C++ patch 4.3</li>
-          <li>✓ Battery / Permissions / MediaDevices → C++ patches</li>
-        </ul>
-      </details>
     </div>
   </div>
+  </div>  <!-- /tab[naturalness] -->
 
-  <!-- ── Captcha ───────────────────────────────────────────── -->
+  <!-- ── Tab: CAPTCHA ──────────────────────────────────────────── -->
+  <div class="behavior-tab-content" data-tab="captcha" role="tabpanel">
   <div class="dense-panel">
     <div class="dense-panel-header">
       <div class="dense-panel-title">🧩 Captcha</div>
@@ -326,4 +321,5 @@
       </div>
     </div>
   </div>
+  </div>  <!-- /tab[captcha] -->
 </section>

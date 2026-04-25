@@ -1,0 +1,77 @@
+{
+  "name": "Facebook login",
+  "description": "Logs into facebook.com with <- click 🔑 to pick username from Vault -> + <- click 🔑 to pick password from Vault ->. Handles the standard email/password form. After auth, dwells on the feed and does light scrolling to seed plausible behavior. Captcha / 2FA flows are NOT auto-handled -- use TOTP from Vault if your account has 2FA enabled.\n\nHOW TO BIND CREDENTIALS: open a 'type' step, click the 🔑 button next to the parameter label, pick your account from the Vault, then choose 'username' or 'password' (or '2FA code' for TOTP). The placeholder becomes {vault.<id>.<field>} and gets resolved to cleartext at run-launch time. Vault must be unlocked.",
+  "category": "login",
+  "tags": [
+    "login",
+    "facebook",
+    "meta"
+  ],
+  "flow": [
+    {
+      "type": "visit",
+      "url": "https://www.facebook.com/"
+    },
+    {
+      "type": "wait_for",
+      "selector": "input[name='email'], input#email",
+      "timeout": 15
+    },
+    {
+      "type": "dwell",
+      "min": 2,
+      "max": 5
+    },
+    {
+      "type": "type",
+      "selector": "input[name='email']",
+      "text": "<- click 🔑 to pick username from Vault ->",
+      "clear_first": true
+    },
+    {
+      "type": "random_delay",
+      "min": 1,
+      "max": 2
+    },
+    {
+      "type": "type",
+      "selector": "input[name='pass']",
+      "text": "<- click 🔑 to pick password from Vault ->",
+      "clear_first": true
+    },
+    {
+      "type": "random_delay",
+      "min": 1,
+      "max": 2
+    },
+    {
+      "type": "click_selector",
+      "selector": "button[name='login'], button[type='submit']"
+    },
+    {
+      "type": "wait_for",
+      "selector": "[role='banner'], [aria-label='Facebook'], div[role='feed']",
+      "timeout": 30
+    },
+    {
+      "type": "dwell",
+      "min": 6,
+      "max": 14
+    },
+    {
+      "type": "scroll",
+      "amount_min": 400,
+      "amount_max": 1000
+    },
+    {
+      "type": "dwell",
+      "min": 4,
+      "max": 10
+    },
+    {
+      "type": "scroll",
+      "amount_min": 300,
+      "amount_max": 800
+    }
+  ]
+}

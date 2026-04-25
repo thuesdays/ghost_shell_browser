@@ -1,0 +1,19 @@
+{
+  "name": "Google search recon",
+  "description": "Goes to Google, types a query, dwells on the SERP for a realistic amount of time, scrolls through the results. Customize the search query in the `type` step or wrap in a foreach loop over a query list.",
+  "category": "recon",
+  "tags": ["google", "search", "ads"],
+  "flow": [
+    { "type": "visit", "url": "https://www.google.com" },
+    { "type": "dwell", "min": 2, "max": 5 },
+    { "type": "click_selector", "selector": "textarea[name='q'], input[name='q']" },
+    { "type": "random_delay", "min": 1, "max": 2 },
+    { "type": "type", "selector": "textarea[name='q'], input[name='q']", "text": "shoe insurance compare", "clear_first": true },
+    { "type": "press_key", "key": "Enter" },
+    { "type": "wait_for", "selector": "#search, #rcnt", "timeout": 12 },
+    { "type": "dwell", "min": 5, "max": 12 },
+    { "type": "scroll", "amount_min": 500, "amount_max": 1200 },
+    { "type": "dwell", "min": 4, "max": 10 },
+    { "type": "scroll", "amount_min": 400, "amount_max": 800 }
+  ]
+}

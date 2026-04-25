@@ -76,15 +76,32 @@
   </div>
 
   <!-- ─── ACTIVE SCRIPT ──────────────────────────────────────── -->
-  <!-- Which saved script (from /Scripts page) does this profile run?
-       Null = fall back to default. UI only shows when we've loaded the
-       profile name, since the API is per-profile. -->
+  <!-- Phase 5.1: opt-in script-on-launch.
+       The toggle defaults to OFF on a fresh install. When OFF the
+       run skips any script binding entirely (legacy behaviour).
+       When ON the picked script runs at every profile launch UNLESS
+       a one-shot override comes through GHOST_SHELL_SCRIPT_ID
+       (set by /api/scripts/<id>/run from a Library card). -->
   <div class="card">
     <div class="card-title">
-      🎬 Active script
-      <span class="muted">— the flow this profile executes per run</span>
+      🎬 Script on launch
+      <span class="muted">— flow this profile runs (when enabled)</span>
     </div>
-    <div class="form-group">
+    <label class="checkbox-row" style="margin-bottom:10px;">
+      <input type="checkbox" id="profile-use-script-toggle">
+      <div class="checkbox-text">
+        <strong>Use a script when this profile starts</strong>
+        <div class="muted">
+          OFF (default) — the run executes the legacy hardcoded loop,
+          ignores any script binding. <br>
+          ON — the run uses the script picked below. A one-shot
+          override from the Scripts page (Run on profiles) still wins
+          for that single run.
+        </div>
+      </div>
+    </label>
+    <div class="form-group" id="profile-script-pick-wrap"
+         style="display:none;">
       <label class="form-label">Script</label>
       <select class="select" id="profile-script-select" style="min-width: 320px;">
         <option value="">— loading —</option>
@@ -98,7 +115,7 @@
     </div>
     <div style="display: flex; gap: 8px; margin-top: 10px;">
       <button class="btn btn-primary btn-small" id="profile-script-save-btn">
-        Save assignment
+        Save
       </button>
       <a href="#" data-nav="scripts" class="btn btn-secondary btn-small">
         Open Scripts →

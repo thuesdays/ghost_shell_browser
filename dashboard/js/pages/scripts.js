@@ -63,14 +63,41 @@ const ScriptsPage = {
 
   // ── Loaders (shared) ─────────────────────────────────────────
 
+
+  // ════════════════════════════════════════════════════════════
+  //   API
+  // ════════════════════════════════════════════════════════════
+
   async loadCatalog() {
     try {
       const resp = await api("/api/actions/catalog");
       const items = Array.isArray(resp) ? resp : (resp.types || []);
+      // Pull ad-class skip/only flags out of common_params and merge
+      // them into every non-container action's params. Without this,
+      // the UI never surfaces them and users can't toggle "click only
+      // my own ads" / "skip target-domain ads" without editing the JSON.
+      // Probability stays excluded because the inspector renders it in
+      // its own Execution section -- merging it here would duplicate.
+      const adFlagNames = new Set([
+        "skip_on_my_domain",
+        "skip_on_target",
+        "only_on_target",
+        "only_on_my_domain",
+      ]);
+      const adFlags = (resp.common_params || [])
+        .filter(p => adFlagNames.has(p.name));
+      this.commonParams = resp.common_params || [];
+
       items.forEach(c => {
         if (!c.category) c.category = "other";
         c.is_container = c.is_container ||
           ["if", "foreach_ad", "foreach", "loop"].includes(c.type);
+        // Containers (if/foreach/loop) don't run per-ad logic, so the
+        // ad-class flags are meaningless there. Everything else gets
+        // them appended after its native params.
+        if (!c.is_container && adFlags.length) {
+          c.params = (c.params || []).concat(adFlags);
+        }
       });
       this.catalog = items;
       this.renderPalette();
@@ -102,6 +129,11 @@ const ScriptsPage = {
 
   // ── View mode switching ──────────────────────────────────────
 
+
+  // ════════════════════════════════════════════════════════════
+  //   STATE / VIEW SWITCH
+  // ════════════════════════════════════════════════════════════
+
   _showLibrary() {
     this.currentScript = null;
     this.selection = null;
@@ -119,6 +151,28 @@ const ScriptsPage = {
       if (!sc) throw new Error("Script not found");
       this.currentScript = sc;
       this.flow = sc.flow || [];
+      // Phase 4: reset undo/redo stacks per-script + check for an
+      // autosaved draft. Push the just-loaded state as the baseline
+      // entry so the very first user mutation has something to undo to.
+      this.undoStack = [];
+      this.redoStack = [];
+      this._pushUndoBaseline = () => {
+        // Defer until after editor inputs are populated.
+        this.undoStack.push(this._snapshotState());
+      };
+      const draft = this._autosaveCheck(scriptId, sc.updated_at);
+      if (draft && confirm(
+            `An unsaved draft for "${sc.name}" was found from ` +
+            `${new Date(draft.savedAt).toLocaleString()}.\n\nRestore it?`)) {
+        this.flow = draft.flow || this.flow;
+        // Name + description applied below in editor wiring; we
+        // override there too:
+        this._pendingDraftName = draft.name;
+        this._pendingDraftDesc = draft.description;
+        this.dirty = true;
+      } else {
+        this._autosaveClear(scriptId);
+      }
       this.selection = null;
       this.dirty = false;
       $("#scripts-library-view").style.display = "none";
@@ -141,40 +195,169 @@ const ScriptsPage = {
   // LIBRARY VIEW
   // ═══════════════════════════════════════════════════════════════
 
+
+  // ════════════════════════════════════════════════════════════
+  //   LIBRARY (cards grid)
+  // ════════════════════════════════════════════════════════════
+
   renderLibrary() {
     const grid = $("#scripts-library-grid");
     if (!this.scripts.length) {
       grid.innerHTML = `<div class="library-empty">
-        No scripts yet. Click <strong>+ New script</strong> to create one.
+        No scripts yet. Click <strong>+ New script</strong>, or
+        <strong>\u{1F4DA} Templates</strong> to start from a recipe.
       </div>`;
       return;
     }
     grid.innerHTML = this.scripts.map(s => this._renderLibraryCard(s)).join("");
-    // Card click → open editor
+    // Card click -> open editor; ⋯ menu click stops propagation and
+    // opens the floating action menu instead. Event delegation keeps
+    // the wiring O(1) regardless of card count.
     grid.querySelectorAll(".library-card").forEach(card => {
-      card.addEventListener("click", () => {
+      card.addEventListener("click", (e) => {
+        // Menu button bubble-stop is handled in _openCardMenu; here we
+        // only need to skip card-open when the click started inside a
+        // chip or pin element (defensive -- prevents pin-chip click
+        // from accidentally opening the editor).
+        if (e.target.closest(".library-card-menu-btn")) return;
+        if (e.target.closest(".library-pin-chip")) return;
         const id = Number(card.dataset.scriptId);
         this._showEditor(id);
       });
     });
+    // Wire ⋯ menu buttons: floating action menu with Edit / Run /
+    // Apply / Pin / Duplicate / Delete.
+    grid.querySelectorAll(".library-card-menu-btn").forEach(btn => {
+      btn.addEventListener("click", (e) => {
+        e.stopPropagation();
+        const id = Number(btn.dataset.cardMenu);
+        this._openCardMenu(btn, id);
+      });
+    });
+  },
+
+  // ─── Phase 5: Validate-before-save ───────────────────────────
+
+  /** Walk the flow, return list of {path, summary, message} for
+   *  required-but-missing params. `path` is an encoded step path that
+   *  matches what `data-path` attributes use, so the caller can mark
+   *  the offending DOM card. Empty list = clean. */
+  _validateFlow() {
+    const errors = [];
+    const walk = (steps, basePath, containerKey) => {
+      (steps || []).forEach((s, i) => {
+        const path = [...basePath, { key: containerKey, idx: i }];
+        const meta = this.catalog.find(c => c.type === s.type);
+        if (!meta) {
+          errors.push({
+            path,
+            summary: `Step ${i + 1}`,
+            message: `unknown type "${s.type}"`,
+          });
+          return;
+        }
+        for (const p of (meta.params || [])) {
+          if (!p.required) continue;
+          const v = s[p.name];
+          const empty = v === undefined || v === null ||
+            (typeof v === "string" && v.trim() === "") ||
+            (Array.isArray(v) && v.length === 0);
+          if (empty) {
+            errors.push({
+              path,
+              summary: `${meta.label || s.type} (#${i + 1})`,
+              message: `"${p.label || p.name}" is required`,
+            });
+          }
+        }
+        // Recurse into containers
+        if (Array.isArray(s.steps))      walk(s.steps,      path, "steps");
+        if (Array.isArray(s.then_steps)) walk(s.then_steps, path, "then_steps");
+        if (Array.isArray(s.else_steps)) walk(s.else_steps, path, "else_steps");
+      });
+    };
+    walk(this.flow, [], "root");
+    return errors;
+  },
+
+  /** Add/remove `is-invalid` class + `data-error-msg` on flow-step
+   *  DOM cards based on validation errors. Re-rendering the canvas
+   *  later will reset this; we just need it to be visible until the
+   *  user fixes the issue and tries Save again. */
+  _renderValidationMarkers(errors) {
+    const root = $("#canvas-flow");
+    if (!root) return;
+    root.querySelectorAll(".flow-step.is-invalid").forEach(el => {
+      el.classList.remove("is-invalid");
+      el.removeAttribute("data-error-msg");
+    });
+    for (const e of errors) {
+      const sel = `.flow-step[data-path="${this._encodePath(e.path)}"]`;
+      const el = root.querySelector(sel);
+      if (el) {
+        el.classList.add("is-invalid");
+        // Aggregate multiple errors per step into one tooltip
+        const cur = el.getAttribute("data-error-msg") || "";
+        el.setAttribute("data-error-msg",
+          cur ? cur + "; " + e.message : e.message);
+      }
+    }
   },
 
   _renderLibraryCard(s) {
     const updated = s.updated_at
       ? this._formatRelative(s.updated_at)
-      : "—";
+      : "\u2014";  // em-dash, escaped for ASCII-safety in this file
     const pCount = s.profile_count || 0;
     const pLabel = pCount === 1 ? "1 profile" : `${pCount} profiles`;
     const desc = s.description || "(no description)";
+
+    // Run-status badge -- decoded from last_run_status (null=never run,
+    // "ok"=last exit code 0, "fail"=last exit code != 0). Card sits idle
+    // until the user opens a card menu so we don't compete with the
+    // primary "Edit by clicking the card" affordance.
+    let badge = "";
+    if (s.last_run_status === "ok") {
+      badge = `<span class="library-card-badge library-card-badge-ok"
+                title="Last run succeeded${s.last_run_at ? " (" + s.last_run_at + ")" : ""}">\u25CF</span>`;
+    } else if (s.last_run_status === "fail") {
+      badge = `<span class="library-card-badge library-card-badge-fail"
+                title="Last run failed${s.last_run_at ? " (" + s.last_run_at + ")" : ""}">\u25CF</span>`;
+    } else {
+      badge = `<span class="library-card-badge library-card-badge-idle"
+                title="Never run">\u25CF</span>`;
+    }
+
+    // Pinned-profile chips: small, max ~4 visible, "+N more" overflow.
+    // Click on a chip alone doesn't bubble to the card -- ⋯ menu is the
+    // way to actually run/manage. Chips here are purely informative.
+    const pinned = Array.isArray(s.pinned_profiles) ? s.pinned_profiles : [];
+    let pinnedRow = "";
+    if (pinned.length) {
+      const visible = pinned.slice(0, 4);
+      const overflow = pinned.length - visible.length;
+      pinnedRow = `<div class="library-card-pinned">
+        ${visible.map(n => `<span class="library-pin-chip" title="Pinned profile: ${escapeHtml(n)}">\u{1F4CC} ${escapeHtml(n)}</span>`).join("")}
+        ${overflow > 0 ? `<span class="library-pin-chip library-pin-overflow">+${overflow}</span>` : ""}
+      </div>`;
+    }
+
     return `
       <div class="library-card" data-script-id="${s.id}">
         <div class="library-card-header">
+          ${badge}
           <div class="library-card-name">${escapeHtml(s.name)}</div>
           ${s.is_default
             ? `<span class="library-card-default" title="Default script">DEFAULT</span>`
             : ""}
+          <button class="library-card-menu-btn" data-card-menu="${s.id}"
+                  title="More actions">\u22EF</button>
         </div>
         <div class="library-card-desc">${escapeHtml(desc)}</div>
+        ${pinnedRow}
+        ${(s.tags && s.tags.length) ? `<div class="library-card-tags">
+          ${s.tags.map(t => `<span class="library-tag">${escapeHtml(t)}</span>`).join("")}
+        </div>` : ""}
         <div class="library-card-stats">
           <span class="library-card-stat">
             <strong>${s.step_count || 0}</strong> steps
@@ -186,6 +369,33 @@ const ScriptsPage = {
           <span class="library-card-stat library-card-time">${updated}</span>
         </div>
       </div>`;
+  },
+
+  /** Phase 5: client-side library filter.
+   *  Matches script.name + description + tags against the query
+   *  case-insensitively. Display the count next to the search box. */
+  _filterLibrary(query) {
+    const q = (query || "").trim().toLowerCase();
+    const grid = $("#scripts-library-grid");
+    const hint = $("#library-search-hint");
+    if (!grid) return;
+    const cards = grid.querySelectorAll(".library-card");
+    let shown = 0;
+    cards.forEach(card => {
+      const id = Number(card.dataset.scriptId);
+      const sc = this.scripts.find(s => s.id === id);
+      if (!sc) { card.style.display = "none"; return; }
+      let hay = (sc.name + " " + (sc.description || "") + " " +
+                 (sc.tags || []).join(" ")).toLowerCase();
+      const match = !q || hay.includes(q);
+      card.style.display = match ? "" : "none";
+      if (match) shown++;
+    });
+    if (hint) {
+      hint.textContent = q
+        ? `${shown} of ${cards.length} scripts`
+        : "";
+    }
   },
 
   /** Turn an ISO timestamp into "3h ago" / "Apr 24" etc. Quick-n-dirty. */
@@ -202,6 +412,11 @@ const ScriptsPage = {
     } catch { return ts; }
   },
 
+
+  // ════════════════════════════════════════════════════════════
+  //   LIBRARY HEADER (new + import + templates)
+  // ════════════════════════════════════════════════════════════
+
   wireLibraryHeader() {
     $("#library-new-btn").addEventListener("click", () => {
       this._openNewScriptModal();
@@ -209,6 +424,17 @@ const ScriptsPage = {
     $("#library-import-btn").addEventListener("click", () => {
       $("#library-import-file").click();
     });
+    const tplBtn = $("#library-templates-btn");
+    if (tplBtn) {
+      tplBtn.addEventListener("click", () => this._openTemplatesModal());
+    }
+    // Phase 5: live library search -- filters cards by name/desc/tag
+    // case-insensitively. Empty query restores full list. Hint shows
+    // "N of M" while filtering.
+    const searchEl = $("#library-search");
+    if (searchEl) {
+      searchEl.addEventListener("input", () => this._filterLibrary(searchEl.value));
+    }
     $("#library-import-file").addEventListener("change", (e) => {
       const file = e.target.files?.[0];
       if (!file) return;
@@ -250,6 +476,11 @@ const ScriptsPage = {
       reader.readAsText(file);
     });
   },
+
+
+  // ════════════════════════════════════════════════════════════
+  //   NEW-SCRIPT MODAL
+  // ════════════════════════════════════════════════════════════
 
   wireNewScriptModal() {
     document.querySelectorAll('[data-close="new-script-modal"]').forEach(el => {
@@ -307,6 +538,11 @@ const ScriptsPage = {
   // EDITOR VIEW (unified flow builder)
   // ═══════════════════════════════════════════════════════════════
 
+
+  // ════════════════════════════════════════════════════════════
+  //   EDITOR HEADER (save / delete / export)
+  // ════════════════════════════════════════════════════════════
+
   wireEditorHeader() {
     $("#editor-back-btn").addEventListener("click", (e) => {
       e.preventDefault();
@@ -330,7 +566,28 @@ const ScriptsPage = {
     // Name + description — live save-on-blur (no auto-save, just mark dirty)
     $("#editor-name-input").addEventListener("input", () => this._markDirty());
     $("#editor-desc-input").addEventListener("input", () => this._markDirty());
+    // Phase 4: apply restored draft override (set in _showEditor before
+    // inputs are populated by the surrounding code).
+    if (this._pendingDraftName !== undefined) {
+      $("#editor-name-input").value = this._pendingDraftName;
+      this._pendingDraftName = undefined;
+    }
+    if (this._pendingDraftDesc !== undefined) {
+      $("#editor-desc-input").value = this._pendingDraftDesc;
+      this._pendingDraftDesc = undefined;
+    }
+    // Push the (possibly draft-overridden) initial state as the undo
+    // baseline so Ctrl+Z brings the editor back to "as it loaded".
+    if (this._pushUndoBaseline) {
+      this._pushUndoBaseline();
+      this._pushUndoBaseline = null;
+    }
   },
+
+
+  // ════════════════════════════════════════════════════════════
+  //   EDITOR SAVE / VALIDATE / DRAFT
+  // ════════════════════════════════════════════════════════════
 
   async save() {
     if (!this.currentScript) return;
@@ -344,15 +601,28 @@ const ScriptsPage = {
         toast("Name is required", true);
         return;
       }
+      // Phase 5: validate-before-save. Walks flow, checks required
+      // params per step against catalog schema. On failure, mark all
+      // bad-step cards red + show the first 3 errors in a toast.
+      const errors = this._validateFlow();
+      this._renderValidationMarkers(errors);
+      if (errors.length) {
+        const sample = errors.slice(0, 3)
+          .map(e => `${e.summary}: ${e.message}`).join("; ");
+        toast(`${errors.length} error${errors.length > 1 ? "s" : ""} -- ${sample}${errors.length > 3 ? "; ..." : ""}`, true);
+        return;
+      }
       await api(`/api/scripts/${this.currentScript.id}`, {
         method: "PUT",
         body: JSON.stringify({
-          name, description: desc, flow: this.flow,
+          name, description: desc, flow: this._cleanFlowForSave(this.flow),
         }),
       });
       this.currentScript.name = name;
       this.currentScript.description = desc;
       this.dirty = false;
+      // Phase 4: drop the draft now that the server has persisted.
+      if (this.currentScript) this._autosaveClear(this.currentScript.id);
       toast("✓ Saved");
     } catch (e) {
       toast(`Save failed: ${e.message}`, true);
@@ -423,12 +693,57 @@ const ScriptsPage = {
 
   // ── Keyboard ─────────────────────────────────────────────────
 
+
+  // ════════════════════════════════════════════════════════════
+  //   KEYBOARD (Ctrl+S/Z/Y/K/1..9)
+  // ════════════════════════════════════════════════════════════
+
   wireKeyboard() {
     document.addEventListener("keydown", (e) => {
-      // Only when in editor mode and a step is selected
-      if (!this.currentScript || !this.selection) return;
-      const t = e.target;
-      if (t && ["INPUT", "TEXTAREA", "SELECT"].includes(t.tagName)) return;
+      // Phase 4: editor-wide shortcuts (work even without selection).
+      // Ctrl+S, Ctrl+Z, Ctrl+Y, Ctrl+Shift+Z (redo alt). Avoid stealing
+      // shortcuts when the user is mid-typing in an input.
+      if (!this.currentScript) return;
+      const inField = e.target && ["INPUT", "TEXTAREA", "SELECT"]
+        .includes(e.target.tagName);
+      if ((e.ctrlKey || e.metaKey) && !e.shiftKey && e.key.toLowerCase() === "s" && !inField) {
+        e.preventDefault();
+        this.save();
+        return;
+      }
+      // Phase 5: Ctrl+K opens the global command palette. Works even
+      // when not in the editor -- useful for "I'm on Profiles page,
+      // want to run script X on profile Y, GO".
+      if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "k") {
+        e.preventDefault();
+        this._openCommandPalette();
+        return;
+      }
+      // Phase 5: Ctrl+1..9 trigger user-defined hotkeys. Each digit
+      // maps to a script id stored in localStorage (set via the card
+      // ⋯ menu). Pressing the hotkey runs that script on the user's
+      // default-profile pick (last-used or first-pinned). No-op if
+      // unassigned.
+      if ((e.ctrlKey || e.metaKey) && !e.shiftKey && /^[1-9]$/.test(e.key) && !inField) {
+        e.preventDefault();
+        this._triggerHotkey(parseInt(e.key, 10));
+        return;
+      }
+      if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "z" && !e.shiftKey) {
+        e.preventDefault();
+        this._undo();
+        return;
+      }
+      if (((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "y") ||
+          ((e.ctrlKey || e.metaKey) && e.shiftKey && e.key.toLowerCase() === "z")) {
+        e.preventDefault();
+        this._redo();
+        return;
+      }
+
+      // Steps-only shortcuts
+      if (!this.selection) return;
+      if (inField) return;
       if (e.key === "Delete" || e.key === "Backspace") {
         e.preventDefault();
         this._removeAt(this.selection.path);
@@ -444,6 +759,11 @@ const ScriptsPage = {
   },
 
   // ── PALETTE ───────────────────────────────────────────────────
+
+
+  // ════════════════════════════════════════════════════════════
+  //   PALETTE (catalog rendering, drag source)
+  // ════════════════════════════════════════════════════════════
 
   renderPalette() {
     const body = $("#palette-body");
@@ -497,6 +817,11 @@ const ScriptsPage = {
     body.innerHTML = html;
   },
 
+
+  // ════════════════════════════════════════════════════════════
+  //   PALETTE WIRING
+  // ════════════════════════════════════════════════════════════
+
   wirePalette() {
     $("#palette-search").addEventListener("input", (e) => {
       const q = e.target.value.trim().toLowerCase();
@@ -525,12 +850,18 @@ const ScriptsPage = {
 
   // ── CANVAS (flow editor) ─────────────────────────────────────
 
+
+  // ════════════════════════════════════════════════════════════
+  //   CANVAS (flow rendering)
+  // ════════════════════════════════════════════════════════════
+
   renderFlow() {
     $("#stat-total-count").textContent = this._countSteps(this.flow);
     const root = $("#canvas-flow");
     root.innerHTML = this._renderStepList(this.flow, [], "root")
                    + this._renderAddButton([]);
     this.wireCanvasInteractions();
+    this._wireInlineParams();
     this.renderInspector();
     this.highlightSelection();
     this._scheduleArrowsRedraw();
@@ -555,6 +886,11 @@ const ScriptsPage = {
     }).join("");
   },
 
+
+  // ════════════════════════════════════════════════════════════
+  //   CANVAS STEP RENDERING (simple + container)
+  // ════════════════════════════════════════════════════════════
+
   _renderStep(step, path) {
     const meta = this.catalog.find(c => c.type === step.type);
     const isContainer = meta?.is_container ||
@@ -568,8 +904,17 @@ const ScriptsPage = {
     const category = meta?.category || "other";
     const enabled  = step.enabled !== false;
     const idx      = path[path.length - 1].idx;
+    // Phase 5: inline param editing -- per-step accordion. The expand
+    // state lives on a transient flag (step._inlineOpen) that is NOT
+    // serialized to the server (filtered out in save()) and NOT
+    // visible in the JSON export. Default is collapsed.
+    const inlineOpen = !!step._inlineOpen;
+    const editableParams = (meta?.params || [])
+      .filter(p => !["steps", "then_steps", "else_steps", "condition"]
+                       .includes(p.name));
+    const hasParams = editableParams.length > 0;
     return `
-      <div class="flow-step ${enabled ? '' : 'is-disabled'}"
+      <div class="flow-step ${enabled ? '' : 'is-disabled'} ${inlineOpen ? 'is-inline-open' : ''}"
            data-path="${this._encodePath(path)}"
            data-category="${category}"
            data-type="${escapeHtml(step.type)}"
@@ -579,13 +924,19 @@ const ScriptsPage = {
           <div class="flow-step-icon">${this._iconFor(meta || {type: step.type})}</div>
           <div class="flow-step-label">${escapeHtml(label)}</div>
           <div class="flow-step-actions">
+            ${hasParams ? `<button class="btn-icon" data-action="inline-edit"
+                    title="${inlineOpen ? 'Hide params' : 'Edit params inline'}">${inlineOpen ? '\u25BC' : '\u270E'}</button>` : ""}
             <button class="btn-icon" data-action="toggle"
-                    title="${enabled ? 'Disable' : 'Enable'}">${enabled ? '⏸' : '▶'}</button>
-            <button class="btn-icon" data-action="duplicate" title="Duplicate">⎘</button>
-            <button class="btn-icon" data-action="remove" title="Remove">✕</button>
+                    title="${enabled ? 'Disable' : 'Enable'}">${enabled ? '\u23F8' : '\u25B6'}</button>
+            <button class="btn-icon" data-action="duplicate" title="Duplicate">\u2398</button>
+            <button class="btn-icon" data-action="remove" title="Remove">\u2715</button>
           </div>
         </div>
         <div class="flow-step-body">${this._buildChips(step, meta)}</div>
+        ${inlineOpen && hasParams ? `<div class="flow-step-inline-params"
+             data-inline-host="${this._encodePath(path)}">
+          ${editableParams.map(p => this._renderInlineParam(p, step, path)).join("")}
+        </div>` : ""}
       </div>`;
   },
 
@@ -738,6 +1089,11 @@ const ScriptsPage = {
     return String(v);
   },
 
+
+  // ════════════════════════════════════════════════════════════
+  //   CANVAS DRAG-DROP / CLICK / DELETE
+  // ════════════════════════════════════════════════════════════
+
   wireCanvasInteractions() {
     const canvas = $("#canvas-flow");
     canvas.onclick = (e) => {
@@ -848,6 +1204,14 @@ const ScriptsPage = {
   },
 
   _handleAction(path, action) {
+    // inline-edit toggles the per-step accordion. NO _markDirty / no
+    // renderFlow at the end because _toggleInlineEdit already does
+    // its own re-render -- and inline-open is transient UI state, not
+    // script content.
+    if (action === "inline-edit") {
+      this._toggleInlineEdit(path);
+      return;
+    }
     if (action === "remove") {
       this._removeAt(path);
       this.selection = null;
@@ -963,7 +1327,131 @@ const ScriptsPage = {
     return step;
   },
 
-  _markDirty() { this.dirty = true; },
+  _markDirty() {
+    this.dirty = true;
+    // Phase 4: push current state onto undo stack + schedule a debounced
+    // localStorage autosave. Both kept inside _markDirty so EVERY existing
+    // call site (and any future ones) participates without per-site
+    // surgery. snapshotState() takes a deep clone so later mutations
+    // don't modify the saved snapshot.
+    this._pushUndoSnapshot();
+    this._scheduleAutosave();
+  },
+
+  // -----  Phase 4: Undo / Redo stack  -----------------------------
+  // Strategy: undoStack always holds the CURRENT state on top. Each
+  // mutation pushes the NEW state. Undo pops top, restores the next-
+  // top, and pushes the popped one onto redoStack.
+
+  _snapshotState() {
+    return {
+      flow:        JSON.parse(JSON.stringify(this.flow || [])),
+      name:        $("#editor-name-input")?.value || "",
+      description: $("#editor-desc-input")?.value || "",
+    };
+  },
+
+  _pushUndoSnapshot() {
+    if (!this.undoStack) this.undoStack = [];
+    if (!this.redoStack) this.redoStack = [];
+    this.undoStack.push(this._snapshotState());
+    // Cap depth so a long editing session does not blow the heap. 80
+    // entries covers easily a full afternoon of work; older entries
+    // get trimmed silently.
+    if (this.undoStack.length > 80) this.undoStack.shift();
+    // Any new mutation invalidates the redo branch -- standard editor
+    // semantics. Without this, redo could resurrect a state from a
+    // different timeline.
+    this.redoStack.length = 0;
+  },
+
+  _applyState(s) {
+    this.flow = JSON.parse(JSON.stringify(s.flow || []));
+    const nameEl = $("#editor-name-input");
+    const descEl = $("#editor-desc-input");
+    if (nameEl) nameEl.value = s.name || "";
+    if (descEl) descEl.value = s.description || "";
+    this.selection = null;
+    this.renderFlow();
+  },
+
+  _undo() {
+    if (!this.undoStack || this.undoStack.length < 2) {
+      toast("Nothing to undo");
+      return;
+    }
+    const cur = this.undoStack.pop();
+    this.redoStack.push(cur);
+    const prev = this.undoStack[this.undoStack.length - 1];
+    this._applyState(prev);
+    this.dirty = true;
+  },
+
+  _redo() {
+    if (!this.redoStack || !this.redoStack.length) {
+      toast("Nothing to redo");
+      return;
+    }
+    const next = this.redoStack.pop();
+    this.undoStack.push(next);
+    this._applyState(next);
+    this.dirty = true;
+  },
+
+  // -----  Phase 4: localStorage autosave  -------------------------
+  // Debounced save -- writes 800ms after the last mutation so a burst
+  // of typing does not hammer storage. On editor open we check for a
+  // draft newer than the server's `updated_at` and offer to restore.
+
+  _scheduleAutosave() {
+    if (!this.currentScript) return;
+    if (this._autosaveTimer) clearTimeout(this._autosaveTimer);
+    this._autosaveTimer = setTimeout(() => this._autosaveFlush(), 800);
+  },
+
+  _autosaveKey(scriptId) { return `gs_script_draft_${scriptId}`; },
+
+  _autosaveFlush() {
+    if (!this.currentScript) return;
+    try {
+      const draft = {
+        ...this._snapshotState(),
+        savedAt: Date.now(),
+      };
+      localStorage.setItem(this._autosaveKey(this.currentScript.id),
+                           JSON.stringify(draft));
+    } catch (e) {
+      // Storage quota / private mode -- silently degrade. Autosave
+      // is a safety net, not a feature the user paid for.
+    }
+  },
+
+  _autosaveClear(scriptId) {
+    try { localStorage.removeItem(this._autosaveKey(scriptId)); } catch {}
+  },
+
+  /** Returns a draft payload if a newer-than-server one is found.
+   *  Caller (in _showEditor) decides whether to prompt the user. */
+  _autosaveCheck(scriptId, serverUpdatedAt) {
+    try {
+      const raw = localStorage.getItem(this._autosaveKey(scriptId));
+      if (!raw) return null;
+      const draft = JSON.parse(raw);
+      // Compare against server's updated_at -- if server has changed
+      // since the draft (rare: another tab or a teammate saved), bias
+      // toward the server: stale drafts get auto-cleared, no prompt.
+      if (serverUpdatedAt) {
+        const serverMs = new Date(serverUpdatedAt.replace(" ", "T") + "Z").getTime();
+        if (!Number.isNaN(serverMs) && draft.savedAt < serverMs) {
+          this._autosaveClear(scriptId);
+          return null;
+        }
+      }
+      return draft;
+    } catch {
+      return null;
+    }
+  },
 
   // Selection
   highlightSelection() {
@@ -986,6 +1474,11 @@ const ScriptsPage = {
   },
 
   // ── INSPECTOR (identical to v3 — full params, condition builder) ──
+
+
+  // ════════════════════════════════════════════════════════════
+  //   INSPECTOR (right panel, parameter editor)
+  // ════════════════════════════════════════════════════════════
 
   renderInspector() {
     const body  = $("#inspector-body");
@@ -1147,7 +1640,12 @@ const ScriptsPage = {
     if (p.type === "textarea" || p.type === "textlist") {
       return `
         <div class="inspector-field field-has-vars">
-          <div class="inspector-field-label">${label}</div>
+          <div class="inspector-field-label">
+            ${label}
+            <button class="inspector-vault-btn" type="button"
+                    data-vault-target="${name}"
+                    title="Insert credential from Vault">\u{1F511}</button>
+          </div>
           <textarea class="input" data-param="${name}" rows="${p.type === "textlist" ? 6 : 4}"
                     ${p.placeholder ? `placeholder="${escapeHtml(p.placeholder)}"` : ""}>${escapeHtml(String(val))}</textarea>
           ${hint}
@@ -1155,7 +1653,12 @@ const ScriptsPage = {
     }
     return `
       <div class="inspector-field field-has-vars">
-        <div class="inspector-field-label">${label}</div>
+        <div class="inspector-field-label">
+          ${label}
+          <button class="inspector-vault-btn" type="button"
+                  data-vault-target="${name}"
+                  title="Insert credential from Vault">\u{1F511}</button>
+        </div>
         <input type="text" class="input" data-param="${name}"
                value="${escapeHtml(String(val))}"
                ${p.placeholder ? `placeholder="${escapeHtml(p.placeholder)}"` : ""}>
@@ -1165,6 +1668,35 @@ const ScriptsPage = {
 
   _wireInspectorInputs() {
     const body = $("#inspector-body");
+
+    // Phase 5.1: 🔑 buttons in inspector. Same UX as inline-edit:
+    // click -> picker -> inserts {vault.<id>.<field>} into the
+    // matching [data-param=<name>] input. Replaces full content if
+    // the existing value is empty/whitespace, otherwise inserts at
+    // the cursor.
+    body.querySelectorAll(".inspector-vault-btn").forEach(btn => {
+      btn.addEventListener("click", (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        const param = btn.dataset.vaultTarget;
+        const input = body.querySelector(`[data-param="${param}"]`);
+        if (!input) return;
+        this._openVaultPicker((placeholder) => {
+          const cur = input.value || "";
+          if (!cur || /^\s*$/.test(cur)) {
+            input.value = placeholder;
+          } else if (input.selectionStart != null) {
+            const s = input.selectionStart, e2 = input.selectionEnd;
+            input.value = cur.slice(0, s) + placeholder + cur.slice(e2);
+            input.selectionStart = input.selectionEnd = s + placeholder.length;
+          } else {
+            input.value = cur + placeholder;
+          }
+          input.dispatchEvent(new Event("input", { bubbles: true }));
+        });
+      });
+    });
+
     body.querySelectorAll("[data-insp]").forEach(input => {
       const update = () => {
         const step = this._getAt(this.selection.path);
@@ -1402,6 +1934,11 @@ const ScriptsPage = {
   },
 
   // Arrows
+
+  // ════════════════════════════════════════════════════════════
+  //   FLOW ARROWS (svg overlay)
+  // ════════════════════════════════════════════════════════════
+
   _scheduleArrowsRedraw() {
     if (this._arrowsRAF) cancelAnimationFrame(this._arrowsRAF);
     this._arrowsRAF = requestAnimationFrame(() => {
@@ -1454,7 +1991,1138 @@ const ScriptsPage = {
     }
   },
 
-  // Icons
+  // ============================================================
+  //  Phase 5: Hotkeys + command palette + schedule binding
+  // ============================================================
+
+  /** Read the hotkey map (digit -> scriptId) from localStorage. The
+   *  map is shared across browser tabs but not across users / hosts. */
+  _hotkeyMapRead() {
+    try {
+      const raw = localStorage.getItem("gs_script_hotkeys");
+      const m = raw ? JSON.parse(raw) : {};
+      return (m && typeof m === "object") ? m : {};
+    } catch { return {}; }
+  },
+  _hotkeyMapWrite(map) {
+    try { localStorage.setItem("gs_script_hotkeys", JSON.stringify(map)); }
+    catch {}
+  },
+
+  async _setHotkeyForScript(sc) {
+    const cur = this._hotkeyMapRead();
+    // Show what's already taken so the user picks an empty slot
+    const lines = [];
+    for (let d = 1; d <= 9; d++) {
+      const sid = cur[d];
+      const s = sid && this.scripts.find(x => x.id === sid);
+      lines.push(`Ctrl+${d}: ${s ? s.name : "(empty)"}`);
+    }
+    const picked = prompt(
+      `Pick a digit 1-9 for "${sc.name}".\n` +
+      `Empty slot is overwritten silently. To clear, leave blank.\n\n` +
+      lines.join("\n"));
+    if (picked === null) return;
+    const trimmed = (picked || "").trim();
+    if (!trimmed) {
+      // Clear any existing mapping for this script
+      for (const d of Object.keys(cur)) {
+        if (cur[d] === sc.id) delete cur[d];
+      }
+      this._hotkeyMapWrite(cur);
+      toast(`\u2713 Cleared hotkey for "${sc.name}"`);
+      return;
+    }
+    if (!/^[1-9]$/.test(trimmed)) {
+      toast("Pick a single digit 1..9", true);
+      return;
+    }
+    // Remove this script from any other digit it may have been mapped to
+    for (const d of Object.keys(cur)) {
+      if (cur[d] === sc.id) delete cur[d];
+    }
+    cur[trimmed] = sc.id;
+    this._hotkeyMapWrite(cur);
+    toast(`\u2713 Ctrl+${trimmed} -> "${sc.name}"`);
+  },
+
+  async _triggerHotkey(digit) {
+    const map = this._hotkeyMapRead();
+    const sid = map[digit];
+    if (!sid) {
+      toast(`Ctrl+${digit} is not assigned. Assign via card \u22EF menu.`);
+      return;
+    }
+    const sc = this.scripts.find(x => x.id === sid);
+    if (!sc) {
+      toast(`Hotkey ${digit} points at a deleted script -- cleared.`, true);
+      delete map[digit]; this._hotkeyMapWrite(map);
+      return;
+    }
+    // If pinned profiles exist, run on them. Otherwise open picker so
+    // the user gets to choose -- "magic without surprise".
+    const pinned = sc.pinned_profiles || [];
+    if (pinned.length) {
+      await this._runOnProfiles(sc, pinned);
+    } else {
+      await this._openProfilePicker(sc, "run");
+    }
+  },
+
+  /** Ctrl+K: fuzzy-search palette over the entire library. Type to
+   *  filter, ArrowUp/Down to navigate, Enter to open the profile
+   *  picker for the highlighted script. Esc closes. */
+  _openCommandPalette() {
+    document.querySelectorAll(".gs-command-palette").forEach(m => m.remove());
+    const all = (this.scripts || []).slice();
+    if (!all.length) {
+      toast("No scripts to pick from. Create one first.");
+      return;
+    }
+    const modal = document.createElement("div");
+    modal.className = "profile-modal gs-command-palette";
+    modal.innerHTML = `
+      <div class="profile-modal-backdrop" data-cancel></div>
+      <div class="profile-modal-content cmdp-content" style="width:520px">
+        <div class="cmdp-input-row">
+          <span class="cmdp-prompt">\u203A</span>
+          <input type="text" class="cmdp-input" id="cmdp-input"
+                 placeholder="Type to filter scripts...">
+        </div>
+        <div class="cmdp-list" id="cmdp-list"></div>
+        <div class="cmdp-foot">
+          <span><kbd>\u2191</kbd><kbd>\u2193</kbd> navigate</span>
+          <span><kbd>Enter</kbd> run</span>
+          <span><kbd>Esc</kbd> close</span>
+        </div>
+      </div>
+    `;
+    document.body.appendChild(modal);
+    const input = modal.querySelector("#cmdp-input");
+    const list  = modal.querySelector("#cmdp-list");
+    let active = 0;
+    let filtered = all;
+
+    const score = (s, q) => {
+      const hay = (s.name + " " + (s.description || "") + " " +
+                   (s.tags || []).join(" ")).toLowerCase();
+      if (!q) return 1;
+      // Cheap fuzzy: every char in q must appear in order in hay
+      let i = 0;
+      for (const c of q) { i = hay.indexOf(c, i); if (i < 0) return 0; i++; }
+      // Bias toward matches in the name
+      return s.name.toLowerCase().includes(q) ? 100 : 1;
+    };
+
+    const render = () => {
+      const q = input.value.trim().toLowerCase();
+      filtered = all
+        .map(s => ({ s, w: score(s, q) }))
+        .filter(x => x.w > 0)
+        .sort((a, b) => b.w - a.w || a.s.name.localeCompare(b.s.name))
+        .map(x => x.s);
+      if (active >= filtered.length) active = Math.max(0, filtered.length - 1);
+      list.innerHTML = filtered.length
+        ? filtered.map((s, i) => `
+            <div class="cmdp-row ${i === active ? 'is-active' : ''}"
+                 data-idx="${i}">
+              <span class="cmdp-row-name">${escapeHtml(s.name)}</span>
+              <span class="cmdp-row-desc">${escapeHtml((s.description || "").slice(0, 60))}</span>
+              <span class="cmdp-row-meta">${(s.tags || []).slice(0, 3).map(t => escapeHtml(t)).join(" \u00B7 ")}</span>
+            </div>`).join("")
+        : `<div class="cmdp-empty">No matches.</div>`;
+      list.querySelectorAll(".cmdp-row").forEach(row => {
+        row.addEventListener("mouseenter", () => {
+          active = Number(row.dataset.idx);
+          render();
+        });
+        row.addEventListener("click", () => {
+          modal.remove();
+          this._openProfilePicker(filtered[Number(row.dataset.idx)], "run");
+        });
+      });
+    };
+
+    const onKey = (ev) => {
+      if (ev.key === "ArrowDown") {
+        ev.preventDefault();
+        active = Math.min(filtered.length - 1, active + 1); render();
+      } else if (ev.key === "ArrowUp") {
+        ev.preventDefault();
+        active = Math.max(0, active - 1); render();
+      } else if (ev.key === "Enter") {
+        ev.preventDefault();
+        const sc = filtered[active];
+        if (sc) {
+          modal.remove();
+          this._openProfilePicker(sc, "run");
+        }
+      } else if (ev.key === "Escape") {
+        modal.remove();
+      }
+    };
+    input.addEventListener("keydown", onKey);
+    input.addEventListener("input", render);
+    modal.querySelector("[data-cancel]").addEventListener("click", () => modal.remove());
+
+    render();
+    setTimeout(() => input.focus(), 30);
+  },
+
+  /** Phase 5 #96: schedule binding modal. Creates rows in
+   *  scheduled_tasks table -- one row per cron+profiles binding for
+   *  this script. The scheduler daemon picks them up on its next
+   *  tick (when it is started). Multiple cron rows per script are
+   *  supported (e.g. "weekday morning warmup" + "weekend evening
+   *  recon" can coexist).
+   *
+   *  UI: a list of existing tasks at top, "+ Add new" row at bottom.
+   *  Each task row has cron / profile-count / enabled-toggle / del.
+   *  Profile picking reuses the existing _openProfilePicker pattern. */
+  async _openScheduleModal(sc) {
+    let tasks = [];
+    let profiles = [];
+    try {
+      const tr = await api(`/api/scripts/${sc.id}/schedules`);
+      tasks = tr.tasks || [];
+      const pr = await api("/api/profiles");
+      profiles = (pr.profiles || pr || []).map(p =>
+        typeof p === "string" ? { name: p } : p);
+    } catch (e) {
+      toast(`Could not load schedule data: ${e.message}`, true);
+      return;
+    }
+
+    document.querySelectorAll(".gs-schedule-modal").forEach(m => m.remove());
+    const modal = document.createElement("div");
+    modal.className = "profile-modal gs-schedule-modal";
+    const renderTaskRow = (t) => {
+      const profs = (t.profiles || []).join(", ") || "(no profiles)";
+      return `<div class="sched-row" data-task-id="${t.id}">
+        <input class="input sched-cron" data-field="cron_expr"
+               value="${escapeHtml(t.cron_expr)}" placeholder="m h dom mon dow">
+        <input class="input sched-name" data-field="name"
+               value="${escapeHtml(t.name || "")}" placeholder="(optional name)">
+        <span class="sched-profs" title="${escapeHtml(profs)}"
+              data-profs='${escapeHtml(JSON.stringify(t.profiles || []))}'>
+          \u{1F465} ${(t.profiles || []).length}
+        </span>
+        <label class="sched-toggle">
+          <input type="checkbox" data-field="enabled" ${t.enabled ? "checked" : ""}>
+          <span>on</span>
+        </label>
+        <button class="btn btn-tiny" data-act="pick-profs">Profiles\u2026</button>
+        <button class="btn btn-tiny btn-danger-sm" data-act="del">\u2715</button>
+      </div>`;
+    };
+    const tasksHtml = tasks.length
+      ? tasks.map(renderTaskRow).join("")
+      : `<div class="sched-empty">No schedules yet for this script.</div>`;
+
+    modal.innerHTML = `
+      <div class="profile-modal-backdrop" data-cancel></div>
+      <div class="profile-modal-content" style="width:680px">
+        <div class="profile-modal-header">
+          <div class="profile-modal-title">\u23F0  Schedule "${escapeHtml(sc.name)}"</div>
+          <button class="profile-modal-close" data-cancel>\u2715</button>
+        </div>
+        <div class="profile-modal-body">
+          <div class="picker-help">
+            Each row binds this script to a cron expression + a set of
+            profiles. The scheduler daemon picks rows up on its next
+            tick. Cron format: <code>m h dom mon dow</code> -- e.g.
+            <code>0 9 * * 1-5</code> = 09:00 on weekdays.
+          </div>
+          <div class="sched-list" id="sched-list">${tasksHtml}</div>
+          <div class="sched-add-row">
+            <input class="input" id="sched-add-cron" placeholder="0 9 * * 1-5">
+            <input class="input" id="sched-add-name" placeholder="(optional name)">
+            <button class="btn btn-secondary" id="sched-add-pick">\u{1F465} Pick profiles\u2026</button>
+            <span class="sched-add-prof-count" id="sched-add-prof-count">0</span>
+            <button class="btn btn-primary" id="sched-add-btn">+ Add</button>
+          </div>
+        </div>
+        <div class="profile-modal-footer">
+          <button class="btn btn-secondary" data-cancel>Close</button>
+        </div>
+      </div>
+    `;
+    document.body.appendChild(modal);
+
+    let newProfs = [];
+    const profCount = modal.querySelector("#sched-add-prof-count");
+    const list      = modal.querySelector("#sched-list");
+
+    // Cancel handlers
+    modal.querySelectorAll("[data-cancel]").forEach(b =>
+      b.addEventListener("click", () => modal.remove()));
+
+    // Profile-pick for the new row
+    const pickProfilesInline = (current, onPick) => {
+      const sub = document.createElement("div");
+      sub.className = "profile-modal gs-profile-picker-modal";
+      sub.style.zIndex = "1200";
+      const sel = new Set(current);
+      sub.innerHTML = `
+        <div class="profile-modal-backdrop" data-subcancel></div>
+        <div class="profile-modal-content" style="width:420px">
+          <div class="profile-modal-header">
+            <div class="profile-modal-title">Pick profiles</div>
+            <button class="profile-modal-close" data-subcancel>\u2715</button>
+          </div>
+          <div class="profile-modal-body">
+            <div class="picker-list" style="max-height:300px;overflow:auto;border:1px solid var(--border);border-radius:4px;background:var(--bg)">
+              ${profiles.map(p => `
+                <label class="picker-row">
+                  <input type="checkbox" value="${escapeHtml(p.name)}" ${sel.has(p.name) ? "checked" : ""}>
+                  <span class="picker-row-name">${escapeHtml(p.name)}</span>
+                </label>
+              `).join("")}
+            </div>
+          </div>
+          <div class="profile-modal-footer">
+            <button class="btn btn-secondary" data-subcancel>Cancel</button>
+            <button class="btn btn-primary" data-subok>OK</button>
+          </div>
+        </div>`;
+      document.body.appendChild(sub);
+      sub.querySelectorAll("input[type='checkbox']").forEach(cb => {
+        cb.addEventListener("change", () => {
+          if (cb.checked) sel.add(cb.value); else sel.delete(cb.value);
+        });
+      });
+      sub.querySelectorAll("[data-subcancel]").forEach(b =>
+        b.addEventListener("click", () => sub.remove()));
+      sub.querySelector("[data-subok]").addEventListener("click", () => {
+        sub.remove();
+        onPick(Array.from(sel));
+      });
+    };
+
+    modal.querySelector("#sched-add-pick").addEventListener("click", () => {
+      pickProfilesInline(newProfs, (chosen) => {
+        newProfs = chosen;
+        profCount.textContent = chosen.length;
+      });
+    });
+
+    modal.querySelector("#sched-add-btn").addEventListener("click", async () => {
+      const cron = modal.querySelector("#sched-add-cron").value.trim();
+      const name = modal.querySelector("#sched-add-name").value.trim();
+      if (!cron) {
+        toast("cron_expr is required", true);
+        return;
+      }
+      try {
+        await api(`/api/scripts/${sc.id}/schedules`, {
+          method: "POST",
+          body: JSON.stringify({ cron_expr: cron, profiles: newProfs,
+                                  name, enabled: true }),
+        });
+        toast("\u2713 Schedule added");
+        modal.remove();
+        this._openScheduleModal(sc);  // re-open to show new row
+      } catch (e) {
+        toast(`Add failed: ${e.message}`, true);
+      }
+    });
+
+    // Per-row actions: pick-profs / del / field changes
+    list.addEventListener("click", async (e) => {
+      const row = e.target.closest(".sched-row");
+      if (!row) return;
+      const tid = Number(row.dataset.taskId);
+      const act = e.target.dataset.act;
+      if (act === "del") {
+        if (!confirm("Delete this schedule?")) return;
+        try {
+          await api(`/api/schedules/${tid}`, { method: "DELETE" });
+          toast("\u2713 Deleted");
+          row.remove();
+        } catch (er) { toast(`Delete failed: ${er.message}`, true); }
+      } else if (act === "pick-profs") {
+        const span = row.querySelector(".sched-profs");
+        const current = JSON.parse(span.dataset.profs || "[]");
+        pickProfilesInline(current, async (chosen) => {
+          try {
+            await api(`/api/schedules/${tid}`, {
+              method: "PATCH",
+              body: JSON.stringify({ profiles: chosen }),
+            });
+            span.dataset.profs = JSON.stringify(chosen);
+            span.title = chosen.join(", ") || "(no profiles)";
+            span.innerHTML = `\u{1F465} ${chosen.length}`;
+            toast("\u2713 Profiles updated");
+          } catch (er) { toast(`Update failed: ${er.message}`, true); }
+        });
+      }
+    });
+
+    list.addEventListener("change", async (e) => {
+      const row = e.target.closest(".sched-row");
+      if (!row) return;
+      const tid = Number(row.dataset.taskId);
+      const field = e.target.dataset.field;
+      if (!field) return;
+      const value = e.target.type === "checkbox"
+        ? e.target.checked
+        : e.target.value;
+      try {
+        await api(`/api/schedules/${tid}`, {
+          method: "PATCH",
+          body: JSON.stringify({ [field]: value }),
+        });
+      } catch (er) { toast(`Update failed: ${er.message}`, true); }
+    });
+  },
+
+    // ============================================================
+  //  Phase 2: card "..." menu + Apply/Run/Pin to N profiles
+  // ============================================================
+
+  /** Floating action menu opened by the ⋯ button on each library card.
+   *  Positioned absolutely below the button; clicking outside closes it.
+   *  Menu items dispatch to _act* methods; profile picker is opened on
+   *  demand (Apply / Run / Pin).
+   */
+  _openCardMenu(btn, scriptId) {
+    // Close any existing menu first -- single-instance UI
+    document.querySelectorAll(".library-card-popmenu").forEach(m => m.remove());
+
+    const sc = this.scripts.find(s => s.id === scriptId);
+    if (!sc) return;
+
+    const menu = document.createElement("div");
+    menu.className = "library-card-popmenu";
+    menu.innerHTML = `
+      <button data-act="edit">\u270F\uFE0F  Edit</button>
+      <button data-act="run">\u25B6\uFE0F  Run on profiles\u2026</button>
+      <button data-act="run-pinned" ${sc.pinned_profiles && sc.pinned_profiles.length ? "" : "disabled"}>
+        \u26A1  Run on pinned (${(sc.pinned_profiles||[]).length})
+      </button>
+      <button data-act="apply">\u{1F4CC}  Apply to profiles\u2026</button>
+      <button data-act="pin">\u{1F516}  Pin profiles\u2026</button>
+      <hr>
+      <button data-act="duplicate">\u{1F4CB}  Duplicate</button>
+      <button data-act="export">\u{1F4E4}  Export JSON</button>
+      ${sc.is_default ? "" : `<button data-act="make-default">\u2605  Make default</button>`}
+      <button data-act="set-hotkey">\u2328\uFE0F  Assign hotkey (Ctrl+1..9)\u2026</button>
+      <button data-act="schedule">\u23F0  Schedule\u2026</button>
+      <hr>
+      <button data-act="delete" class="popmenu-danger">\u{1F5D1}  Delete</button>
+    `;
+    document.body.appendChild(menu);
+
+    // Position: below the button, clamped to viewport
+    const r = btn.getBoundingClientRect();
+    menu.style.position = "fixed";
+    menu.style.top  = `${r.bottom + 4}px`;
+    menu.style.left = `${Math.max(8, Math.min(r.left, window.innerWidth - 240))}px`;
+
+    // Close on outside click
+    const onAway = (e) => {
+      if (!menu.contains(e.target)) {
+        menu.remove();
+        document.removeEventListener("click", onAway, true);
+      }
+    };
+    setTimeout(() => document.addEventListener("click", onAway, true), 0);
+
+    // Wire actions
+    menu.querySelectorAll("button[data-act]").forEach(b => {
+      b.addEventListener("click", async (e) => {
+        e.stopPropagation();
+        const act = b.dataset.act;
+        menu.remove();
+        document.removeEventListener("click", onAway, true);
+        await this._dispatchCardAction(act, sc);
+      });
+    });
+  },
+
+  async _dispatchCardAction(act, sc) {
+    switch (act) {
+      case "edit":         return this._showEditor(sc.id);
+      case "run":          return this._openProfilePicker(sc, "run");
+      case "run-pinned":   return this._runOnProfiles(sc, sc.pinned_profiles || []);
+      case "apply":        return this._openProfilePicker(sc, "apply");
+      case "pin":          return this._openProfilePicker(sc, "pin");
+      case "duplicate":    return this._duplicateScript(sc);
+      case "export":       return this._exportScript(sc);
+      case "make-default": return this._makeDefaultFromCard(sc);
+      case "set-hotkey":   return this._setHotkeyForScript(sc);
+      case "schedule":     return this._openScheduleModal(sc);
+      case "delete":       return this._deleteFromCard(sc);
+    }
+  },
+
+  // ----- profile picker modal -----------------------------------------
+
+  /** Mode: "apply" | "run" | "pin". Determines title, primary-button
+   *  label, default-checked set, and which API call fires on confirm. */
+  async _openProfilePicker(sc, mode) {
+    let profiles = [];
+    try {
+      const list = await api("/api/profiles");
+      profiles = (list.profiles || list || []).map(p =>
+        typeof p === "string" ? { name: p } : p);
+    } catch (e) {
+      toast(`Could not load profiles: ${e.message}`, true);
+      return;
+    }
+    if (!profiles.length) {
+      toast("No profiles yet -- create one on the Profiles page first.", true);
+      return;
+    }
+
+    // Pre-select sensible defaults: pinned for "run" / "pin",
+    // currently-assigned for "apply".
+    let preselected = new Set();
+    if (mode === "run" || mode === "pin") {
+      (sc.pinned_profiles || []).forEach(n => preselected.add(n));
+    } else if (mode === "apply") {
+      try {
+        const r = await api(`/api/scripts/${sc.id}`);
+        // Existing assignments come from the script_profiles list.
+        // The plain GET doesn't include them, so we fetch separately:
+        const assigns = await api(`/api/scripts/${sc.id}/profiles`)
+          .catch(() => null);
+        if (assigns && Array.isArray(assigns.profiles)) {
+          assigns.profiles.forEach(n => preselected.add(n));
+        }
+      } catch {}
+    }
+
+    this._renderProfilePicker(sc, mode, profiles, preselected);
+  },
+
+  _renderProfilePicker(sc, mode, profiles, preselected) {
+    document.querySelectorAll(".gs-profile-picker-modal").forEach(m => m.remove());
+
+    const titleMap = {
+      apply: `Apply "${sc.name}" to profiles`,
+      run:   `Run "${sc.name}" on profiles`,
+      pin:   `Pin profiles to "${sc.name}"`,
+    };
+    const ctaMap = {
+      apply: "Apply to selected",
+      run:   "Run on selected",
+      pin:   "Save pins",
+    };
+    const helpMap = {
+      apply: "Selected profiles will be permanently bound to this script. Other scripts they had get unbound.",
+      run:   "Selected profiles will START a run NOW (each on its own browser process). One-run-per-profile rule applies.",
+      pin:   "Pinned profiles show as chips on the script card. Use \"Run on pinned\" for one-click bulk runs.",
+    };
+
+    const modal = document.createElement("div");
+    modal.className = "profile-modal gs-profile-picker-modal";
+    modal.innerHTML = `
+      <div class="profile-modal-backdrop" data-cancel></div>
+      <div class="profile-modal-content" style="width:520px">
+        <div class="profile-modal-header">
+          <div class="profile-modal-title">${escapeHtml(titleMap[mode])}</div>
+          <button class="profile-modal-close" data-cancel>\u2715</button>
+        </div>
+        <div class="profile-modal-body">
+          <div class="picker-help">${escapeHtml(helpMap[mode])}</div>
+          <input type="text" class="input picker-search"
+                 placeholder="Search profiles\u2026">
+          <div class="picker-actions-row">
+            <button class="btn btn-tiny" data-pick="all">All</button>
+            <button class="btn btn-tiny" data-pick="none">None</button>
+            <button class="btn btn-tiny" data-pick="invert">Invert</button>
+            <span class="picker-count" data-count>0 selected</span>
+          </div>
+          <div class="picker-list" data-list></div>
+        </div>
+        <div class="profile-modal-footer">
+          <button class="btn btn-secondary" data-cancel>Cancel</button>
+          <button class="btn btn-primary" data-confirm>${escapeHtml(ctaMap[mode])}</button>
+        </div>
+      </div>
+    `;
+    document.body.appendChild(modal);
+
+    const list  = modal.querySelector("[data-list]");
+    const count = modal.querySelector("[data-count]");
+    const search = modal.querySelector(".picker-search");
+
+    const renderList = (filter) => {
+      const f = (filter || "").toLowerCase();
+      list.innerHTML = profiles
+        .filter(p => !f || p.name.toLowerCase().includes(f))
+        .map(p => {
+          const checked = preselected.has(p.name) ? "checked" : "";
+          return `<label class="picker-row">
+            <input type="checkbox" value="${escapeHtml(p.name)}" ${checked}>
+            <span class="picker-row-name">${escapeHtml(p.name)}</span>
+            ${p.proxy ? `<span class="picker-row-meta">${escapeHtml(p.proxy)}</span>` : ""}
+          </label>`;
+        }).join("");
+      // Re-bind change events on filtered rows
+      list.querySelectorAll('input[type="checkbox"]').forEach(cb => {
+        cb.addEventListener("change", () => {
+          if (cb.checked) preselected.add(cb.value);
+          else preselected.delete(cb.value);
+          count.textContent = `${preselected.size} selected`;
+        });
+      });
+    };
+    renderList("");
+    count.textContent = `${preselected.size} selected`;
+
+    search.addEventListener("input", () => renderList(search.value));
+
+    modal.querySelectorAll("[data-pick]").forEach(b => {
+      b.addEventListener("click", () => {
+        const all = profiles.map(p => p.name);
+        if (b.dataset.pick === "all")    all.forEach(n => preselected.add(n));
+        if (b.dataset.pick === "none")   preselected.clear();
+        if (b.dataset.pick === "invert") {
+          all.forEach(n => preselected.has(n) ? preselected.delete(n) : preselected.add(n));
+        }
+        renderList(search.value);
+        count.textContent = `${preselected.size} selected`;
+      });
+    });
+
+    modal.querySelectorAll("[data-cancel]").forEach(b => {
+      b.addEventListener("click", () => modal.remove());
+    });
+
+    modal.querySelector("[data-confirm]").addEventListener("click", async () => {
+      const chosen = Array.from(preselected);
+      modal.remove();
+      if (mode === "apply") return this._applyToProfiles(sc, chosen);
+      if (mode === "run")   return this._runOnProfiles(sc, chosen);
+      if (mode === "pin")   return this._pinProfiles(sc, chosen);
+    });
+  },
+
+  async _applyToProfiles(sc, profiles) {
+    if (!profiles.length) {
+      toast("No profiles selected.", true);
+      return;
+    }
+    try {
+      const r = await api(`/api/scripts/${sc.id}/assign`, {
+        method:  "POST",
+        headers: { "Content-Type": "application/json" },
+        body:    JSON.stringify({ profiles }),
+      });
+      toast(`\u2713 Applied "${sc.name}" to ${profiles.length} profile${profiles.length > 1 ? "s" : ""}`);
+      await this.loadLibrary();
+    } catch (e) {
+      toast(`Apply failed: ${e.message}`, true);
+    }
+  },
+
+  async _runOnProfiles(sc, profiles) {
+    if (!profiles.length) {
+      toast("No profiles selected.", true);
+      return;
+    }
+    try {
+      const r = await api(`/api/scripts/${sc.id}/run`, {
+        method:  "POST",
+        headers: { "Content-Type": "application/json" },
+        body:    JSON.stringify({ profiles, assign: true }),
+      });
+      const ok    = r.started || 0;
+      const total = r.total   || profiles.length;
+      const fails = (r.results || []).filter(x => !x.ok);
+      if (fails.length) {
+        const why = fails.slice(0, 3)
+          .map(f => `${f.profile}: ${f.error}`).join("; ");
+        toast(`Started ${ok}/${total}. Failed: ${why}${fails.length > 3 ? `; +${fails.length - 3} more` : ""}`, true);
+      } else {
+        toast(`\u2713 Started ${ok} run${ok > 1 ? "s" : ""}`);
+      }
+      // Library refresh will pick up the new run -> updated last_run_*
+      // status badges on next reload.
+      setTimeout(() => this.loadLibrary().catch(() => {}), 800);
+    } catch (e) {
+      toast(`Run failed: ${e.message}`, true);
+    }
+  },
+
+  async _pinProfiles(sc, profiles) {
+    try {
+      await api(`/api/scripts/${sc.id}/pin`, {
+        method:  "POST",
+        headers: { "Content-Type": "application/json" },
+        body:    JSON.stringify({ profiles }),
+      });
+      toast(`\u2713 Pinned ${profiles.length} profile${profiles.length === 1 ? "" : "s"} to "${sc.name}"`);
+      await this.loadLibrary();
+    } catch (e) {
+      toast(`Could not pin: ${e.message}`, true);
+    }
+  },
+
+  async _duplicateScript(sc) {
+    try {
+      const full = await api(`/api/scripts/${sc.id}`);
+      const baseName = full.name + " (copy)";
+      let name = baseName;
+      let n = 2;
+      while (this.scripts.some(x => x.name === name)) {
+        name = `${baseName} ${n++}`;
+      }
+      await api(`/api/scripts`, {
+        method:  "POST",
+        headers: { "Content-Type": "application/json" },
+        body:    JSON.stringify({
+          name,
+          description: full.description || "",
+          flow:        full.flow || [],
+        }),
+      });
+      toast(`\u2713 Duplicated as "${name}"`);
+      await this.loadLibrary();
+    } catch (e) {
+      toast(`Duplicate failed: ${e.message}`, true);
+    }
+  },
+
+  async _exportScript(sc) {
+    try {
+      const full = await api(`/api/scripts/${sc.id}`);
+      const blob = new Blob(
+        [JSON.stringify({
+          name:        full.name,
+          description: full.description || "",
+          flow:        full.flow || [],
+        }, null, 2)],
+        { type: "application/json" });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = `${full.name.replace(/[^\w.-]+/g, "_")}.json`;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      setTimeout(() => URL.revokeObjectURL(url), 0);
+    } catch (e) {
+      toast(`Export failed: ${e.message}`, true);
+    }
+  },
+
+  async _makeDefaultFromCard(sc) {
+    try {
+      await api(`/api/scripts/${sc.id}`, {
+        method:  "PUT",
+        headers: { "Content-Type": "application/json" },
+        body:    JSON.stringify({ is_default: true }),
+      });
+      toast(`\u2713 "${sc.name}" is now the default`);
+      await this.loadLibrary();
+    } catch (e) {
+      toast(`Could not set default: ${e.message}`, true);
+    }
+  },
+
+  async _deleteFromCard(sc) {
+    if (!confirm(`Delete "${sc.name}"?\n\nProfiles using it will fall back to the default script.`)) {
+      return;
+    }
+    try {
+      await api(`/api/scripts/${sc.id}`, { method: "DELETE" });
+      toast(`\u2713 Deleted "${sc.name}"`);
+      await this.loadLibrary();
+    } catch (e) {
+      toast(`Delete failed: ${e.message}`, true);
+    }
+  },
+
+  // ============================================================
+  //  Phase 3: Templates library
+  // ============================================================
+
+  async _openTemplatesModal() {
+    let templates = [];
+    let errors = [];
+    try {
+      const r = await api("/api/scripts/templates");
+      templates = r.templates || [];
+      errors    = r.errors    || [];
+    } catch (e) {
+      toast(`Could not load templates: ${e.message}`, true);
+      return;
+    }
+
+    document.querySelectorAll(".gs-templates-modal").forEach(m => m.remove());
+    const modal = document.createElement("div");
+    modal.className = "profile-modal gs-templates-modal";
+    modal.innerHTML = `
+      <div class="profile-modal-backdrop" data-cancel></div>
+      <div class="profile-modal-content" style="width:840px">
+        <div class="profile-modal-header">
+          <div class="profile-modal-title">\u{1F4DA} Script templates</div>
+          <button class="profile-modal-close" data-cancel>\u2715</button>
+        </div>
+        <div class="profile-modal-body">
+          <div class="picker-help">
+            Pick a starter recipe -- creates a new script seeded with the
+            template's flow. Edit it like any other script after creation.
+          </div>
+          ${errors.length ? `<div class="picker-help" style="color:var(--accent-red)">
+            ${errors.length} template${errors.length>1?"s":""} failed to load: ${escapeHtml(errors.join("; "))}
+          </div>` : ""}
+          <div class="templates-grid">
+            ${templates.length ? templates.map(t => `
+              <div class="template-card" data-tpl="${escapeHtml(t.filename || t.name)}">
+                <div class="template-card-name">${escapeHtml(t.name)}</div>
+                <div class="template-card-desc">${escapeHtml(t.description || "")}</div>
+                <div class="template-card-meta">
+                  <span class="template-card-tag">${escapeHtml(t.category || "general")}</span>
+                  <span class="template-card-stat"><strong>${t.step_count || 0}</strong> steps</span>
+                </div>
+                ${(t.tags || []).length ? `<div class="template-card-tags">
+                  ${t.tags.map(tag => `<span class="template-tag">${escapeHtml(tag)}</span>`).join("")}
+                </div>` : ""}
+                <button class="btn btn-primary btn-sm template-use-btn">Use this</button>
+              </div>
+            `).join("") : `<div class="library-empty">No templates available.</div>`}
+          </div>
+        </div>
+        <div class="profile-modal-footer">
+          <button class="btn btn-secondary" data-cancel>Close</button>
+        </div>
+      </div>
+    `;
+    document.body.appendChild(modal);
+
+    modal.querySelectorAll("[data-cancel]").forEach(b => {
+      b.addEventListener("click", () => modal.remove());
+    });
+    modal.querySelectorAll(".template-use-btn").forEach(b => {
+      b.addEventListener("click", async () => {
+        const card = b.closest(".template-card");
+        const tplName = card.dataset.tpl;
+        const tpl = templates.find(t => (t.filename || t.name) === tplName);
+        if (!tpl) return;
+        // Compute non-conflicting name
+        let name = tpl.name;
+        let n = 2;
+        while (this.scripts.some(x => x.name === name)) {
+          name = `${tpl.name} (${n++})`;
+        }
+        try {
+          const r = await api("/api/scripts", {
+            method:  "POST",
+            headers: { "Content-Type": "application/json" },
+            body:    JSON.stringify({
+              name,
+              description: tpl.description || "",
+              flow:        tpl.flow || [],
+            }),
+          });
+          modal.remove();
+          toast(`\u2713 Created "${name}" from template`);
+          await this.loadLibrary();
+          if (r && r.id) {
+            // Drop user straight into the editor for review/tweaks
+            this._showEditor(r.id);
+          }
+        } catch (e) {
+          toast(`Create from template failed: ${e.message}`, true);
+        }
+      });
+    });
+  },
+
+    // Icons
+
+  // ════════════════════════════════════════════════════════════
+  //   ICONS
+  // ════════════════════════════════════════════════════════════
+
+  // ════════════════════════════════════════════════════════════
+  //   INLINE PARAM EDITING (Phase 5 #98)
+  // ════════════════════════════════════════════════════════════
+
+  /** Render a single parameter as a compact inline form row. Output
+   *  matches inspector visuals but is rendered INSIDE the step card
+   *  rather than the right-side panel. Inputs carry `data-inline-param`
+   *  and `data-inline-path` so a single delegated change listener
+   *  (in wireCanvasInteractions) routes the value back to the step. */
+  /** Strip transient UI state (e.g. _inlineOpen) before sending
+   *  the flow to the server. Recursive over nested containers. */
+  _cleanFlowForSave(flow) {
+    const strip = (steps) => (steps || []).map(s => {
+      const c = { ...s };
+      delete c._inlineOpen;
+      if (Array.isArray(c.steps))      c.steps      = strip(c.steps);
+      if (Array.isArray(c.then_steps)) c.then_steps = strip(c.then_steps);
+      if (Array.isArray(c.else_steps)) c.else_steps = strip(c.else_steps);
+      return c;
+    });
+    return strip(flow);
+  },
+
+  _renderInlineParam(p, step, path) {
+    const cur = step[p.name] ?? p.default ?? "";
+    const enc = this._encodePath(path);
+    const lab = escapeHtml(p.label || p.name);
+    const hint = p.hint ? `<span class="inline-param-hint">${escapeHtml(p.hint)}</span>` : "";
+    const required = p.required ? " *" : "";
+    const ph = p.placeholder ? `placeholder="${escapeHtml(p.placeholder)}"` : "";
+
+    if (p.type === "bool") {
+      return `<label class="inline-param inline-param-bool">
+        <input type="checkbox" data-inline-param="${escapeHtml(p.name)}"
+               data-inline-path="${enc}" ${cur ? "checked" : ""}>
+        <span class="inline-param-label">${lab}${required}</span>${hint}
+      </label>`;
+    }
+    if (p.type === "number") {
+      return `<div class="inline-param">
+        <label class="inline-param-label">${lab}${required}</label>
+        <input type="number" class="inline-param-input"
+               data-inline-param="${escapeHtml(p.name)}"
+               data-inline-path="${enc}" value="${escapeHtml(String(cur))}" ${ph}>
+        ${hint}
+      </div>`;
+    }
+    if (p.type === "select" && Array.isArray(p.options)) {
+      const opts = p.options.map(o => {
+        const v = typeof o === "string" ? o : o.value;
+        const l = typeof o === "string" ? o : (o.label || o.value);
+        return `<option value="${escapeHtml(v)}" ${String(v) === String(cur) ? "selected" : ""}>${escapeHtml(l)}</option>`;
+      }).join("");
+      return `<div class="inline-param">
+        <label class="inline-param-label">${lab}${required}</label>
+        <select class="inline-param-input"
+                data-inline-param="${escapeHtml(p.name)}"
+                data-inline-path="${enc}">${opts}</select>
+        ${hint}
+      </div>`;
+    }
+    if (p.type === "json" || p.type === "textarea") {
+      const v = typeof cur === "string" ? cur : JSON.stringify(cur, null, 2);
+      return `<div class="inline-param">
+        <label class="inline-param-label">${lab}${required}
+          <button class="inline-vault-btn-tiny" type="button"
+                  data-vault-target-param="${escapeHtml(p.name)}"
+                  data-vault-target-path="${enc}"
+                  title="Insert from Credential Vault">\u{1F511}</button>
+        </label>
+        <textarea class="inline-param-input"
+                  data-inline-param="${escapeHtml(p.name)}"
+                  data-inline-path="${enc}"
+                  data-inline-json="${p.type === 'json' ? '1' : '0'}"
+                  rows="3" ${ph}>${escapeHtml(v)}</textarea>
+        ${hint}
+      </div>`;
+    }
+    // Default: text -- with a 🔑 button that opens the vault picker
+    // and inserts {vault.<id>.<field>} into the input. Cleanly works
+    // alongside the regular value -- the placeholder gets resolved at
+    // runtime by the dashboard before the subprocess sees the flow.
+    return `<div class="inline-param">
+      <label class="inline-param-label">${lab}${required}</label>
+      <div class="inline-param-row">
+        <input type="text" class="inline-param-input"
+               data-inline-param="${escapeHtml(p.name)}"
+               data-inline-path="${enc}"
+               value="${escapeHtml(String(cur))}" ${ph}>
+        <button class="inline-vault-btn" type="button"
+                data-vault-target-param="${escapeHtml(p.name)}"
+                data-vault-target-path="${enc}"
+                title="Insert from Credential Vault">\u{1F511}</button>
+      </div>
+      ${hint}
+    </div>`;
+  },
+
+  /** Wire delegated input/change listener for inline-param fields.
+   *  Called once from wireCanvasInteractions on each canvas re-render.
+   *  Idempotency: we attach to the canvas root (which is regenerated)
+   *  so re-render naturally drops old listeners.
+   *
+   *  Value extraction respects type:
+   *    - checkbox          -> .checked (bool)
+   *    - data-inline-json  -> JSON.parse, fail-graceful to raw string
+   *    - number            -> Number()
+   *    - everything else   -> .value (string)
+   */
+  _wireInlineParams() {
+    const root = $("#canvas-flow");
+    if (!root) return;
+    const handler = (e) => {
+      const el = e.target.closest("[data-inline-param]");
+      if (!el) return;
+      const name = el.dataset.inlineParam;
+      const path = this._decodePath(el.dataset.inlinePath);
+      const step = this._getAt(path);
+      if (!step) return;
+      let v;
+      if (el.type === "checkbox") {
+        v = el.checked;
+      } else if (el.type === "number") {
+        v = el.value === "" ? "" : Number(el.value);
+      } else if (el.dataset.inlineJson === "1") {
+        try { v = JSON.parse(el.value || "null"); }
+        catch { v = el.value; }  // keep raw on parse fail; user sees the error on save
+      } else {
+        v = el.value;
+      }
+      step[name] = v;
+      this._markDirty();
+      // Re-render chips ONLY for this step -- avoid full canvas
+      // rebuild which would steal focus from the input the user is
+      // typing in. The body/chips are the only summary affected.
+      const card = el.closest(".flow-step");
+      if (card) {
+        const meta = this.catalog.find(c => c.type === card.dataset.type);
+        const chips = card.querySelector(".flow-step-body");
+        if (chips && meta) chips.innerHTML = this._buildChips(step, meta);
+      }
+    };
+    root.addEventListener("input",  handler);
+    root.addEventListener("change", handler);
+
+    // Phase 5.1: 🔑 button click -> open vault picker.
+    root.addEventListener("click", (e) => {
+      const btn = e.target.closest(".inline-vault-btn, .inline-vault-btn-tiny");
+      if (!btn) return;
+      e.stopPropagation();
+      const card = btn.closest(".flow-step");
+      const path = btn.dataset.vaultTargetPath;
+      const param = btn.dataset.vaultTargetParam;
+      const input = card?.querySelector(
+        `[data-inline-param="${param}"][data-inline-path="${path}"]`);
+      if (!input) return;
+      this._openVaultPicker((placeholder) => {
+        // Insert the placeholder at the cursor position; if the input
+        // had a non-empty current value we replace it (most common case
+        // for credential fields).
+        const cur = input.value || "";
+        if (!cur || /^\s*$/.test(cur)) {
+          input.value = placeholder;
+        } else if (input.selectionStart != null) {
+          const s = input.selectionStart, e = input.selectionEnd;
+          input.value = cur.slice(0, s) + placeholder + cur.slice(e);
+          input.selectionStart = input.selectionEnd = s + placeholder.length;
+        } else {
+          input.value = cur + placeholder;
+        }
+        // Trigger change-event so step state gets updated
+        input.dispatchEvent(new Event("change", { bubbles: true }));
+      });
+    });
+  },
+
+  /** Phase 5.1: vault picker modal. Lists unlocked vault items;
+   *  picking one + a field inserts a {vault.<id>.<field>} placeholder
+   *  into the calling input. Vault must be unlocked at run-launch time
+   *  for the placeholder to actually resolve to cleartext on runtime. */
+  async _openVaultPicker(onPick) {
+    let items = [];
+    let vaultStatus = null;
+    try {
+      vaultStatus = await api("/api/vault/status");
+    } catch (e) {
+      toast(`Vault status check failed: ${e.message}`, true);
+      return;
+    }
+    if (vaultStatus && vaultStatus.locked) {
+      toast("Vault is locked. Open Vault page and unlock it first.", true);
+      return;
+    }
+    try {
+      const r = await api("/api/vault/items");
+      items = r.items || [];
+    } catch (e) {
+      toast(`Vault items load failed: ${e.message}`, true);
+      return;
+    }
+    if (!items.length) {
+      toast("Vault is empty. Open the Vault page and add an account.");
+      return;
+    }
+    document.querySelectorAll(".gs-vault-picker-modal").forEach(m => m.remove());
+    const modal = document.createElement("div");
+    modal.className = "profile-modal gs-vault-picker-modal";
+    modal.innerHTML = `
+      <div class="profile-modal-backdrop" data-cancel></div>
+      <div class="profile-modal-content" style="width:520px">
+        <div class="profile-modal-header">
+          <div class="profile-modal-title">\u{1F511}  Insert from Credential Vault</div>
+          <button class="profile-modal-close" data-cancel>\u2715</button>
+        </div>
+        <div class="profile-modal-body">
+          <div class="picker-help">
+            Pick an item, then choose which field to insert. The result
+            is a placeholder like <code>{vault.42.username}</code> that
+            gets resolved to cleartext at run-launch time. The
+            subprocess never sees the master password -- the dashboard
+            decrypts referenced items just-in-time and passes the
+            resolved values via env.
+          </div>
+          <input type="text" class="input picker-search"
+                 placeholder="Search items\u2026" id="vault-pick-search">
+          <div class="picker-list" id="vault-pick-list"></div>
+        </div>
+        <div class="profile-modal-footer">
+          <button class="btn btn-secondary" data-cancel>Cancel</button>
+        </div>
+      </div>
+    `;
+    document.body.appendChild(modal);
+
+    const list = modal.querySelector("#vault-pick-list");
+    const search = modal.querySelector("#vault-pick-search");
+
+    const render = (filter) => {
+      const f = (filter || "").toLowerCase();
+      list.innerHTML = items
+        .filter(it => !f || (it.name || "").toLowerCase().includes(f) ||
+                            (it.service || "").toLowerCase().includes(f))
+        .map(it => {
+          const hasTotp = it.has_totp || (it.kind || "").includes("totp");
+          return `<div class="vault-pick-item" data-id="${it.id}">
+            <div class="vault-pick-name">
+              <strong>${escapeHtml(it.name || "(no name)")}</strong>
+              ${it.service ? `<span class="muted"> -- ${escapeHtml(it.service)}</span>` : ""}
+            </div>
+            <div class="vault-pick-fields">
+              <button class="btn btn-tiny" data-field="username">username</button>
+              <button class="btn btn-tiny" data-field="password">password</button>
+              ${hasTotp ? `<button class="btn btn-tiny" data-field="totp_code">2FA code</button>` : ""}
+            </div>
+          </div>`;
+        }).join("") || `<div class="library-empty">No matches.</div>`;
+      list.querySelectorAll(".vault-pick-item").forEach(row => {
+        const iid = row.dataset.id;
+        row.querySelectorAll("button[data-field]").forEach(btn => {
+          btn.addEventListener("click", () => {
+            const field = btn.dataset.field;
+            modal.remove();
+            onPick(`{vault.${iid}.${field}}`);
+          });
+        });
+      });
+    };
+    render("");
+    search.addEventListener("input", () => render(search.value));
+    modal.querySelectorAll("[data-cancel]").forEach(b =>
+      b.addEventListener("click", () => modal.remove()));
+    setTimeout(() => search.focus(), 30);
+  },
+
+  /** Toggle a step's inline-edit accordion. Mutates a transient flag
+   *  on the step object (`_inlineOpen`) and re-renders the canvas. */
+  _toggleInlineEdit(path) {
+    const step = this._getAt(path);
+    if (!step) return;
+    step._inlineOpen = !step._inlineOpen;
+    // No _markDirty here -- _inlineOpen is UI state, not script content
+    this.renderFlow();
+  },
+
   _iconFor(meta) {
     const type = (meta.type || "").toLowerCase();
     const map = {

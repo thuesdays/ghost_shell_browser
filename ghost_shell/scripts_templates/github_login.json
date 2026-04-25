@@ -1,0 +1,67 @@
+{
+  "name": "GitHub login",
+  "description": "Logs into github.com with <- click 🔑 to pick username from Vault -> + <- click 🔑 to pick password from Vault ->. After auth, visits the dashboard and dwells. If you have 2FA on, a TOTP step will appear before the dashboard -- this template doesn't auto-fill it; pair with the Vault page's TOTP generator for a manual paste.\n\nHOW TO BIND CREDENTIALS: open a 'type' step, click the 🔑 button next to the parameter label, pick your account from the Vault, then choose 'username' or 'password' (or '2FA code' for TOTP). The placeholder becomes {vault.<id>.<field>} and gets resolved to cleartext at run-launch time. Vault must be unlocked.",
+  "category": "login",
+  "tags": [
+    "login",
+    "github",
+    "dev"
+  ],
+  "flow": [
+    {
+      "type": "visit",
+      "url": "https://github.com/login"
+    },
+    {
+      "type": "wait_for",
+      "selector": "input#login_field",
+      "timeout": 12
+    },
+    {
+      "type": "dwell",
+      "min": 2,
+      "max": 4
+    },
+    {
+      "type": "type",
+      "selector": "input#login_field",
+      "text": "<- click 🔑 to pick username from Vault ->",
+      "clear_first": true
+    },
+    {
+      "type": "random_delay",
+      "min": 1,
+      "max": 2
+    },
+    {
+      "type": "type",
+      "selector": "input#password",
+      "text": "<- click 🔑 to pick password from Vault ->",
+      "clear_first": true
+    },
+    {
+      "type": "random_delay",
+      "min": 1,
+      "max": 2
+    },
+    {
+      "type": "click_selector",
+      "selector": "input[type='submit'][name='commit'], button[type='submit']"
+    },
+    {
+      "type": "wait_for",
+      "selector": "header.AppHeader, [aria-label='Home'], a[href='/']",
+      "timeout": 25
+    },
+    {
+      "type": "dwell",
+      "min": 4,
+      "max": 10
+    },
+    {
+      "type": "scroll",
+      "amount_min": 300,
+      "amount_max": 800
+    }
+  ]
+}

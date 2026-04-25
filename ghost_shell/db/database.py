@@ -282,6 +282,27 @@ CREATE TABLE IF NOT EXISTS scripts (
     updated_at   TEXT    NOT NULL DEFAULT (datetime('now'))
 );
 
+-- Phase 5 #96: per-script schedule entries. Independent of the
+-- single-instance scheduler daemon (which still drives the actual
+-- monitor loop); these rows are picked up by the scheduler tick to
+-- decide which scripts to run on which profiles when. Multiple rows
+-- per script are allowed (e.g. weekday cron + weekend cron).
+CREATE TABLE IF NOT EXISTS scheduled_tasks (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    script_id    INTEGER NOT NULL,
+    name         TEXT    NOT NULL DEFAULT '',     -- user-visible label
+    cron_expr    TEXT    NOT NULL,                -- 5-field cron (m h dom mon dow)
+    profiles     TEXT    NOT NULL DEFAULT '[]',   -- JSON array of profile names
+    enabled      INTEGER NOT NULL DEFAULT 1,
+    last_run_at  TEXT,                            -- ISO timestamp of last fire
+    next_run_at  TEXT,                            -- computed by cron parser
+    created_at   TEXT    NOT NULL DEFAULT (datetime('now')),
+    updated_at   TEXT    NOT NULL DEFAULT (datetime('now')),
+    FOREIGN KEY (script_id) REFERENCES scripts(id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_sched_script  ON scheduled_tasks(script_id);
+CREATE INDEX IF NOT EXISTS idx_sched_enabled ON scheduled_tasks(enabled, next_run_at);
+
 -- ───────────────────────────────────────────────────────────────
 -- proxies — library of reusable proxy configurations. Replaces
 -- the single `proxy.url` + `proxy.pool_urls` config entries with
@@ -468,7 +489,11 @@ DEFAULT_CONFIG = {
     "proxy.pool_urls":            [],
     "proxy.use_pool":             False,
 
-    "browser.profile_name":       "profile_01",
+    # On fresh install we DO NOT pre-name a profile. The UI shows
+    # an empty Profiles page with a "Create your first profile"
+    # CTA. Once the user creates one, this gets set to that
+    # profile's name (or stays in sync via profile selection).
+    "browser.profile_name":       None,
     # Relative path resolved against current working directory.
     # Layout depends on platform:
     #   Windows  chrome_win64/chrome.exe
@@ -711,6 +736,58 @@ class DB:
         self._ensure_column(conn, "runs", "pid",          "INTEGER")
         self._ensure_column(conn, "runs", "heartbeat_at", "TEXT")
         self._ensure_column(conn, "profiles", "script_id", "INTEGER")
+
+        # Phase 5.1: opt-in to per-profile script execution. Default 0
+        # (off): runs ignore profile.script_id and execute the legacy
+        # flow without an attached script. When the user ticks the
+        # "Use script on launch" toggle in profile settings, this goes
+        # to 1 and runs honour the bound script_id.
+        self._ensure_column(conn, "profiles",
+                            "use_script_on_launch", "INTEGER NOT NULL DEFAULT 0")
+
+        # Phase 2: pinned_profiles -- JSON array of profile names that
+        # the user "pins" to this script for quick re-runs from the
+        # Scripts library card. Default empty array.
+        self._ensure_column(conn, "scripts", "pinned_profiles", "TEXT NOT NULL DEFAULT '[]'")
+
+        # Phase 5: tags -- JSON array of free-form labels for library
+        # search/filter ("warmup", "google", "linkedin", etc.). Default
+        # empty array. Tags live separate from category (which is a
+        # single value per ACTION inside a script); a script may have
+        # multiple tags itself.
+        self._ensure_column(conn, "scripts", "tags", "TEXT NOT NULL DEFAULT '[]'")
+
+        # One-time migration (Phase 5): old default "profile_01" got
+        # written to config_kv on every fresh install. Now that we
+        # treat liveness as data-driven, surface "profile_01" in the
+        # UI only if it ACTUALLY has folder/meta/fingerprint. If the
+        # config still points at "profile_01" but no real artifacts
+        # exist, clear it so the UI shows the empty-state CTA.
+        cur_active = conn.execute(
+            "SELECT value FROM config_kv WHERE key = 'browser.profile_name'"
+        ).fetchone()
+        if cur_active:
+            try:
+                active_name = json.loads(cur_active["value"])
+            except Exception:
+                active_name = None
+            if active_name == "profile_01":
+                # Check real-world existence before stripping
+                meta_row = conn.execute(
+                    "SELECT 1 FROM profiles WHERE name = ?", (active_name,)
+                ).fetchone()
+                fp_row = conn.execute(
+                    "SELECT 1 FROM fingerprints WHERE profile_name = ? LIMIT 1",
+                    (active_name,)
+                ).fetchone()
+                folder_exists = os.path.isdir(os.path.join("profiles", active_name))
+                if not (meta_row or fp_row or folder_exists):
+                    conn.execute(
+                        "UPDATE config_kv SET value = ? "
+                        "WHERE key = 'browser.profile_name'",
+                        (json.dumps(None),))
+                    conn.commit()
+
 
         # Fingerprint coherence system (added in v4):
         #   template_id      — canonical device template used
@@ -1015,22 +1092,37 @@ class DB:
     # no assignment yet (or whose script_id no longer exists).
 
     def scripts_list(self) -> list[dict]:
-        """All scripts with summary metadata + usage count."""
+        """All scripts with summary metadata + usage count + last-run hint.
+
+        Returns each script's:
+          - id, name, description, is_default, created_at, updated_at
+          - profile_count: how many profiles are bound to this script
+          - step_count: top-level steps in flow (computed by JSON parse)
+          - pinned_profiles: list[str] -- profiles user pinned for quick run
+          - last_run_at / last_run_status: most-recent run from any bound
+            profile, used by the library card status badge. NULL when
+            no profile bound to this script has ever run.
+        """
         conn = self._get_conn()
         rows = conn.execute("""
             SELECT s.id, s.name, s.description, s.is_default,
-                   s.created_at, s.updated_at,
+                   s.created_at, s.updated_at, s.pinned_profiles, s.tags,
                    (SELECT COUNT(*) FROM profiles p WHERE p.script_id = s.id)
-                       AS profile_count
+                       AS profile_count,
+                   (SELECT r.started_at FROM runs r
+                     JOIN profiles p ON p.name = r.profile_name
+                    WHERE p.script_id = s.id
+                 ORDER BY r.started_at DESC LIMIT 1) AS last_run_at,
+                   (SELECT r.exit_code FROM runs r
+                     JOIN profiles p ON p.name = r.profile_name
+                    WHERE p.script_id = s.id
+                 ORDER BY r.started_at DESC LIMIT 1) AS last_run_exit
               FROM scripts s
              ORDER BY s.is_default DESC, s.updated_at DESC
         """).fetchall()
-        # Don't return the full flow JSON here — the list view only
-        # needs summary counts. `script_get` returns the full flow.
         result = []
         for r in rows:
             d = dict(r)
-            # Compute step count by parsing flow JSON on demand
             flow_row = conn.execute(
                 "SELECT flow FROM scripts WHERE id = ?", (r["id"],)
             ).fetchone()
@@ -1039,6 +1131,23 @@ class DB:
                 d["step_count"] = len(flow) if isinstance(flow, list) else 0
             except Exception:
                 d["step_count"] = 0
+            try:
+                pinned = json.loads(d.get("pinned_profiles") or "[]")
+                d["pinned_profiles"] = pinned if isinstance(pinned, list) else []
+            except Exception:
+                d["pinned_profiles"] = []
+            try:
+                tags = json.loads(d.get("tags") or "[]")
+                d["tags"] = tags if isinstance(tags, list) else []
+            except Exception:
+                d["tags"] = []
+            exit_code = d.pop("last_run_exit", None)
+            if exit_code is None:
+                d["last_run_status"] = None
+            elif exit_code == 0:
+                d["last_run_status"] = "ok"
+            else:
+                d["last_run_status"] = "fail"
             result.append(d)
         return result
 
@@ -1088,7 +1197,8 @@ class DB:
         return self.script_get(new_id)
 
     def script_create(self, name: str, description: str = "",
-                      flow: list = None, is_default: bool = False) -> int:
+                      flow: list = None, is_default: bool = False,
+                      tags: list = None) -> int:
         """Insert a new script. Raises if name already exists (UNIQUE)."""
         flow_json = json.dumps(flow or [], ensure_ascii=False)
         conn = self._get_conn()
@@ -1097,15 +1207,17 @@ class DB:
                 # Only one script may be default at a time
                 conn.execute("UPDATE scripts SET is_default = 0")
             cur = conn.execute("""
-                INSERT INTO scripts (name, description, flow, is_default)
-                VALUES (?, ?, ?, ?)
+                INSERT INTO scripts (name, description, flow, is_default, tags)
+                VALUES (?, ?, ?, ?, ?)
             """, (name, description or "", flow_json,
-                  1 if is_default else 0))
+                  1 if is_default else 0,
+                  json.dumps(tags or [])))
             return cur.lastrowid
 
     def script_update(self, script_id: int, *, name: str = None,
                       description: str = None, flow: list = None,
-                      is_default: bool | None = None) -> bool:
+                      is_default: bool | None = None,
+                      tags: list | None = None) -> bool:
         """Partial update. Returns True if a row was affected."""
         conn = self._get_conn()
         updates = []
@@ -1117,6 +1229,9 @@ class DB:
         if flow is not None:
             updates.append("flow = ?")
             params.append(json.dumps(flow, ensure_ascii=False))
+        if tags is not None:
+            updates.append("tags = ?")
+            params.append(json.dumps(tags))
         if is_default is True:
             # Mark this one as default, unmark all others
             with conn:
@@ -1179,6 +1294,118 @@ class DB:
                 )
         return True
 
+    def scheduled_tasks_list(self, script_id: int | None = None) -> list[dict]:
+        """All scheduled tasks, optionally filtered to one script."""
+        conn = self._get_conn()
+        if script_id is None:
+            rows = conn.execute(
+                "SELECT * FROM scheduled_tasks ORDER BY id"
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT * FROM scheduled_tasks WHERE script_id = ? ORDER BY id",
+                (script_id,),
+            ).fetchall()
+        out = []
+        for r in rows:
+            d = dict(r)
+            try: d["profiles"] = json.loads(d["profiles"] or "[]")
+            except Exception: d["profiles"] = []
+            out.append(d)
+        return out
+
+    def scheduled_task_create(self, script_id: int, cron_expr: str,
+                              profiles: list[str] | None = None,
+                              name: str = "",
+                              enabled: bool = True) -> int:
+        """Create a scheduled task entry. Validation of cron_expr is
+        the caller's responsibility -- the column is just a string."""
+        conn = self._get_conn()
+        with conn:
+            cur = conn.execute("""
+                INSERT INTO scheduled_tasks (script_id, name, cron_expr,
+                                             profiles, enabled)
+                VALUES (?, ?, ?, ?, ?)
+            """, (script_id, name or "", cron_expr,
+                  json.dumps(profiles or []),
+                  1 if enabled else 0))
+            return cur.lastrowid
+
+    def scheduled_task_update(self, task_id: int, *,
+                              cron_expr: str | None = None,
+                              profiles: list | None = None,
+                              name: str | None = None,
+                              enabled: bool | None = None) -> bool:
+        """Partial update of one scheduled task."""
+        conn = self._get_conn()
+        cols = []
+        params = []
+        if cron_expr is not None:
+            cols.append("cron_expr = ?"); params.append(cron_expr)
+        if profiles is not None:
+            cols.append("profiles = ?"); params.append(json.dumps(profiles))
+        if name is not None:
+            cols.append("name = ?"); params.append(name)
+        if enabled is not None:
+            cols.append("enabled = ?"); params.append(1 if enabled else 0)
+        if not cols:
+            return False
+        cols.append("updated_at = datetime('now')")
+        params.append(task_id)
+        with conn:
+            cur = conn.execute(
+                f"UPDATE scheduled_tasks SET {', '.join(cols)} WHERE id = ?",
+                params,
+            )
+            return cur.rowcount > 0
+
+    def scheduled_task_delete(self, task_id: int) -> bool:
+        conn = self._get_conn()
+        with conn:
+            cur = conn.execute(
+                "DELETE FROM scheduled_tasks WHERE id = ?", (task_id,)
+            )
+            return cur.rowcount > 0
+
+    def script_set_pinned(self, script_id: int,
+                          profile_names: list[str]) -> bool:
+        """Set the pinned-profiles list for a script (Phase 2 quick-run UX).
+
+        Replaces the entire list -- caller is responsible for sending the
+        full desired set, not deltas. Profiles that don't exist are
+        accepted silently; we don't validate against the profiles table
+        because users may pin profiles that get renamed/deleted later
+        and we don't want pinning to fail in those edge cases.
+        """
+        # De-dup + preserve order (small N, list comprehension is fine)
+        seen = set()
+        clean = []
+        for n in profile_names or []:
+            if isinstance(n, str) and n not in seen:
+                seen.add(n)
+                clean.append(n)
+        conn = self._get_conn()
+        with conn:
+            conn.execute(
+                "UPDATE scripts SET pinned_profiles = ?, "
+                "updated_at = datetime('now') WHERE id = ?",
+                (json.dumps(clean), script_id),
+            )
+        return True
+
+    def script_get_pinned(self, script_id: int) -> list[str]:
+        """Read pinned profiles for a script."""
+        row = self._get_conn().execute(
+            "SELECT pinned_profiles FROM scripts WHERE id = ?", (script_id,)
+        ).fetchone()
+        if not row or not row["pinned_profiles"]:
+            return []
+        try:
+            v = json.loads(row["pinned_profiles"])
+            return v if isinstance(v, list) else []
+        except Exception:
+            return []
+
     def script_profiles(self, script_id: int) -> list[str]:
         """Profile names that have this script assigned."""
         rows = self._get_conn().execute(
@@ -1188,20 +1415,33 @@ class DB:
         return [r["name"] for r in rows]
 
     def script_resolve_for_profile(self, profile_name: str) -> dict | None:
-        """Runtime: which script should this profile use?
-        - If profile has script_id and it exists → that script
-        - Otherwise → default script (always exists)
-        Returns full script dict (with flow parsed)."""
+        """Runtime: which script should this profile use, if any.
+
+        Resolution order:
+          1. If profile.use_script_on_launch is FALSE -> return None
+             (the runtime will fall through to the legacy hardcoded
+             loop or exit cleanly). This is the new default -- runs
+             do NOT auto-attach a script unless the user opts in.
+          2. If opt-in is TRUE and profile has a valid script_id -> that script.
+          3. If opt-in is TRUE but no script_id (or the id points at a
+             deleted script) -> the default script (is_default=1).
+
+        Returns full script dict (with flow parsed) or None.
+        """
         row = self._get_conn().execute(
-            "SELECT script_id FROM profiles WHERE name = ?",
+            "SELECT script_id, use_script_on_launch FROM profiles "
+            "WHERE name = ?",
             (profile_name,),
         ).fetchone()
-        script_id = row["script_id"] if row else None
+        if not row:
+            return None
+        if not row["use_script_on_launch"]:
+            return None  # opt-in disabled -- no auto-script
+        script_id = row["script_id"]
         if script_id:
             sc = self.script_get(script_id)
             if sc:
                 return sc
-        # Fall back to default
         return self.script_get_default()
 
     # ──────────────────────────────────────────────────────────
@@ -2881,7 +3121,19 @@ class DB:
         """
         conn = self._get_conn()
 
-        # Alive sources
+        # A profile is ALIVE iff it has at least one of:
+        #   - row in `profiles` table (per-profile metadata)
+        #   - row in `fingerprints` table
+        #   - folder on disk under profiles/
+        # Note: the active-profile config (`browser.profile_name`) is
+        # NOT a source of liveness. Treating it as such caused two
+        # bugs:
+        #   (a) Fresh install showed a phantom "profile_01" even though
+        #       no real profile existed -- user expected empty state.
+        #   (b) Deleting the only profile didn't actually disappear it
+        #       from the list, because the post-delete reassignment of
+        #       browser.profile_name kept circling back to "profile_01".
+        # Pure data-driven liveness fixes both.
         alive_names = set()
 
         # 1. profiles-table rows
@@ -2899,17 +3151,10 @@ class DB:
                 if os.path.isdir(os.path.join("profiles", name)):
                     alive_names.add(name)
 
-        # 4. current active profile (config-declared)
-        default = self.config_get("browser.profile_name", "profile_01")
-        if default:
-            alive_names.add(default)
-
         profiles = sorted(alive_names)
-
-        # If nothing was found at all, still surface the default so the
-        # UI has something to render on a fresh install.
-        if not profiles:
-            profiles = [default or "profile_01"]
+        # Empty list is a legitimate state (fresh install) -- no
+        # synthesized fallback. UI handles "no profiles" with a
+        # "create your first profile" prompt.
 
         result = []
         for name in profiles:
@@ -3540,4 +3785,4 @@ if __name__ == "__main__":
             print("Добавь --yes for underтверждения")
 
     else:
-        print("Команды: init | migrate | info | config | competitors | reset --yes")
+        print("Commands: init | migrate | info | config | competitors | reset --yes")

@@ -1,0 +1,76 @@
+{
+  "name": "Reddit login",
+  "description": "Logs into reddit.com (old + new UI both supported via fallback selectors). After auth, scrolls the home feed for ~30s with realistic dwells.\n\nHOW TO BIND CREDENTIALS: open a 'type' step, click the 🔑 button next to the parameter label, pick your account from the Vault, then choose 'username' or 'password' (or '2FA code' for TOTP). The placeholder becomes {vault.<id>.<field>} and gets resolved to cleartext at run-launch time. Vault must be unlocked.",
+  "category": "login",
+  "tags": [
+    "login",
+    "reddit"
+  ],
+  "flow": [
+    {
+      "type": "visit",
+      "url": "https://www.reddit.com/login"
+    },
+    {
+      "type": "wait_for",
+      "selector": "input[name='username'], input#loginUsername",
+      "timeout": 15
+    },
+    {
+      "type": "dwell",
+      "min": 2,
+      "max": 5
+    },
+    {
+      "type": "type",
+      "selector": "input[name='username']",
+      "text": "<- click 🔑 to pick username from Vault ->",
+      "clear_first": true
+    },
+    {
+      "type": "random_delay",
+      "min": 1,
+      "max": 2
+    },
+    {
+      "type": "type",
+      "selector": "input[name='password']",
+      "text": "<- click 🔑 to pick password from Vault ->",
+      "clear_first": true
+    },
+    {
+      "type": "random_delay",
+      "min": 1,
+      "max": 2
+    },
+    {
+      "type": "click_selector",
+      "selector": "button[type='submit'], button:has-text('Log In')"
+    },
+    {
+      "type": "wait_for",
+      "selector": "header, [data-testid='community-list']",
+      "timeout": 25
+    },
+    {
+      "type": "dwell",
+      "min": 4,
+      "max": 10
+    },
+    {
+      "type": "scroll",
+      "amount_min": 600,
+      "amount_max": 1400
+    },
+    {
+      "type": "dwell",
+      "min": 5,
+      "max": 12
+    },
+    {
+      "type": "scroll",
+      "amount_min": 500,
+      "amount_max": 1100
+    }
+  ]
+}

@@ -1661,7 +1661,30 @@ def run_monitor():
             # populated with no scripts row yet.
             try:
                 from ghost_shell.db.database import get_db as _getdb
-                _script = _getdb().script_resolve_for_profile(PROFILE_NAME)
+                _db = _getdb()
+                # Phase 5.1: GHOST_SHELL_SCRIPT_ID env (set by the
+                # dashboard when /api/scripts/<id>/run is invoked from
+                # a library card) takes priority over the profile-bound
+                # resolution. This makes "Run on profiles" from a script
+                # card a true one-shot: the user picks a script,
+                # presses run, that script runs THIS time only, and
+                # the profile's own settings (use_script_on_launch +
+                # script_id) stay untouched for next time.
+                _override = os.environ.get("GHOST_SHELL_SCRIPT_ID")
+                _script = None
+                if _override:
+                    try:
+                        _script = _db.script_get(int(_override))
+                        if _script:
+                            logging.info(
+                                f"[main] using one-shot script override: "
+                                f"id={_override} name={_script.get('name')!r}")
+                    except Exception as e:
+                        logging.warning(
+                            f"[main] script_id override {_override} "
+                            f"unresolvable: {e}")
+                if _script is None:
+                    _script = _db.script_resolve_for_profile(PROFILE_NAME)
                 unified_flow = _script["flow"] if _script else []
             except Exception as e:
                 logging.warning(f"[main] script_resolve failed: {e}")

@@ -1,0 +1,90 @@
+{
+  "name": "Instagram login",
+  "description": "Logs into instagram.com with <- click 🔑 to pick username from Vault -> + <- click 🔑 to pick password from Vault ->. Handles the standard form, dismisses the post-login popups (notifications/save-info prompts) by clicking the Not now buttons. Then dwells on the feed.\n\nHOW TO BIND CREDENTIALS: open a 'type' step, click the 🔑 button next to the parameter label, pick your account from the Vault, then choose 'username' or 'password' (or '2FA code' for TOTP). The placeholder becomes {vault.<id>.<field>} and gets resolved to cleartext at run-launch time. Vault must be unlocked.",
+  "category": "login",
+  "tags": [
+    "login",
+    "instagram",
+    "meta"
+  ],
+  "flow": [
+    {
+      "type": "visit",
+      "url": "https://www.instagram.com/accounts/login/"
+    },
+    {
+      "type": "wait_for",
+      "selector": "input[name='username']",
+      "timeout": 15
+    },
+    {
+      "type": "dwell",
+      "min": 2,
+      "max": 5
+    },
+    {
+      "type": "type",
+      "selector": "input[name='username']",
+      "text": "<- click 🔑 to pick username from Vault ->",
+      "clear_first": true
+    },
+    {
+      "type": "random_delay",
+      "min": 1,
+      "max": 2
+    },
+    {
+      "type": "type",
+      "selector": "input[name='password']",
+      "text": "<- click 🔑 to pick password from Vault ->",
+      "clear_first": true
+    },
+    {
+      "type": "random_delay",
+      "min": 1,
+      "max": 2
+    },
+    {
+      "type": "click_selector",
+      "selector": "button[type='submit']"
+    },
+    {
+      "type": "wait_for",
+      "selector": "main[role='main'], svg[aria-label='Instagram']",
+      "timeout": 25
+    },
+    {
+      "type": "dwell",
+      "min": 4,
+      "max": 9
+    },
+    {
+      "type": "click_selector",
+      "selector": "button:has-text('Not now'), button:has-text('Не сейчас')"
+    },
+    {
+      "type": "random_delay",
+      "min": 1,
+      "max": 3
+    },
+    {
+      "type": "click_selector",
+      "selector": "button:has-text('Not now'), button:has-text('Не сейчас')"
+    },
+    {
+      "type": "dwell",
+      "min": 4,
+      "max": 10
+    },
+    {
+      "type": "scroll",
+      "amount_min": 400,
+      "amount_max": 1000
+    },
+    {
+      "type": "dwell",
+      "min": 4,
+      "max": 8
+    }
+  ]
+}

@@ -11,6 +11,8 @@
         </div>
       </div>
       <div class="scripts-header-actions">
+        <button class="btn btn-secondary" id="library-templates-btn"
+                title="Start from a curated recipe">📚 Templates</button>
         <button class="btn btn-secondary" id="library-import-btn"
                 title="Create a new script from a JSON file">📥 Import</button>
         <button class="btn btn-primary" id="library-new-btn">
@@ -21,6 +23,11 @@
              accept=".json,application/json" style="display: none;">
     </div>
 
+    <div class="library-search-row">
+      <input type="text" id="library-search" class="input library-search-input"
+             placeholder="🔍  Search scripts by name, description, or tag…">
+      <span class="library-search-hint" id="library-search-hint"></span>
+    </div>
     <div class="scripts-library-grid" id="scripts-library-grid">
       <div class="library-empty">Loading…</div>
     </div>

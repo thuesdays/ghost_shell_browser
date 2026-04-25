@@ -1,0 +1,86 @@
+{
+  "name": "Twitter / X login",
+  "description": "Logs into x.com (Twitter) with <- click 🔑 to pick username from Vault -> + <- click 🔑 to pick password from Vault ->. X has a multi-step form: username, then password (with possible challenge). Template handles the common path; if X asks for a phone confirmation or challenge, the run will fail at wait_for -- check the screenshot.\n\nHOW TO BIND CREDENTIALS: open a 'type' step, click the 🔑 button next to the parameter label, pick your account from the Vault, then choose 'username' or 'password' (or '2FA code' for TOTP). The placeholder becomes {vault.<id>.<field>} and gets resolved to cleartext at run-launch time. Vault must be unlocked.",
+  "category": "login",
+  "tags": [
+    "login",
+    "twitter",
+    "x"
+  ],
+  "flow": [
+    {
+      "type": "visit",
+      "url": "https://x.com/i/flow/login"
+    },
+    {
+      "type": "wait_for",
+      "selector": "input[autocomplete='username'], input[name='text']",
+      "timeout": 15
+    },
+    {
+      "type": "dwell",
+      "min": 2,
+      "max": 5
+    },
+    {
+      "type": "type",
+      "selector": "input[autocomplete='username']",
+      "text": "<- click 🔑 to pick username from Vault ->",
+      "clear_first": true
+    },
+    {
+      "type": "random_delay",
+      "min": 1,
+      "max": 2
+    },
+    {
+      "type": "press_key",
+      "key": "Enter"
+    },
+    {
+      "type": "wait_for",
+      "selector": "input[autocomplete='current-password'], input[name='password']",
+      "timeout": 15
+    },
+    {
+      "type": "dwell",
+      "min": 2,
+      "max": 4
+    },
+    {
+      "type": "type",
+      "selector": "input[autocomplete='current-password']",
+      "text": "<- click 🔑 to pick password from Vault ->",
+      "clear_first": true
+    },
+    {
+      "type": "random_delay",
+      "min": 1,
+      "max": 2
+    },
+    {
+      "type": "press_key",
+      "key": "Enter"
+    },
+    {
+      "type": "wait_for",
+      "selector": "[aria-label='Home timeline'], [data-testid='primaryColumn']",
+      "timeout": 30
+    },
+    {
+      "type": "dwell",
+      "min": 6,
+      "max": 14
+    },
+    {
+      "type": "scroll",
+      "amount_min": 500,
+      "amount_max": 1100
+    },
+    {
+      "type": "dwell",
+      "min": 4,
+      "max": 8
+    }
+  ]
+}

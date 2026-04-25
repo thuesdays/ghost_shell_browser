@@ -8495,3 +8495,770 @@ input[type="range"] {
   box-shadow: none;
   cursor: not-allowed;
 }
+
+
+/* ════════════════════════════════════════════════════════════
+   Phase 1+2+3+5 -- Scripts page additions, dense IDE style
+   ──────────────────────────────────────────────────────────────
+   Tight spacing, mono-ish accents, no decorative bling. Modal
+   structure follows the existing .profile-modal pattern (outer
+   .profile-modal positions+centers, inner .profile-modal-backdrop
+   dims, sibling .profile-modal-content holds the dialog box).
+   ════════════════════════════════════════════════════════════ */
+
+/* ── Library card: status badge ───────────────────────────── */
+.library-card-header {
+  display: flex; align-items: center; gap: 8px;
+}
+.library-card-badge {
+  font-size: 9px; line-height: 1;
+  display: inline-block; width: 9px; height: 9px;
+  flex: 0 0 9px; text-align: center;
+}
+.library-card-badge-ok   { color: var(--healthy); }
+.library-card-badge-fail { color: var(--critical); }
+.library-card-badge-idle { color: var(--text-muted); }
+
+/* ── Library card: ⋯ menu button + popmenu ──────────────────── */
+.library-card-menu-btn {
+  margin-left: auto;
+  background: transparent; border: none;
+  color: var(--text-muted);
+  font-size: 16px; line-height: 1; cursor: pointer;
+  padding: 2px 7px; border-radius: 4px;
+  transition: background .1s, color .1s;
+}
+.library-card-menu-btn:hover {
+  background: rgba(255,255,255,.04); color: var(--text);
+}
+.library-card-popmenu {
+  z-index: 1100;
+  background: var(--card); border: 1px solid var(--border);
+  border-radius: 6px;
+  box-shadow: 0 4px 14px rgba(0,0,0,.5);
+  min-width: 200px;
+  padding: 3px 0;
+  font-size: 12px;
+}
+.library-card-popmenu button {
+  display: block; width: 100%; text-align: left;
+  background: transparent; border: none;
+  color: var(--text);
+  padding: 6px 12px; cursor: pointer; font: inherit;
+}
+.library-card-popmenu button:hover:not(:disabled) {
+  background: rgba(255,255,255,.04);
+}
+.library-card-popmenu button:disabled {
+  opacity: .35; cursor: not-allowed;
+}
+.library-card-popmenu hr {
+  border: none; border-top: 1px solid var(--border-soft);
+  margin: 3px 0;
+}
+.library-card-popmenu .popmenu-danger { color: var(--critical); }
+
+/* ── Library card: pinned chips ───────────────────────────── */
+.library-card-pinned {
+  display: flex; flex-wrap: wrap; gap: 3px;
+  margin: 4px 0;
+}
+.library-pin-chip {
+  display: inline-block;
+  padding: 1px 7px; border-radius: 10px;
+  background: rgba(90, 159, 237, .10);
+  color: var(--accent);
+  font-size: 10px;
+  border: 1px solid rgba(90, 159, 237, .22);
+  white-space: nowrap; line-height: 1.5;
+}
+.library-pin-chip.library-pin-overflow {
+  background: rgba(255, 255, 255, .03);
+  color: var(--text-muted);
+  border-color: var(--border-soft);
+}
+
+/* ── Profile picker modal (Apply / Run / Pin) ─────────────── */
+.gs-profile-picker-modal .picker-help {
+  color: var(--text-muted); font-size: 11px;
+  margin-bottom: 8px; line-height: 1.45;
+}
+.gs-profile-picker-modal .picker-search {
+  width: 100%;
+  margin-bottom: 6px;
+  font-size: 12px; padding: 6px 10px;
+}
+.gs-profile-picker-modal .picker-actions-row {
+  display: flex; gap: 4px; align-items: center;
+  margin-bottom: 6px;
+}
+.gs-profile-picker-modal .btn-tiny {
+  padding: 3px 8px; font-size: 10px;
+  background: transparent;
+  border: 1px solid var(--border);
+  color: var(--text-dim);
+  border-radius: 3px; cursor: pointer;
+}
+.gs-profile-picker-modal .btn-tiny:hover {
+  background: rgba(255,255,255,.04); color: var(--text);
+}
+.gs-profile-picker-modal .picker-count {
+  margin-left: auto; color: var(--text-muted); font-size: 10px;
+}
+.gs-profile-picker-modal .picker-list {
+  max-height: 320px; overflow-y: auto;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  background: var(--bg);
+}
+.gs-profile-picker-modal .picker-row {
+  display: flex; align-items: center; gap: 8px;
+  padding: 5px 10px;
+  cursor: pointer;
+  border-bottom: 1px solid var(--border-soft);
+  font-size: 12px;
+}
+.gs-profile-picker-modal .picker-row:last-child { border-bottom: none; }
+.gs-profile-picker-modal .picker-row:hover {
+  background: rgba(255,255,255,.025);
+}
+.gs-profile-picker-modal .picker-row input[type="checkbox"] {
+  cursor: pointer;
+}
+.gs-profile-picker-modal .picker-row-name {
+  flex: 1; font-weight: 500;
+}
+.gs-profile-picker-modal .picker-row-meta {
+  color: var(--text-muted); font-size: 10px;
+  font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+}
+
+/* ── Templates modal (grid of starter recipes), dense IDE ──── */
+.gs-templates-modal .templates-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(240px, 1fr));
+  gap: 8px;
+  margin-top: 6px;
+}
+.gs-templates-modal .template-card {
+  background: var(--card-alt);
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  padding: 10px 11px;
+  display: flex; flex-direction: column; gap: 5px;
+  transition: border-color .12s, background .12s;
+  font-size: 11.5px;
+  line-height: 1.4;
+}
+.gs-templates-modal .template-card:hover {
+  border-color: var(--accent);
+  background: var(--card);
+}
+.gs-templates-modal .template-card-name {
+  font-weight: 600; font-size: 12px;
+  color: var(--text);
+  letter-spacing: .1px;
+}
+.gs-templates-modal .template-card-desc {
+  color: var(--text-muted); font-size: 10.5px;
+  line-height: 1.4; flex: 1;
+  display: -webkit-box;
+  -webkit-line-clamp: 4; -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+.gs-templates-modal .template-card-meta {
+  display: flex; align-items: center; gap: 6px;
+  font-size: 10px; color: var(--text-muted);
+  margin-top: 2px;
+}
+.gs-templates-modal .template-card-tag {
+  padding: 0px 6px;
+  background: rgba(90,159,237,.12); color: var(--accent);
+  border-radius: 8px;
+  font-weight: 500; font-size: 9.5px;
+  letter-spacing: .3px; text-transform: uppercase;
+}
+.gs-templates-modal .template-card-stat strong {
+  color: var(--text-dim); font-weight: 600;
+}
+.gs-templates-modal .template-card-tags {
+  display: flex; flex-wrap: wrap; gap: 3px;
+}
+.gs-templates-modal .template-tag {
+  font-size: 9.5px; color: var(--text-muted);
+  background: rgba(255,255,255,.03);
+  padding: 0 5px; border-radius: 3px;
+  border: 1px solid var(--border-soft);
+  line-height: 1.5;
+}
+.gs-templates-modal .template-use-btn {
+  margin-top: 4px; width: 100%;
+  font-size: 11px; padding: 5px 10px;
+  font-weight: 500;
+}
+.gs-templates-modal .btn-sm {
+  padding: 5px 10px; font-size: 11px;
+}
+
+
+
+/* Phase 5: library search-row + per-card tag chips ────────── */
+.library-search-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-bottom: 14px;
+}
+.library-search-input {
+  flex: 1;
+  max-width: 480px;
+}
+.library-search-hint {
+  color: var(--text-muted);
+  font-size: 12px;
+}
+.library-card-tags {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  margin: 4px 0 6px;
+}
+.library-tag {
+  font-size: 10px;
+  padding: 2px 7px;
+  border-radius: 6px;
+  background: rgba(255,255,255,.04);
+  color: var(--text-dim);
+  border: 1px solid var(--border-soft);
+}
+
+
+/* Phase 5: validate-before-save inline error markers ───────── */
+.flow-step.is-invalid {
+  outline: 2px solid var(--critical) !important;
+  outline-offset: 1px;
+  position: relative;
+}
+.flow-step.is-invalid::after {
+  content: "⚠ " attr(data-error-msg);
+  position: absolute;
+  top: 100%;
+  left: 0;
+  right: 0;
+  margin-top: 4px;
+  padding: 4px 8px;
+  background: var(--critical);
+  color: white;
+  font-size: 11px;
+  border-radius: 4px;
+  white-space: normal;
+  z-index: 5;
+  pointer-events: none;
+}
+
+
+/* ── Phase 5: Ctrl+K command palette ──────────────────────── */
+.gs-command-palette .cmdp-content {
+  padding: 0;
+  border-radius: 8px;
+  overflow: hidden;
+}
+.cmdp-input-row {
+  display: flex; align-items: center; gap: 8px;
+  padding: 10px 14px;
+  border-bottom: 1px solid var(--border);
+  background: var(--card-alt);
+}
+.cmdp-prompt {
+  color: var(--accent); font-size: 16px;
+  font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  font-weight: 700;
+}
+.cmdp-input {
+  flex: 1;
+  background: transparent;
+  border: none;
+  color: var(--text);
+  font-size: 14px;
+  outline: none;
+}
+.cmdp-list {
+  max-height: 360px;
+  overflow-y: auto;
+  padding: 4px 0;
+}
+.cmdp-row {
+  display: grid;
+  grid-template-columns: minmax(120px, max-content) 1fr auto;
+  align-items: baseline;
+  gap: 10px;
+  padding: 6px 14px;
+  cursor: pointer;
+  border-left: 2px solid transparent;
+  font-size: 12px;
+}
+.cmdp-row.is-active {
+  background: rgba(90, 159, 237, .1);
+  border-left-color: var(--accent);
+}
+.cmdp-row-name {
+  font-weight: 600;
+  color: var(--text);
+  white-space: nowrap;
+}
+.cmdp-row-desc {
+  color: var(--text-muted);
+  font-size: 11px;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.cmdp-row-meta {
+  color: var(--text-dim);
+  font-size: 10px;
+  font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+}
+.cmdp-empty {
+  padding: 18px; text-align: center;
+  color: var(--text-muted); font-size: 12px;
+}
+.cmdp-foot {
+  display: flex; gap: 14px;
+  padding: 7px 14px;
+  border-top: 1px solid var(--border-soft);
+  background: var(--card-alt);
+  font-size: 10px;
+  color: var(--text-muted);
+}
+.cmdp-foot kbd {
+  display: inline-block;
+  padding: 1px 5px; margin-right: 3px;
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  font-size: 9.5px;
+  color: var(--text);
+}
+
+
+/* ── Phase 5 #98: Inline parameter editing accordion ───────── */
+.flow-step.is-inline-open {
+  background: rgba(255,255,255,.015);
+}
+.flow-step-inline-params {
+  display: flex; flex-direction: column; gap: 7px;
+  padding: 8px 12px 10px 14px;
+  margin-top: 4px;
+  border-top: 1px dashed var(--border-soft);
+  background: var(--card-alt);
+}
+.inline-param {
+  display: flex; flex-direction: column; gap: 3px;
+  font-size: 11.5px;
+}
+.inline-param-bool {
+  display: flex; align-items: center; gap: 6px;
+  font-size: 11.5px;
+  cursor: pointer;
+}
+.inline-param-bool input[type="checkbox"] {
+  cursor: pointer;
+}
+.inline-param-label {
+  color: var(--text-dim);
+  font-size: 10.5px;
+  font-weight: 600;
+  letter-spacing: .15px;
+  text-transform: uppercase;
+}
+.inline-param-input {
+  background: var(--bg);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  padding: 4px 8px;
+  font-size: 11.5px;
+  font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  outline: none;
+}
+.inline-param-input:focus {
+  border-color: var(--accent);
+  background: rgba(90,159,237,.04);
+}
+.inline-param-input[readonly] { opacity: .6; }
+textarea.inline-param-input {
+  resize: vertical;
+  min-height: 56px;
+  line-height: 1.4;
+}
+.inline-param-hint {
+  color: var(--text-muted);
+  font-size: 10px;
+  font-style: italic;
+}
+
+
+/* ── Phase 5 #96: Schedule modal ─────────────────────────── */
+.gs-schedule-modal .sched-list {
+  display: flex; flex-direction: column; gap: 4px;
+  margin: 8px 0;
+  max-height: 320px; overflow-y: auto;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 6px;
+}
+.gs-schedule-modal .sched-row {
+  display: grid;
+  grid-template-columns: 130px 1fr 60px 50px auto auto;
+  gap: 6px;
+  align-items: center;
+  padding: 5px 4px;
+  border-bottom: 1px solid var(--border-soft);
+  font-size: 11.5px;
+}
+.gs-schedule-modal .sched-row:last-child { border-bottom: none; }
+.gs-schedule-modal .sched-row .input {
+  padding: 4px 8px; font-size: 11px;
+  font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+}
+.gs-schedule-modal .sched-cron { font-weight: 600; }
+.gs-schedule-modal .sched-profs {
+  color: var(--text-muted); font-size: 11px;
+  cursor: default; white-space: nowrap;
+}
+.gs-schedule-modal .sched-toggle {
+  display: flex; align-items: center; gap: 4px;
+  font-size: 10px; color: var(--text-muted);
+  cursor: pointer;
+}
+.gs-schedule-modal .btn-tiny {
+  padding: 3px 7px; font-size: 10px;
+  background: transparent;
+  border: 1px solid var(--border); color: var(--text-dim);
+  border-radius: 3px; cursor: pointer;
+}
+.gs-schedule-modal .btn-tiny:hover {
+  background: rgba(255,255,255,.04); color: var(--text);
+}
+.gs-schedule-modal .btn-danger-sm {
+  border-color: var(--critical); color: var(--critical);
+}
+.gs-schedule-modal .btn-danger-sm:hover {
+  background: var(--critical); color: white;
+}
+.gs-schedule-modal .sched-empty {
+  padding: 16px; text-align: center;
+  color: var(--text-muted); font-size: 11px;
+}
+.gs-schedule-modal .sched-add-row {
+  display: grid;
+  grid-template-columns: 130px 1fr auto auto auto;
+  gap: 6px; align-items: center;
+  margin-top: 8px; padding-top: 8px;
+  border-top: 1px dashed var(--border-soft);
+}
+.gs-schedule-modal .sched-add-row .input {
+  padding: 5px 9px; font-size: 11px;
+  font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+}
+.gs-schedule-modal .sched-add-prof-count {
+  font-size: 10px;
+  color: var(--text-muted);
+  min-width: 22px; text-align: center;
+}
+.gs-schedule-modal code {
+  background: var(--card-alt);
+  padding: 0px 5px;
+  border-radius: 3px;
+  font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  font-size: 10.5px;
+}
+
+
+/* ════════════════════════════════════════════════════════════
+   Behavior page redesign -- tab strip + search filter, dense IDE
+   ════════════════════════════════════════════════════════════ */
+
+.behavior-header-actions {
+  display: flex; align-items: center; gap: 8px;
+}
+.behavior-search-input {
+  width: 240px;
+  padding: 6px 10px;
+  font-size: 12px;
+  background: var(--card-alt);
+  border: 1px solid var(--border);
+  color: var(--text);
+  border-radius: 4px;
+}
+.behavior-search-input:focus {
+  border-color: var(--accent);
+  background: var(--card);
+}
+
+/* ── Tab strip ────────────────────────────────────────────── */
+.behavior-tabstrip {
+  display: flex;
+  gap: 0;
+  margin: 14px 0 16px;
+  border-bottom: 1px solid var(--border);
+  padding-left: 4px;
+}
+.behavior-tab-btn {
+  background: transparent;
+  border: none;
+  border-bottom: 2px solid transparent;
+  color: var(--text-muted);
+  padding: 9px 18px;
+  font-size: 12px;
+  font-weight: 500;
+  letter-spacing: .2px;
+  cursor: pointer;
+  transition: color .12s, border-color .12s, background .12s;
+  position: relative;
+  margin-bottom: -1px;  /* sit on the strip's bottom border */
+}
+.behavior-tab-btn:hover {
+  color: var(--text);
+  background: rgba(255,255,255,.02);
+}
+.behavior-tab-btn.is-active {
+  color: var(--accent);
+  border-bottom-color: var(--accent);
+  background: rgba(90,159,237,.04);
+}
+.behavior-tab-btn.is-search-empty {
+  opacity: .35;
+}
+
+/* ── Tab content (default hidden) ──────────────────────────── */
+.behavior-tab-content {
+  display: none;
+  animation: behavior-tab-fade-in .15s ease-out;
+}
+.behavior-tab-content.is-visible {
+  display: block;
+}
+@keyframes behavior-tab-fade-in {
+  from { opacity: 0; transform: translateY(2px); }
+  to   { opacity: 1; transform: none; }
+}
+
+/* ── Search filter "hidden" rows ──────────────────────────── */
+.is-search-hidden {
+  display: none !important;
+}
+
+/* ── Dense IDE polish: tighten panels inside Behavior tabs ──── */
+.behavior-tab-content .dense-panel {
+  margin-bottom: 12px;
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: 5px;
+}
+.behavior-tab-content .dense-panel-header {
+  padding: 10px 14px 8px;
+  border-bottom: 1px solid var(--border-soft);
+}
+.behavior-tab-content .dense-panel-title {
+  font-size: 12px;
+  font-weight: 600;
+  letter-spacing: .2px;
+  color: var(--text);
+}
+.behavior-tab-content .dense-panel-hint {
+  color: var(--text-muted);
+  font-size: 10.5px;
+  margin-top: 2px;
+}
+.behavior-tab-content .dense-panel-body {
+  padding: 10px 14px 14px;
+}
+.behavior-tab-content .timing-row {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  gap: 14px;
+  align-items: center;
+  padding: 6px 0;
+  border-bottom: 1px dashed var(--border-soft);
+}
+.behavior-tab-content .timing-row:last-child { border-bottom: none; }
+.behavior-tab-content .timing-label strong {
+  font-size: 11.5px;
+  color: var(--text);
+  font-weight: 600;
+}
+.behavior-tab-content .timing-label .muted {
+  font-size: 10.5px;
+  color: var(--text-muted);
+  margin-top: 1px;
+}
+.behavior-tab-content .timing-inputs {
+  display: flex; align-items: center; gap: 4px;
+}
+.behavior-tab-content .timing-input-wrap {
+  display: flex; flex-direction: column; gap: 1px;
+}
+.behavior-tab-content .timing-minmax-label {
+  font-size: 9px;
+  color: var(--text-muted);
+  text-transform: uppercase;
+  letter-spacing: .5px;
+}
+.behavior-tab-content .timing-inputs .input {
+  width: 70px;
+  padding: 4px 8px;
+  font-size: 11.5px;
+  font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+}
+.behavior-tab-content .timing-dash {
+  color: var(--text-muted);
+  font-size: 12px;
+  padding: 0 2px;
+}
+.behavior-tab-content .unit {
+  color: var(--text-muted);
+  font-size: 10px;
+  margin-left: 4px;
+}
+.behavior-tab-content .checkbox-row {
+  display: flex; align-items: flex-start; gap: 9px;
+  padding: 7px 0;
+  border-bottom: 1px dashed var(--border-soft);
+  font-size: 11.5px;
+  cursor: pointer;
+}
+.behavior-tab-content .checkbox-row:last-child { border-bottom: none; }
+.behavior-tab-content .checkbox-row strong {
+  font-size: 11.5px;
+  color: var(--text);
+}
+.behavior-tab-content .checkbox-row .muted {
+  font-size: 10.5px;
+  color: var(--text-muted);
+  margin-top: 1px;
+  line-height: 1.4;
+}
+.behavior-tab-content .dense-hint {
+  font-size: 11px;
+  color: var(--text-muted);
+  line-height: 1.5;
+  padding: 8px 12px;
+  background: var(--card-alt);
+  border-left: 3px solid var(--accent-dim);
+  border-radius: 3px;
+  margin-bottom: 10px;
+}
+.behavior-tab-content .deprecated-list {
+  list-style: none;
+  padding: 0; margin: 0;
+  font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  font-size: 11px;
+}
+.behavior-tab-content .deprecated-list li {
+  padding: 4px 0;
+  color: var(--text-muted);
+  border-bottom: 1px dashed var(--border-soft);
+}
+.behavior-tab-content .deprecated-list li:last-child { border-bottom: none; }
+.behavior-tab-content .deprecated-list code {
+  background: var(--bg);
+  padding: 1px 5px;
+  border-radius: 3px;
+  font-size: 10.5px;
+  color: var(--accent);
+}
+
+
+/* ── Phase 5.1: vault picker + inline-vault button ─────────── */
+.inline-param-row {
+  display: flex; align-items: stretch; gap: 4px;
+}
+.inline-param-row .inline-param-input { flex: 1; }
+.inline-vault-btn {
+  background: var(--card-alt);
+  border: 1px solid var(--border);
+  color: var(--text-dim);
+  padding: 0 8px;
+  border-radius: 3px;
+  cursor: pointer;
+  font-size: 13px;
+}
+.inline-vault-btn:hover {
+  background: rgba(90,159,237,.15);
+  color: var(--accent);
+  border-color: var(--accent);
+}
+.inline-vault-btn-tiny {
+  background: transparent;
+  border: none;
+  color: var(--text-muted);
+  padding: 0 4px;
+  cursor: pointer;
+  font-size: 11px;
+  margin-left: 4px;
+}
+.inline-vault-btn-tiny:hover { color: var(--accent); }
+
+.gs-vault-picker-modal .picker-list {
+  max-height: 360px; overflow-y: auto;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 4px;
+}
+.gs-vault-picker-modal .vault-pick-item {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  gap: 8px;
+  padding: 6px 8px;
+  align-items: center;
+  border-bottom: 1px dashed var(--border-soft);
+  font-size: 11.5px;
+}
+.gs-vault-picker-modal .vault-pick-item:last-child { border-bottom: none; }
+.gs-vault-picker-modal .vault-pick-name { color: var(--text); }
+.gs-vault-picker-modal .vault-pick-name .muted { color: var(--text-muted); }
+.gs-vault-picker-modal .vault-pick-fields {
+  display: flex; gap: 4px;
+}
+.gs-vault-picker-modal .vault-pick-fields .btn-tiny {
+  padding: 3px 8px; font-size: 10px;
+  background: transparent;
+  border: 1px solid var(--border);
+  color: var(--text-dim);
+  border-radius: 3px; cursor: pointer;
+}
+.gs-vault-picker-modal .vault-pick-fields .btn-tiny:hover {
+  background: rgba(90,159,237,.12); color: var(--accent);
+  border-color: var(--accent);
+}
+.gs-vault-picker-modal code {
+  background: var(--card-alt); padding: 0 5px;
+  border-radius: 3px;
+  font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  font-size: 10.5px;
+  color: var(--accent);
+}
+
+
+/* ── Phase 5.1: 🔑 button in right-side inspector ─────────── */
+.inspector-field-label {
+  display: flex; align-items: center; justify-content: space-between;
+  gap: 6px;
+}
+.inspector-vault-btn {
+  background: var(--card-alt);
+  border: 1px solid var(--border);
+  color: var(--text-dim);
+  padding: 1px 6px;
+  border-radius: 3px;
+  cursor: pointer;
+  font-size: 11px;
+  line-height: 1.4;
+}
+.inspector-vault-btn:hover {
+  background: rgba(90,159,237,.15);
+  color: var(--accent);
+  border-color: var(--accent);
+}

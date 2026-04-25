@@ -1,0 +1,31 @@
+{
+  "name": "Cookie warmup -- day 1 of 7",
+  "description": "First day of a 7-day cookie-building cycle. Visits 6 thematic sites (general news + tech) at realistic intervals. Run on a fresh profile each day with the matching d2/d3/.../d7 templates to grow a believable cookie pool.",
+  "category": "warmup",
+  "tags": ["warmup", "cookies", "day-1"],
+  "flow": [
+    { "type": "visit", "url": "https://news.ycombinator.com" },
+    { "type": "dwell", "min": 6, "max": 12 },
+    { "type": "scroll", "amount_min": 400, "amount_max": 900 },
+    { "type": "dwell", "min": 4, "max": 8 },
+
+    { "type": "visit", "url": "https://www.theverge.com" },
+    { "type": "dwell", "min": 5, "max": 12 },
+    { "type": "scroll", "amount_min": 600, "amount_max": 1200 },
+
+    { "type": "visit", "url": "https://www.cnet.com" },
+    { "type": "dwell", "min": 4, "max": 10 },
+    { "type": "scroll", "amount_min": 400, "amount_max": 1000 },
+
+    { "type": "visit", "url": "https://arstechnica.com" },
+    { "type": "dwell", "min": 5, "max": 11 },
+    { "type": "scroll", "amount_min": 500, "amount_max": 1100 },
+
+    { "type": "visit", "url": "https://techcrunch.com" },
+    { "type": "dwell", "min": 4, "max": 9 },
+    { "type": "scroll", "amount_min": 400, "amount_max": 900 },
+
+    { "type": "visit", "url": "https://stackoverflow.com" },
+    { "type": "dwell", "min": 3, "max": 7 }
+  ]
+}

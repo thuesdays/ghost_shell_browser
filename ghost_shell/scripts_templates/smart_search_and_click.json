@@ -1,0 +1,79 @@
+{
+  "name": "Smart Search & Click (competitor-only)",
+  "description": "Loops through your search queries. If the SERP has no ads on first load, refreshes up to 3 times (Google often reveals ads only on the 2nd or 3rd impression). For each ad found, the if-branches let you treat each class differently: competitor ads get clicked + read with a realistic dwell, your own / target-domain ads can be skipped (extend the condition list per row). Replace the queries placeholder with your own keyword list before running.",
+  "category": "recon",
+  "tags": ["google", "ads", "competitors", "smart"],
+  "flow": [
+    {
+      "type": "loop",
+      "enabled": true,
+      "items": "your first keyword\nyour second keyword\nyour third keyword",
+      "item_var": "item",
+      "shuffle": true,
+      "steps": [
+        {
+          "type": "search_query",
+          "enabled": true,
+          "query": "{item}",
+          "fail_on_empty": false
+        },
+        {
+          "type": "if",
+          "enabled": true,
+          "condition": { "kind": "no_ads" },
+          "then_steps": [
+            {
+              "type": "refresh",
+              "enabled": true,
+              "max_attempts": 3,
+              "delay_min_sec": 3,
+              "delay_max_sec": 7
+            },
+            {
+              "type": "catch_ads",
+              "enabled": true,
+              "query": "{item}"
+            }
+          ],
+          "else_steps": []
+        },
+        {
+          "type": "foreach_ad",
+          "enabled": true,
+          "shuffle": true,
+          "steps": [
+            {
+              "type": "if",
+              "enabled": true,
+              "condition": { "kind": "ad_is_competitor" },
+              "then_steps": [
+                {
+                  "type": "click_ad",
+                  "enabled": true,
+                  "dwell_min": 6,
+                  "dwell_max": 18,
+                  "scroll_after_click": true,
+                  "close_after": true
+                },
+                {
+                  "type": "pause",
+                  "enabled": true,
+                  "probability": 0.6,
+                  "min_sec": 2,
+                  "max_sec": 5
+                }
+              ],
+              "else_steps": []
+            }
+          ]
+        },
+        {
+          "type": "pause",
+          "enabled": true,
+          "min_sec": 5,
+          "max_sec": 12
+        }
+      ]
+    }
+  ]
+}

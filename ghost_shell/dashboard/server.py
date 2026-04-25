@@ -831,7 +831,7 @@ def api_profile_meta_set(name: str):
     allowed = {
         "tags", "proxy_url", "proxy_is_rotating",
         "rotation_api_url", "rotation_provider", "rotation_api_key",
-        "notes",
+        "notes", "use_script_on_launch",
     }
     updates = {k: v for k, v in payload.items() if k in allowed}
     if updates:
@@ -1443,6 +1443,35 @@ def _launch_run_thread(slot: "RunnerSlot", proxy_url: str) -> None:
             env["GHOST_SHELL_PROFILE_NAME"] = profile_name
             if proxy_url:
                 env["GHOST_SHELL_PROXY_URL"] = proxy_url
+            # One-shot script override (set when /api/scripts/<id>/run
+            # is invoked from a Library card). main.py reads this and,
+            # if present, uses it INSTEAD of resolving via the profile's
+            # bound script + opt-in toggle. Lifecycle = THIS run only;
+            # never persisted, never affects the profile's settings.
+            sid_override = getattr(slot, "script_id_override", None)
+            if sid_override is not None:
+                env["GHOST_SHELL_SCRIPT_ID"] = str(int(sid_override))
+
+            # Phase 5.1: resolve {vault.<id>.<field>} placeholders for
+            # the script that this run will execute, and pass the
+            # resolved values to the subprocess via env. The script we
+            # need is the one main.py will pick: override > profile-bound.
+            try:
+                _flow_for_resolve = []
+                if sid_override is not None:
+                    _sc = db.script_get(int(sid_override))
+                    if _sc:
+                        _flow_for_resolve = _sc.get("flow") or []
+                else:
+                    _sc = db.script_resolve_for_profile(profile_name)
+                    if _sc:
+                        _flow_for_resolve = _sc.get("flow") or []
+                if _flow_for_resolve:
+                    _bag = _build_vault_bag_for_flow(_flow_for_resolve)
+                    if _bag:
+                        env["GHOST_SHELL_VAULT_RESOLVED"] = json.dumps(_bag)
+            except Exception as e:
+                logging.warning(f"[run-launch] vault resolve failed: {e}")
 
             proc = subprocess.Popen(
                 [sys.executable, "-u", "-m", "ghost_shell", "monitor"],
@@ -1582,7 +1611,100 @@ def _launch_run_thread(slot: "RunnerSlot", proxy_url: str) -> None:
     t.start()
 
 
-def _spawn_run(profile_name: str) -> dict:
+
+# ──────────────────────────────────────────────────────────────
+# Phase 5.1: vault-from-scripts -- pre-resolve {vault.<id>.<field>}
+# placeholders at run-launch time so the spawned subprocess never
+# needs vault unlock state. We walk the flow JSON, decrypt each
+# referenced item via the in-process unlocked vault, and pass the
+# resolved bag as GHOST_SHELL_VAULT_RESOLVED (JSON env var). main.py
+# merges it into ctx.vars["vault"] so {vault.42.username} resolves
+# through the existing template-resolution machinery.
+#
+# Failure modes (handled defensively):
+#   - vault locked    -> empty bag; placeholders resolve to ""
+#   - item missing    -> skip silently with debug log
+#   - TOTP no secret  -> field absent in resolved bag
+#   - secrets dict shapes vary per kind -> we read the common keys
+#     (password, totp_secret) plus pass through any string field
+# ──────────────────────────────────────────────────────────────
+
+import re as _re_vault
+_VAULT_REF = _re_vault.compile(r"\{vault\.([0-9]+)\.([a-zA-Z_][a-zA-Z0-9_]*)\}")
+
+def _collect_vault_refs(flow) -> set:
+    """Walk a script flow recursively, collect (item_id, field) pairs
+    referenced via {vault.X.Y} placeholders in any string."""
+    seen = set()
+    def walk(node):
+        if isinstance(node, str):
+            for m in _VAULT_REF.finditer(node):
+                seen.add((m.group(1), m.group(2)))
+        elif isinstance(node, dict):
+            for v in node.values():
+                walk(v)
+        elif isinstance(node, list):
+            for v in node:
+                walk(v)
+    walk(flow or [])
+    return seen
+
+
+def _build_vault_bag_for_flow(flow) -> dict:
+    """For each (item_id, field) pair found in the flow, look up the
+    cleartext value from the unlocked vault. If vault is locked OR
+    items missing, the corresponding placeholder will resolve to ""
+    at runtime (acceptable graceful degradation -- vs. throwing and
+    aborting the whole run). Returns {id_str: {field: value, ...}}."""
+    refs = _collect_vault_refs(flow)
+    if not refs:
+        return {}
+    bag = {}
+    try:
+        from ghost_shell.accounts import manager as _vm
+        from ghost_shell.accounts import vault as _vault
+        if not _vault.get_vault().is_unlocked():
+            logging.info("[vault-bag] vault locked, "
+                         "{vault.X} placeholders will resolve to empty")
+            return {}
+    except Exception as e:
+        logging.warning(f"[vault-bag] vault module import failed: {e}")
+        return {}
+
+    for (sid, field) in refs:
+        try:
+            iid = int(sid)
+        except ValueError:
+            continue
+        bag.setdefault(sid, {})
+        try:
+            if field == "totp_code":
+                tc = _vm.totp_code(iid)
+                if tc and tc.get("code"):
+                    bag[sid]["totp_code"] = tc["code"]
+            else:
+                ct = _vm.get_item_cleartext(iid)
+                if not ct:
+                    continue
+                # Look in top-level fields first, then secrets dict
+                v = ct.get(field)
+                if v is None:
+                    secrets = ct.get("secrets") or {}
+                    v = secrets.get(field)
+                # Common alias: "username" maps to top-level "login"
+                if v is None and field == "username":
+                    v = ct.get("login")
+                if v is not None:
+                    bag[sid][field] = str(v)
+        except Exception as e:
+            logging.debug(f"[vault-bag] could not resolve "
+                          f"vault.{sid}.{field}: {e}")
+    # Drop empty per-id entries
+    return {k: v for k, v in bag.items() if v}
+
+
+def _spawn_run(profile_name: str, *,
+                script_id_override: int | None = None) -> dict:
     """
     Shared launch path — used by /api/run (legacy default) and
     /api/runs (explicit per-profile). Enforces:
@@ -1632,6 +1754,14 @@ def _spawn_run(profile_name: str) -> dict:
         proxy_url = proxy_cfg["url"]
         run_id = db.run_start(profile_name, proxy_url)
         slot = RunnerSlot(run_id=run_id, profile_name=profile_name)
+        # Stash the optional script-override on the slot so the launcher
+        # thread can pass it as GHOST_SHELL_SCRIPT_ID env. One-shot --
+        # NOT persisted to profile.script_id (that would break the
+        # "Run from card without re-binding" UX promise).
+        try:
+            slot.script_id_override = script_id_override
+        except Exception:
+            pass
         RUNNER_POOL.add(slot)
 
     # Outside the lock from here — the actual subprocess spawn can
@@ -1860,18 +1990,32 @@ def api_profile_delete(name: str):
         # filtering, we reassign the config to the deleted profile and
         # the UI sees no change — the exact bug user reported when
         # deleting the sole default profile.
+        # If we just deleted the active profile, reassign or clear.
+        # Empty-state policy: when no profiles remain, set
+        # browser.profile_name = None so the UI shows the
+        # "Create your first profile" CTA instead of a phantom
+        # "profile_01" that doesn't actually exist anywhere.
+        # Reading this null in the runtime is fine -- _spawn_run /
+        # main.py both treat a missing profile_name as
+        # "no active profile, refuse to start a run".
         reassigned_to = None
         active = db.config_get("browser.profile_name")
         if active == name:
             remaining = [p["name"] for p in db.profiles_list()
                          if p["name"] != name]
-            reassigned_to = remaining[0] if remaining else "profile_01"
-            db.config_set("browser.profile_name", reassigned_to)
-            logging.info(
-                f"[delete profile] active profile was '{name}', "
-                f"reassigned browser.profile_name -> '{reassigned_to}' "
-                f"({'remaining profiles: ' + str(remaining) if remaining else 'no profiles left — fresh profile_01 will be created on next run'})"
-            )
+            if remaining:
+                reassigned_to = remaining[0]
+                db.config_set("browser.profile_name", reassigned_to)
+                logging.info(
+                    f"[delete profile] active was '{name}', reassigned "
+                    f"browser.profile_name -> '{reassigned_to}' "
+                    f"(remaining: {remaining})")
+            else:
+                # No profiles left -- clear active. UI handles empty state.
+                db.config_set("browser.profile_name", None)
+                logging.info(
+                    f"[delete profile] active was '{name}', no profiles "
+                    f"left -- cleared browser.profile_name to None")
 
         return jsonify({
             "ok":            True,
@@ -3274,11 +3418,18 @@ def api_scripts_create():
 
     db = get_db()
     try:
+        # Phase 5: tags is an optional list of free-form labels for
+        # library search/filter. Empty list is fine; non-list silently
+        # coerced to [] so a careless client doesn't 400.
+        raw_tags = data.get("tags")
+        tags = [str(t) for t in raw_tags if isinstance(t, str)] \
+               if isinstance(raw_tags, list) else []
         script_id = db.script_create(
             name=name,
             description=data.get("description", "") or "",
             flow=flow,
             is_default=bool(data.get("is_default")),
+            tags=tags,
         )
     except Exception as e:
         # Likely UNIQUE constraint on name
@@ -3321,12 +3472,16 @@ def api_scripts_update(script_id):
         if err:
             return jsonify({"error": err}), 400
     try:
+        tags_in = data.get("tags") if "tags" in data else None
+        if tags_in is not None and not isinstance(tags_in, list):
+            return jsonify({"error": "tags must be a list"}), 400
         ok = db.script_update(
             script_id,
             name=data.get("name"),
             description=data.get("description"),
             flow=data.get("flow"),
             is_default=data.get("is_default") if "is_default" in data else None,
+            tags=tags_in if tags_in is None else [str(t) for t in tags_in if isinstance(t, str)],
         )
     except Exception as e:
         return jsonify({"error": f"Could not update: {e}"}), 400
@@ -3399,6 +3554,243 @@ def api_profile_script_set(name):
         return jsonify({"error": "script not found"}), 404
     db.script_assign_to_profile(name, script_id)
     return jsonify({"ok": True})
+
+
+@app.route("/api/scripts/<int:script_id>/run", methods=["POST"])
+def api_scripts_run_multi(script_id):
+    """Phase 2: kick off runs for one or more profiles, all using this script.
+
+    Body: {"profiles": ["profile_01", "profile_02"], "assign": true}
+
+    `assign=true` (default) means: bind the script to each profile BEFORE
+    starting the run, so the runtime resolves to this script even if the
+    profile previously had a different binding. `assign=false` skips the
+    binding step -- useful when the user only wants to run, not change
+    permanent assignment.
+
+    Each profile run goes through the standard `_spawn_run()` pipeline
+    (RunnerPool slot reservation, one-run-per-profile guard, max_parallel
+    cap). Failures are reported per-profile in the response, not as a
+    blanket 500 -- this keeps "5 of 7 started" partial-success cases
+    legible to the UI.
+    """
+    body  = request.get_json(silent=True) or {}
+    names = body.get("profiles") or []
+    do_assign = bool(body.get("assign", True))
+    if not isinstance(names, list) or not names:
+        return jsonify({"error": "profiles must be a non-empty list"}), 400
+
+    db = get_db()
+    sc = db.script_get(script_id)
+    if not sc:
+        return jsonify({"error": "script not found"}), 404
+
+    results = []
+    for name in names:
+        if not isinstance(name, str) or not name.strip():
+            results.append({"profile": str(name), "ok": False,
+                            "error": "invalid profile name"})
+            continue
+        try:
+            # Permanent re-binding only when the caller explicitly
+            # asked for it (assign=true). Default path is one-shot
+            # override -- the run uses this script but the profile's
+            # configured script binding stays untouched.
+            if do_assign:
+                db.script_assign_to_profile(name, script_id)
+            r = _spawn_run(name, script_id_override=script_id)
+            results.append({
+                "profile": name,
+                "ok":      True,
+                "run_id":  r.get("run_id"),
+            })
+        except ValueError as e:
+            # _spawn_run raises ValueError on cap / already-running
+            results.append({"profile": name, "ok": False, "error": str(e)})
+        except Exception as e:
+            results.append({"profile": name, "ok": False,
+                            "error": f"spawn failed: {e}"})
+
+    started = sum(1 for r in results if r["ok"])
+    return jsonify({
+        "ok":      started > 0,
+        "started": started,
+        "total":   len(names),
+        "results": results,
+    })
+
+
+@app.route("/api/scripts/<int:script_id>/pin", methods=["POST", "PUT"])
+def api_scripts_pin(script_id):
+    """Phase 2: set the pinned-profiles list for a script.
+
+    Body: {"profiles": ["profile_01", "profile_02"]}
+
+    Pinned profiles are surfaced as chips on the Scripts library card
+    and as the default checked set in the "Run on profiles" picker --
+    one-click re-run for the user's frequent combos. Sending an empty
+    list clears the pins. Pins are independent of `script_assign_to_profile`:
+    a profile can be pinned to script A while currently bound to script B.
+    """
+    body = request.get_json(silent=True) or {}
+    names = body.get("profiles") or []
+    if not isinstance(names, list):
+        return jsonify({"error": "profiles must be a list"}), 400
+
+    db = get_db()
+    if not db.script_get(script_id):
+        return jsonify({"error": "script not found"}), 404
+
+    db.script_set_pinned(script_id, names)
+    return jsonify({"ok": True, "pinned": db.script_get_pinned(script_id)})
+
+
+@app.route("/api/scripts/<int:script_id>/profiles", methods=["GET"])
+def api_scripts_assigned_profiles(script_id):
+    """List profiles currently bound to this script (via profile.script_id).
+
+    Used by the Phase 2 "Apply to profiles" picker to pre-check the
+    currently-assigned set so the user sees state-of-the-world rather
+    than an empty list.
+    """
+    db = get_db()
+    if not db.script_get(script_id):
+        return jsonify({"error": "script not found"}), 404
+    return jsonify({"profiles": db.script_profiles(script_id)})
+
+
+@app.route("/api/scripts/<int:script_id>/pin", methods=["GET"])
+def api_scripts_pin_get(script_id):
+    """Read the pinned-profiles list. Convenience for the UI; the same
+    data is included in `/api/scripts` (list endpoint) but a dedicated
+    GET avoids re-fetching the entire library when only one card needs
+    refresh."""
+    db = get_db()
+    if not db.script_get(script_id):
+        return jsonify({"error": "script not found"}), 404
+    return jsonify({"profiles": db.script_get_pinned(script_id)})
+
+
+@app.route("/api/scripts/templates", methods=["GET"])
+def api_scripts_templates():
+    """Phase 3: list curated script templates from the bundled
+    `ghost_shell/scripts_templates/` directory.
+
+    Each template is a JSON file with the shape:
+        {"name": "...", "description": "...", "category": "...",
+         "tags": [...], "flow": [{step}, {step}, ...]}
+
+    The endpoint returns a list -- the UI shows them as a grid on the
+    Library page and "Use this" creates a brand-new script seeded with
+    the template's flow (user can edit before saving).
+
+    Templates are read from disk on every call (no caching) -- they
+    are static-ish data and the file count is small (<20). This keeps
+    the dev loop tight: edit a JSON, refresh the page, see the change.
+
+    File errors are reported per-file in the `errors` array so a
+    single broken template doesn't take the whole list down.
+    """
+    import os, json as _json
+    from pathlib import Path
+    # ghost_shell/scripts_templates lives next to this module's package root
+    pkg_root = Path(__file__).resolve().parent.parent
+    tpl_dir  = pkg_root / "scripts_templates"
+
+    if not tpl_dir.exists():
+        return jsonify({"templates": [], "errors": [
+            f"templates dir missing: {tpl_dir}"
+        ]})
+
+    templates = []
+    errors = []
+    for p in sorted(tpl_dir.glob("*.json")):
+        try:
+            with open(p, "r", encoding="utf-8") as fh:
+                data = _json.load(fh)
+            # Minimal validation -- name + flow are required for the
+            # template to make sense in the UI. Anything else is
+            # optional metadata that the card can render or ignore.
+            if not isinstance(data, dict) or "name" not in data \
+                    or "flow" not in data:
+                errors.append(f"{p.name}: missing 'name' or 'flow'")
+                continue
+            data["filename"] = p.name
+            data["step_count"] = len(data.get("flow", [])) \
+                if isinstance(data.get("flow"), list) else 0
+            templates.append(data)
+        except _json.JSONDecodeError as e:
+            errors.append(f"{p.name}: invalid JSON -- {e}")
+        except Exception as e:
+            errors.append(f"{p.name}: {e}")
+
+    return jsonify({"templates": templates, "errors": errors})
+
+
+@app.route("/api/scripts/<int:script_id>/schedules", methods=["GET"])
+def api_script_schedules_list(script_id):
+    """List scheduled-task entries for one script."""
+    db = get_db()
+    if not db.script_get(script_id):
+        return jsonify({"error": "script not found"}), 404
+    return jsonify({"tasks": db.scheduled_tasks_list(script_id=script_id)})
+
+
+@app.route("/api/scripts/<int:script_id>/schedules", methods=["POST"])
+def api_script_schedules_create(script_id):
+    """Create a scheduled task for this script. Body:
+       {"cron_expr": "*/15 * * * *", "profiles": [...], "name": "...", "enabled": true}"""
+    body = request.get_json(silent=True) or {}
+    cron_expr = (body.get("cron_expr") or "").strip()
+    if not cron_expr:
+        return jsonify({"error": "cron_expr is required"}), 400
+    profiles = body.get("profiles") or []
+    if not isinstance(profiles, list):
+        return jsonify({"error": "profiles must be a list"}), 400
+    name = body.get("name") or ""
+    enabled = bool(body.get("enabled", True))
+
+    db = get_db()
+    if not db.script_get(script_id):
+        return jsonify({"error": "script not found"}), 404
+    try:
+        task_id = db.scheduled_task_create(
+            script_id=script_id,
+            cron_expr=cron_expr,
+            profiles=[str(p) for p in profiles if isinstance(p, str)],
+            name=name,
+            enabled=enabled,
+        )
+    except Exception as e:
+        return jsonify({"error": f"create failed: {e}"}), 400
+    return jsonify({"ok": True, "id": task_id})
+
+
+@app.route("/api/schedules/<int:task_id>", methods=["PATCH", "PUT"])
+def api_schedule_update(task_id):
+    """Update a scheduled task. Body may contain any of:
+       cron_expr, profiles, name, enabled."""
+    body = request.get_json(silent=True) or {}
+    db = get_db()
+    ok = db.scheduled_task_update(
+        task_id,
+        cron_expr=body.get("cron_expr"),
+        profiles=body.get("profiles"),
+        name=body.get("name"),
+        enabled=body.get("enabled") if "enabled" in body else None,
+    )
+    if not ok:
+        return jsonify({"error": "not found or no changes"}), 404
+    return jsonify({"ok": True})
+
+
+@app.route("/api/schedules/<int:task_id>", methods=["DELETE"])
+def api_schedule_delete(task_id):
+    db = get_db()
+    if not db.scheduled_task_delete(task_id):
+        return jsonify({"error": "not found"}), 404
+    return jsonify({"ok": True})
+
 
 
 # ──────────────────────────────────────────────────────────────

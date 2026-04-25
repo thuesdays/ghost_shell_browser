@@ -1,0 +1,81 @@
+{
+  "name": "Google account login",
+  "description": "Logs into a Google account at accounts.google.com. Uses <- click 🔑 to pick username from Vault -> and <- click 🔑 to pick password from Vault -> placeholders that you substitute either via the Variables block at the top of the editor, or via a profile-bound account from Vault. After auth, dwells briefly on the inbox/welcome page so the session looks normal.\n\nHOW TO BIND CREDENTIALS: open a 'type' step, click the 🔑 button next to the parameter label, pick your account from the Vault, then choose 'username' or 'password' (or '2FA code' for TOTP). The placeholder becomes {vault.<id>.<field>} and gets resolved to cleartext at run-launch time. Vault must be unlocked.",
+  "category": "login",
+  "tags": [
+    "login",
+    "google",
+    "auth"
+  ],
+  "flow": [
+    {
+      "type": "visit",
+      "url": "https://accounts.google.com/signin"
+    },
+    {
+      "type": "wait_for",
+      "selector": "input[type='email'], input#identifierId",
+      "timeout": 15
+    },
+    {
+      "type": "dwell",
+      "min": 2,
+      "max": 5
+    },
+    {
+      "type": "type",
+      "selector": "input[type='email'], input#identifierId",
+      "text": "<- click 🔑 to pick username from Vault ->",
+      "clear_first": true
+    },
+    {
+      "type": "random_delay",
+      "min": 1,
+      "max": 2
+    },
+    {
+      "type": "click_selector",
+      "selector": "#identifierNext, button[type='button']:has-text('Next')"
+    },
+    {
+      "type": "wait_for",
+      "selector": "input[type='password'], input[name='Passwd']",
+      "timeout": 15
+    },
+    {
+      "type": "dwell",
+      "min": 2,
+      "max": 4
+    },
+    {
+      "type": "type",
+      "selector": "input[type='password']",
+      "text": "<- click 🔑 to pick password from Vault ->",
+      "clear_first": true
+    },
+    {
+      "type": "random_delay",
+      "min": 1,
+      "max": 2
+    },
+    {
+      "type": "click_selector",
+      "selector": "#passwordNext, button[type='button']"
+    },
+    {
+      "type": "wait_for",
+      "selector": "header[role='banner'], a[aria-label*='Account']",
+      "timeout": 25
+    },
+    {
+      "type": "dwell",
+      "min": 5,
+      "max": 12
+    },
+    {
+      "type": "scroll",
+      "amount_min": 100,
+      "amount_max": 400
+    }
+  ]
+}
