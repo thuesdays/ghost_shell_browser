@@ -17,6 +17,10 @@ const PAGES = {
   fingerprint: { html: "/pages/fingerprint.html", init: () => FingerprintPage.init() },
   session:     { html: "/pages/session.html",     init: () => SessionPage.init(),     teardown: () => SessionPage.teardown?.() },
   accounts:    { html: "/pages/accounts.html",    init: () => VaultPage.init() },
+  // Extensions pool — Phase 3 Extensions feature.
+  // Pool of CRX/folder unpacks shared across profiles. Each profile
+  // can opt-in to auto-install at launch via --load-extension.
+  extensions:  { html: "/pages/extensions.html",  init: () => ExtensionsPage.init(), teardown: () => ExtensionsPage.teardown?.() },
   competitors: { html: "/pages/competitors.html", init: () => Competitors.init(), teardown: () => Competitors.teardown?.() },
   behavior:    { html: "/pages/behavior.html",    init: () => Behavior.init() },
   // "Scripts" page (was "Actions") — pipeline/script builder

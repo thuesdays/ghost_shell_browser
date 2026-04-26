@@ -12,7 +12,128 @@
         <div class="column-picker-dropdown" id="column-picker-dropdown" style="display:none;"></div>
       </div>
       <button class="btn btn-secondary" id="reload-profiles-btn">↻ Reload</button>
+      <button class="btn btn-secondary" id="btn-bulk-create-profile"
+              title="Create N profiles at once with shared template / proxy pool / script binding">
+        ⚡ Bulk create
+      </button>
       <button class="btn btn-primary" id="btn-create-profile">+ Create profile</button>
+    </div>
+  </div>
+
+  <!-- ═══ Bulk-create profile modal ═══════════════════════════
+       For users scaling to 10-50 profiles. One dialog, server
+       creates all of them with unique fingerprints, optional
+       proxy round-robin, optional script binding, and auto
+       cookie-pool injection. Partial-success aware. -->
+  <div class="profile-modal" id="bulk-create-modal" style="display:none;">
+    <div class="profile-modal-backdrop" data-close="bulk-create-modal"></div>
+    <div class="profile-modal-content" style="width: 640px;">
+      <div class="profile-modal-header">
+        <div class="profile-modal-title">⚡ Bulk create profiles</div>
+        <button class="profile-modal-close" data-close="bulk-create-modal">×</button>
+      </div>
+      <div class="profile-modal-body">
+        <div class="form-row" style="display:grid; grid-template-columns: 2fr 1fr; gap: 10px;">
+          <div class="form-group">
+            <label class="form-label">Name prefix *</label>
+            <input type="text" class="input" id="bc-prefix"
+                   placeholder="ua_med_" value="profile_">
+            <div class="form-hint">
+              Each profile gets a 3-digit suffix appended (e.g. <code>ua_med_001</code>, <code>ua_med_002</code>).
+              Letters, digits, _ and -.
+            </div>
+          </div>
+          <div class="form-group">
+            <label class="form-label">How many?</label>
+            <input type="number" class="input" id="bc-count"
+                   min="1" max="100" value="10">
+          </div>
+        </div>
+
+        <div class="form-row" style="display:grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-top: 10px;">
+          <div class="form-group">
+            <label class="form-label">Start index</label>
+            <input type="number" class="input" id="bc-start" min="1" value="1">
+            <div class="form-hint">Suffix counter starts here. Auto-skips collisions.</div>
+          </div>
+          <div class="form-group">
+            <label class="form-label">Language</label>
+            <input type="text" class="input" id="bc-lang"
+                   value="uk-UA" placeholder="uk-UA">
+          </div>
+        </div>
+
+        <div class="form-group" style="margin-top: 10px;">
+          <label class="form-label">FP template strategy</label>
+          <select class="select" id="bc-template">
+            <option value="auto">Auto (random per profile, recommended)</option>
+            <!-- Specific template ids could go here, but auto is the
+                 right default for diversification -->
+          </select>
+          <div class="form-hint">
+            Each profile gets a different fingerprint -- looks like
+            different physical machines on Google.
+          </div>
+        </div>
+
+        <div class="form-group" style="margin-top: 10px;">
+          <label class="form-label">Proxy pool (round-robin)</label>
+          <select multiple class="select" id="bc-proxy-pool"
+                  style="height: 100px;">
+            <option disabled>Loading proxies…</option>
+          </select>
+          <div class="form-hint">
+            Hold Ctrl/Cmd to select multiple. Each profile gets one
+            proxy from the pool, round-robin. Leave empty to use
+            global default.
+          </div>
+        </div>
+
+        <div class="form-group" style="margin-top: 10px;">
+          <label class="form-label">Bind script (optional)</label>
+          <select class="select" id="bc-script">
+            <option value="">— don't bind any script —</option>
+          </select>
+          <div class="form-hint">
+            All profiles get this script + use_script_on_launch=true
+            applied. Same as clicking Apply-to-profile manually for each.
+          </div>
+        </div>
+
+        <div class="form-group" style="margin-top: 10px;">
+          <label class="form-label">Tags (comma-separated)</label>
+          <input type="text" class="input" id="bc-tags"
+                 placeholder="ua, medical, monitoring">
+          <div class="form-hint">
+            Applied to every profile. The first non-system tag is used
+            as cookie-pool category for auto-injection.
+          </div>
+        </div>
+
+        <div class="checkbox-row" style="margin-top: 12px;">
+          <input type="checkbox" id="bc-skip-cookies">
+          <label for="bc-skip-cookies">
+            Skip cookie pool auto-injection
+            <span class="form-hint" style="display:block;">
+              By default each new profile gets cookies injected from a matching pool snapshot.
+              Disable if you want completely cold profiles.
+            </span>
+          </label>
+        </div>
+
+        <div id="bc-status" style="margin-top: 14px; display:none;
+             padding: 10px; border-radius: 6px;
+             background: var(--surface-2, rgba(99,102,241,0.06));
+             border: 1px solid var(--border, #2a3142);
+             font-family: ui-monospace, monospace; font-size: 12px;">
+        </div>
+      </div>
+      <div class="profile-modal-footer">
+        <button class="btn btn-secondary" data-close="bulk-create-modal">Cancel</button>
+        <button class="btn btn-primary" id="bc-submit-btn">
+          ⚡ Create profiles
+        </button>
+      </div>
     </div>
   </div>
 

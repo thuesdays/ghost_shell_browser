@@ -1,0 +1,227 @@
+<!--
+  Extensions pool — dense IDE-style layout.
+  Mirrors the patterns used by Session/Vault/Traffic pages:
+    .content:has(.ext-workspace) → max-width: none, full viewport
+    dense-statbar → KPI cards strip
+    dense-panel    → main containers (grid + detail)
+    cmp-filter-bar → search + segmented filter
+
+  Backend endpoints:
+    GET    /api/extensions
+    GET    /api/extensions/<id>
+    DELETE /api/extensions/<id>
+    PATCH  /api/extensions/<id>
+    POST   /api/extensions/upload          (CRX or ZIP autodetect)
+    POST   /api/extensions/install-cws     ({id_or_url})
+    GET    /api/extensions/cws-search?q=…
+    GET    /api/profiles/<name>/extensions
+    POST   /api/profiles/<name>/extensions
+    DELETE /api/profiles/<name>/extensions/<ext_id>
+-->
+<section class="ext-workspace">
+  <div class="page-header">
+    <div>
+      <div class="page-title">🧩 Extensions</div>
+      <div class="page-subtitle">
+        Shared pool of Chrome extensions. Profiles opt-in to any subset
+        — they auto-install at launch and keep their own data
+        (Local Storage, IndexedDB, settings) inside the profile's
+        user-data-dir, so wallets stay isolated.
+      </div>
+    </div>
+    <div class="ext-header-actions">
+      <button class="btn btn-secondary btn-small" id="ext-reload-btn"
+              title="Reload pool">↻ Reload</button>
+
+      <div class="ext-add-wrap">
+        <button class="btn btn-primary btn-small" id="ext-add-btn">+ Add extension ▾</button>
+        <div class="ext-add-menu" id="ext-add-menu" style="display: none;">
+          <div class="ext-add-menu-item" data-source="crx">
+            <span class="ext-add-menu-icon">📦</span>
+            <div class="ext-add-menu-body">
+              <div class="ext-add-menu-title">Upload .crx file</div>
+              <div class="ext-add-menu-hint">Packed Chrome extension (CRX2/CRX3)</div>
+            </div>
+          </div>
+          <div class="ext-add-menu-item" data-source="folder">
+            <span class="ext-add-menu-icon">📁</span>
+            <div class="ext-add-menu-body">
+              <div class="ext-add-menu-title">Upload unpacked folder (.zip)</div>
+              <div class="ext-add-menu-hint">Zipped folder with manifest.json at root</div>
+            </div>
+          </div>
+          <div class="ext-add-menu-item" data-source="cws-id">
+            <span class="ext-add-menu-icon">🔗</span>
+            <div class="ext-add-menu-body">
+              <div class="ext-add-menu-title">Install from Chrome Web Store (by ID)</div>
+              <div class="ext-add-menu-hint">Paste CWS URL or 32-char extension ID</div>
+            </div>
+          </div>
+          <div class="ext-add-menu-item" data-source="cws-search">
+            <span class="ext-add-menu-icon">🔍</span>
+            <div class="ext-add-menu-body">
+              <div class="ext-add-menu-title">Search the Chrome Web Store</div>
+              <div class="ext-add-menu-hint">Browse and install — no leaving the dashboard</div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <input type="file" id="ext-file-crx"    accept=".crx"  style="display: none;">
+      <input type="file" id="ext-file-folder" accept=".zip"  style="display: none;">
+    </div>
+  </div>
+
+  <!-- ═══ KPI strip ═══════════════════════════════════════════ -->
+  <div class="dense-statbar" id="ext-statbar">
+    <div class="dense-stat">
+      <div class="dense-stat-label">In pool</div>
+      <div class="dense-stat-value" id="ext-stat-total">—</div>
+      <div class="dense-stat-sub">extensions installed</div>
+    </div>
+    <div class="dense-stat">
+      <div class="dense-stat-label">Enabled</div>
+      <div class="dense-stat-value" id="ext-stat-enabled">—</div>
+      <div class="dense-stat-sub">available for assignment</div>
+    </div>
+    <div class="dense-stat">
+      <div class="dense-stat-label">Disabled</div>
+      <div class="dense-stat-value" id="ext-stat-disabled">—</div>
+      <div class="dense-stat-sub">won't auto-install if assigned</div>
+    </div>
+    <div class="dense-stat">
+      <div class="dense-stat-label">Profiles using ≥1</div>
+      <div class="dense-stat-value" id="ext-stat-profiles">—</div>
+      <div class="dense-stat-sub">at least one extension</div>
+    </div>
+  </div>
+
+  <!-- ═══ Main 2-col layout ═══════════════════════════════════ -->
+  <div class="ext-layout" id="ext-layout">
+
+    <!-- LEFT: pool grid wrapped in a dense-panel -->
+    <div class="dense-panel ext-grid-panel">
+      <div class="dense-panel-header">
+        <div class="dense-panel-title">
+          📦 Pool
+          <span class="dense-panel-badge" id="ext-grid-count">0</span>
+        </div>
+        <div class="ext-toolbar">
+          <input type="text" class="input ext-search-input" id="ext-search"
+                 placeholder="🔍  Search by name, source, or extension ID…">
+          <div class="cmp-period-picker ext-source-filter"
+               role="tablist" aria-label="Source filter">
+            <button class="cmp-period-btn active" data-source="">All</button>
+            <button class="cmp-period-btn" data-source="cws">CWS</button>
+            <button class="cmp-period-btn" data-source="manual_crx" data-source-alt="crx">CRX</button>
+            <button class="cmp-period-btn" data-source="manual_unpacked" data-source-alt="folder">Folder</button>
+          </div>
+        </div>
+      </div>
+      <div class="dense-panel-body" style="padding: 12px;">
+        <div id="ext-grid" class="ext-grid">
+          <div class="dense-empty" style="padding: 40px 16px; text-align: center;">
+            Loading…
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- RIGHT: detail panel (sticky) -->
+    <aside class="dense-panel ext-detail-panel" id="ext-detail-wrap">
+      <div class="dense-panel-header">
+        <div class="dense-panel-title">📋 Details</div>
+        <span class="dense-panel-hint" id="ext-detail-hint"
+              style="display:none;">click an extension</span>
+      </div>
+      <div class="dense-panel-body" style="padding: 14px;">
+        <div class="dense-empty" id="ext-detail-empty"
+             style="padding: 40px 16px; text-align: center;">
+          <div style="font-size: 32px; opacity: 0.4; margin-bottom: 8px;">🧩</div>
+          <div style="font-size: 12.5px; opacity: 0.7;">
+            Pick an extension from the pool to see manifest summary,
+            permissions, and which profiles use it.
+          </div>
+        </div>
+        <div id="ext-detail" style="display: none;"></div>
+      </div>
+    </aside>
+  </div>
+</section>
+
+<!-- ═══════════════════════════════════════════════════════════════
+     CWS install-by-ID modal
+     ═══════════════════════════════════════════════════════════════ -->
+<div class="profile-modal" id="ext-cws-id-modal" style="display:none;">
+  <div class="profile-modal-backdrop" data-close="ext-cws-id-modal"></div>
+  <div class="profile-modal-content" style="width: 540px;">
+    <div class="profile-modal-header">
+      <div class="profile-modal-title">🔗 Install from Chrome Web Store</div>
+      <button class="profile-modal-close" data-close="ext-cws-id-modal">×</button>
+    </div>
+    <div class="profile-modal-body">
+      <div class="form-group">
+        <label class="form-label">Extension URL or ID</label>
+        <input type="text" class="input" id="ext-cws-id-input"
+               placeholder="https://chromewebstore.google.com/detail/…/abc…  or  32-char ID"
+               autocomplete="off">
+        <div class="form-hint">
+          Paste the full Chrome Web Store URL (we extract the ID
+          automatically) or the 32-character ID directly. Example IDs:
+          <code>nkbihfbeogaeaoehlefnkodbefgpgknn</code> (MetaMask),
+          <code>mcohilncbfahbmgdjkbpemcciiolgcge</code> (OKX Wallet).
+        </div>
+      </div>
+      <div class="dense-callout" style="margin-top: 12px;">
+        <span class="dense-callout-icon">ℹ</span>
+        <div class="dense-callout-body">
+          We download the latest version directly from Google's
+          <code>update2/crx</code> endpoint — no browser interaction
+          required. Each profile gets its own data directory, so wallet
+          seed phrases and accounts stay isolated.
+        </div>
+      </div>
+    </div>
+    <div class="profile-modal-footer">
+      <button class="btn btn-secondary" data-close="ext-cws-id-modal">Cancel</button>
+      <button class="btn btn-primary" id="ext-cws-id-install-btn">Download &amp; install</button>
+    </div>
+  </div>
+</div>
+
+<!-- ═══════════════════════════════════════════════════════════════
+     CWS search modal
+     ═══════════════════════════════════════════════════════════════ -->
+<div class="profile-modal" id="ext-cws-search-modal" style="display:none;">
+  <div class="profile-modal-backdrop" data-close="ext-cws-search-modal"></div>
+  <div class="profile-modal-content" style="width: 760px; max-height: 88vh;">
+    <div class="profile-modal-header">
+      <div class="profile-modal-title">🔍 Search the Chrome Web Store</div>
+      <button class="profile-modal-close" data-close="ext-cws-search-modal">×</button>
+    </div>
+    <div class="profile-modal-body" style="display: flex; flex-direction: column; gap: 12px;">
+      <div style="display: flex; gap: 8px;">
+        <input type="text" class="input" id="ext-cws-search-input" style="flex: 1;"
+               placeholder="metamask, okx, phantom, ad blocker…"
+               autocomplete="off">
+        <button class="btn btn-primary" id="ext-cws-search-btn">Search</button>
+      </div>
+      <div class="form-hint" style="margin-top: -4px;">
+        Best-effort scrape of the Chrome Web Store. For wallets we
+        recommend installing by exact ID — the official extensions are
+        listed under the developer's verified domain.
+      </div>
+
+      <div id="ext-cws-recommended" class="ext-cws-rec-grid"></div>
+
+      <div id="ext-cws-results" class="ext-cws-results">
+        <div class="dense-empty" style="padding: 30px 16px; text-align: center;">
+          Type a query above to search.
+        </div>
+      </div>
+    </div>
+    <div class="profile-modal-footer">
+      <button class="btn btn-secondary" data-close="ext-cws-search-modal">Close</button>
+    </div>
+  </div>
+</div>

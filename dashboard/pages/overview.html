@@ -61,6 +61,27 @@
     </a>
   </div>
 
+  <!-- ═══ Ad density trend (★ algo-effectiveness widget) ═══════
+       Without this card the user can't tell whether algo upgrades
+       (commercial_inflate, deep_dive, comparison-scan, geo-warmup,
+       cookie-pool injection, etc.) are actually moving the needle.
+       Shows: 7-day rolling avg ads/query, delta vs the prior 7
+       days, 14-day sparkline, top profiles, top IPs. Plot is a
+       lightweight SVG sparkline rendered client-side from the
+       /api/metrics/ad-density daily array — no external chart lib. -->
+  <div class="dense-panel" id="ov-density-panel">
+    <div class="dense-panel-header">
+      <div class="dense-panel-title">📈 Ad density trend
+        <span class="dense-panel-hint">— effectiveness of warmup &amp; click algos</span>
+      </div>
+      <button class="btn btn-secondary btn-small" id="ov-density-refresh"
+              title="Recompute now">↻</button>
+    </div>
+    <div class="dense-panel-body" id="ov-density-body">
+      <div class="muted" style="padding: 12px;">Loading…</div>
+    </div>
+  </div>
+
   <!-- ═══ Quick actions ════════════════════════════════════ -->
   <div class="ov-actions">
     <span class="ov-actions-label">Quick actions</span>

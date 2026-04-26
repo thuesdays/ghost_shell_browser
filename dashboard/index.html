@@ -66,6 +66,15 @@
       <div class="sidebar-item" data-page="accounts">
         <span class="sidebar-item-icon">🔐</span><span>Accounts & Vault</span>
       </div>
+      <!-- Extensions pool — per-profile Chrome extension management.
+           Pool stores CRX/folder unpacks once; each profile can pick
+           any subset to auto-install at launch (--load-extension).
+           Extension data (Local Storage / IndexedDB / settings) lives
+           in user-data-dir so each profile keeps its own state. -->
+      <div class="sidebar-item" data-page="extensions">
+        <span class="sidebar-item-icon">🧩</span><span>Extensions</span>
+        <span class="sidebar-badge" id="badge-extensions" style="display:none">0</span>
+      </div>
 
       <!-- TARGETS: what we're looking at out there -->
       <div class="sidebar-section-label">Targets</div>
@@ -150,6 +159,7 @@
 <script src="/js/pages/fingerprint.js"></script>
 <script src="/js/pages/session.js"></script>
 <script src="/js/pages/accounts.js"></script>
+<script src="/js/pages/extensions.js"></script>
 <script src="/js/pages/competitors.js"></script>
 <script src="/js/pages/behavior.js"></script>
 <script src="/js/pages/scripts.js"></script>

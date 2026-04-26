@@ -399,6 +399,52 @@ CREATE INDEX IF NOT EXISTS idx_snapshot_profile   ON cookie_snapshots(profile_na
 CREATE INDEX IF NOT EXISTS idx_snapshot_created   ON cookie_snapshots(created_at);
 
 -- ───────────────────────────────────────────────────────────────
+-- extensions — pool catalogue of Chrome extensions available to any
+-- profile. Each row maps to an unpacked extension folder under
+-- data/extensions_pool/<id>/. At profile launch the runtime pulls
+-- assigned rows from profile_extensions and adds the pool path to
+-- Chrome's --load-extension CLI flag. Extension data (Local Extension
+-- Settings, IndexedDB, etc.) lives inside the per-profile user-data-dir
+-- so it persists across launches without us touching it.
+--
+-- id format:
+--   - For CWS-installed extensions: the canonical 32-char Chrome ID
+--     derived from the public key in the CRX.
+--   - For manual unpacked uploads: same algorithm, applied to a key
+--     we auto-inject into manifest.json so the ID stays stable across
+--     pool moves.
+-- ───────────────────────────────────────────────────────────────
+CREATE TABLE IF NOT EXISTS extensions (
+    id                    TEXT PRIMARY KEY,
+    name                  TEXT NOT NULL,
+    description           TEXT,
+    version               TEXT,
+    source                TEXT,                -- "manual_crx" | "manual_unpacked" | "cws"
+    source_url            TEXT,                -- CWS URL or upload origin filename
+    pool_path             TEXT NOT NULL,       -- absolute path to unpacked dir
+    manifest_json         TEXT,                -- cached manifest.json contents
+    icon_b64              TEXT,                -- base64 48px icon for UI
+    permissions_summary   TEXT,                -- comma-joined permissions list
+    is_enabled            INTEGER NOT NULL DEFAULT 1,
+    auto_install_for_new  INTEGER NOT NULL DEFAULT 0,
+    created_at            TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at            TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+-- Per-profile assignment: which extensions a given profile should have
+-- at launch. The runtime verifies this list before spawning Chrome.
+CREATE TABLE IF NOT EXISTS profile_extensions (
+    profile_name   TEXT NOT NULL,
+    extension_id   TEXT NOT NULL,
+    enabled        INTEGER NOT NULL DEFAULT 1,
+    installed_at   TEXT,                       -- last verified-present timestamp
+    PRIMARY KEY (profile_name, extension_id),
+    FOREIGN KEY (extension_id) REFERENCES extensions(id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_profext_profile ON profile_extensions(profile_name);
+CREATE INDEX IF NOT EXISTS idx_profext_ext     ON profile_extensions(extension_id);
+
+-- ───────────────────────────────────────────────────────────────
 -- vault_items — generic credential & secret vault
 --
 -- Stores ANY sensitive material the user wants protected: social-media
@@ -2930,24 +2976,153 @@ class DB:
 
     def snapshot_save(self, profile_name: str, cookies: list, storage: dict,
                       *, run_id: int = None, trigger: str = "manual",
-                      reason: str = None) -> int:
-        """Freeze the current cookie + storage state. Returns new row id."""
+                      reason: str = None,
+                      country: str = None, category: str = None) -> int:
+        """Freeze the current cookie + storage state. Returns new row id.
+
+        country/category tag the snapshot for cross-profile pool reuse.
+        Both auto-derived from the source profile's metadata when not
+        explicitly given:
+          - country  = profile's expected_country / proxy country
+          - category = first non-system tag, or "general"
+        Allows snapshot_pool_pick_best() to find a snapshot
+        appropriate for a freshly-created profile of the same locale.
+        """
         cookies_json = json.dumps(cookies or [], ensure_ascii=False)
         storage_json = json.dumps(storage or {}, ensure_ascii=False)
         domains = {c.get("domain") for c in (cookies or []) if c.get("domain")}
         size = len(cookies_json) + len(storage_json)
+
+        # Auto-derive country/category if not given. Cheap reads --
+        # profile_meta_get returns dict or {}.
+        if (country is None or category is None) and profile_name:
+            try:
+                meta = self.profile_meta_get(profile_name) or {}
+                if country is None:
+                    country = (
+                        meta.get("expected_country")
+                        or self.config_get("browser.expected_country")
+                        or None
+                    )
+                if category is None:
+                    tags = meta.get("tags") or []
+                    if isinstance(tags, list):
+                        # First non-system tag wins; otherwise "general"
+                        for t in tags:
+                            ts = str(t).strip()
+                            if ts and not ts.startswith("__"):
+                                category = ts.lower()
+                                break
+                    if not category:
+                        category = "general"
+            except Exception:
+                pass
+        if not category:
+            category = "general"
+
+        # Defensive ALTER -- in case the table predates these columns.
+        # ALTER TABLE ... ADD COLUMN is idempotent only via try/except;
+        # SQLite has no IF NOT EXISTS for ADD COLUMN.
         conn = self._get_conn()
+        for col in ("country TEXT", "category TEXT"):
+            try:
+                conn.execute(f"ALTER TABLE cookie_snapshots ADD COLUMN {col}")
+            except Exception:
+                pass
+
         with conn:
             cur = conn.execute("""
                 INSERT INTO cookie_snapshots (
                     profile_name, run_id, trigger, cookies_json, storage_json,
-                    cookie_count, domain_count, bytes, reason
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    cookie_count, domain_count, bytes, reason,
+                    country, category
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 profile_name, run_id, trigger, cookies_json, storage_json,
                 len(cookies or []), len(domains), size, reason,
+                country, category,
             ))
             return cur.lastrowid
+
+    def snapshot_pool_list(self, *, country: str = None,
+                           category: str = None,
+                           exclude_profile: str = None,
+                           min_cookies: int = 5,
+                           limit: int = 50) -> list[dict]:
+        """List snapshots across ALL profiles, filtered for cross-profile
+        injection. Excludes the given profile (so a fresh profile_05
+        doesn't get its own empty snapshot suggested back).
+
+        Sort: largest cookie_count first (more cookies = more
+        third-party signals for Google), then most recent. min_cookies
+        defaults to 5 so we don't suggest snapshots from profiles
+        that never got past the consent screen.
+        """
+        conn = self._get_conn()
+        # Make sure migration columns exist before SELECT
+        for col in ("country TEXT", "category TEXT"):
+            try:
+                conn.execute(f"ALTER TABLE cookie_snapshots ADD COLUMN {col}")
+            except Exception:
+                pass
+
+        where = ["cookie_count >= ?"]
+        params: list = [int(min_cookies)]
+        if country:
+            where.append("(country = ? OR country IS NULL)")
+            params.append(country)
+        if category:
+            where.append("(category = ? OR category IS NULL)")
+            params.append(category)
+        if exclude_profile:
+            where.append("profile_name != ?")
+            params.append(exclude_profile)
+
+        sql = f"""
+            SELECT id, profile_name, created_at, trigger,
+                   cookie_count, domain_count, bytes, country, category
+            FROM cookie_snapshots
+            WHERE {' AND '.join(where)}
+            ORDER BY cookie_count DESC, created_at DESC
+            LIMIT ?
+        """
+        params.append(int(limit))
+        rows = conn.execute(sql, tuple(params)).fetchall()
+        return [dict(r) for r in rows]
+
+    def snapshot_pool_pick_best(self, *, country: str = None,
+                                category: str = None,
+                                exclude_profile: str = None) -> Optional[dict]:
+        """Best single snapshot for cross-profile injection.
+
+        Strategy: prefer exact (country, category) match, fall back
+        to country-only, then category-only, then any. Returns the
+        full snapshot dict (parsed cookies + storage) ready for
+        write_to_session_dir().
+        """
+        # Tier 1: exact match
+        rows = self.snapshot_pool_list(
+            country=country, category=category,
+            exclude_profile=exclude_profile, limit=1,
+        )
+        if not rows and country:
+            # Tier 2: country only
+            rows = self.snapshot_pool_list(
+                country=country, exclude_profile=exclude_profile, limit=1,
+            )
+        if not rows and category:
+            # Tier 3: category only
+            rows = self.snapshot_pool_list(
+                category=category, exclude_profile=exclude_profile, limit=1,
+            )
+        if not rows:
+            # Tier 4: any
+            rows = self.snapshot_pool_list(
+                exclude_profile=exclude_profile, limit=1,
+            )
+        if not rows:
+            return None
+        return self.snapshot_get(rows[0]["id"])
 
     def snapshot_list(self, profile_name: str, limit: int = 50) -> list[dict]:
         """List snapshots for a profile (summary — no full cookie JSON)."""
@@ -3006,6 +3181,168 @@ class DB:
             "total_bytes":   d.get("total_bytes") or 0,
             "last_at":       d.get("last_at"),
         }
+
+    # ──────────────────────────────────────────────────────────
+    # EXTENSIONS — pool catalogue + per-profile assignment
+    # ──────────────────────────────────────────────────────────
+    # Each extension is stored once in data/extensions_pool/<id>/ and
+    # referenced by N profiles via profile_extensions. Runtime reads
+    # the assignment list at launch and constructs the Chrome
+    # --load-extension flag from pool paths.
+
+    def extension_create(self, *, ext_id: str, name: str, pool_path: str,
+                         description: str = None, version: str = None,
+                         source: str = "manual_unpacked",
+                         source_url: str = None,
+                         manifest_json: str = None,
+                         icon_b64: str = None,
+                         permissions_summary: str = None,
+                         auto_install_for_new: bool = False) -> str:
+        """Insert or replace a pool extension. Returns id.
+
+        Replace semantics: re-uploading the same id (e.g. updating an
+        extension to a newer version) overwrites metadata in place
+        rather than failing on UNIQUE collision. The pool dir is
+        managed by the helper module — DB just tracks the path.
+        """
+        conn = self._get_conn()
+        with conn:
+            conn.execute("""
+                INSERT OR REPLACE INTO extensions (
+                    id, name, description, version, source, source_url,
+                    pool_path, manifest_json, icon_b64,
+                    permissions_summary, is_enabled, auto_install_for_new,
+                    created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?,
+                    COALESCE((SELECT created_at FROM extensions WHERE id = ?),
+                             datetime('now')),
+                    datetime('now'))
+            """, (ext_id, name, description, version, source, source_url,
+                  pool_path, manifest_json, icon_b64,
+                  permissions_summary,
+                  1 if auto_install_for_new else 0,
+                  ext_id))
+        return ext_id
+
+    def extension_list(self) -> list[dict]:
+        """All pool extensions + per-extension profile-usage count."""
+        rows = self._get_conn().execute("""
+            SELECT e.*,
+                   (SELECT COUNT(*) FROM profile_extensions pe
+                     WHERE pe.extension_id = e.id) AS profile_count
+              FROM extensions e
+             ORDER BY e.created_at DESC
+        """).fetchall()
+        return [dict(r) for r in rows]
+
+    def extension_get(self, ext_id: str) -> Optional[dict]:
+        row = self._get_conn().execute(
+            "SELECT * FROM extensions WHERE id = ?", (ext_id,)
+        ).fetchone()
+        if not row:
+            return None
+        out = dict(row)
+        # Add the profiles that use this one for the detail panel
+        prof_rows = self._get_conn().execute(
+            "SELECT profile_name, enabled FROM profile_extensions "
+            "WHERE extension_id = ? ORDER BY profile_name", (ext_id,)
+        ).fetchall()
+        out["profiles"] = [dict(r) for r in prof_rows]
+        return out
+
+    def extension_delete(self, ext_id: str) -> bool:
+        """Remove a pool extension. Cascades to profile_extensions
+        via FK constraint. The actual pool dir is removed by the
+        caller (helper module) — the DB only tracks metadata."""
+        conn = self._get_conn()
+        with conn:
+            cur = conn.execute("DELETE FROM extensions WHERE id = ?", (ext_id,))
+            return (cur.rowcount or 0) > 0
+
+    def extension_update_meta(self, ext_id: str, **fields) -> bool:
+        """Partial update -- only is_enabled / auto_install_for_new / name
+        / description are mutable. Other fields come from the manifest
+        and shouldn't be edited directly."""
+        allowed = {"is_enabled", "auto_install_for_new",
+                   "name", "description"}
+        updates = {k: v for k, v in fields.items() if k in allowed}
+        if not updates:
+            return False
+        sets = ", ".join(f"{k} = ?" for k in updates)
+        params = list(updates.values()) + [ext_id]
+        conn = self._get_conn()
+        with conn:
+            cur = conn.execute(
+                f"UPDATE extensions SET {sets}, "
+                f"updated_at = datetime('now') WHERE id = ?",
+                params,
+            )
+            return (cur.rowcount or 0) > 0
+
+    # ── Per-profile assignment ────────────────────────────────────
+
+    def profile_extensions_get(self, profile_name: str,
+                               only_enabled: bool = True) -> list[dict]:
+        """Return assigned extensions for a profile, joined with the
+        pool entry so the runtime gets pool_path in one query.
+
+        only_enabled=True (default): omit rows where either
+        profile_extensions.enabled=0 OR extensions.is_enabled=0.
+        Runtime callers use this; UI uses only_enabled=False to
+        show disabled rows too.
+        """
+        sql = """
+            SELECT pe.profile_name, pe.extension_id, pe.enabled,
+                   pe.installed_at,
+                   e.name, e.version, e.pool_path, e.is_enabled,
+                   e.icon_b64, e.permissions_summary, e.source
+              FROM profile_extensions pe
+              JOIN extensions e ON e.id = pe.extension_id
+             WHERE pe.profile_name = ?
+        """
+        if only_enabled:
+            sql += " AND pe.enabled = 1 AND e.is_enabled = 1"
+        sql += " ORDER BY e.name"
+        rows = self._get_conn().execute(sql, (profile_name,)).fetchall()
+        return [dict(r) for r in rows]
+
+    def profile_extensions_set(self, profile_name: str,
+                               extension_id: str,
+                               enabled: bool = True) -> None:
+        """Assign extension to profile (or update enabled flag)."""
+        conn = self._get_conn()
+        with conn:
+            conn.execute("""
+                INSERT OR REPLACE INTO profile_extensions (
+                    profile_name, extension_id, enabled, installed_at
+                ) VALUES (?, ?, ?,
+                    COALESCE((SELECT installed_at FROM profile_extensions
+                              WHERE profile_name = ? AND extension_id = ?),
+                             NULL))
+            """, (profile_name, extension_id, 1 if enabled else 0,
+                  profile_name, extension_id))
+
+    def profile_extensions_remove(self, profile_name: str,
+                                  extension_id: str) -> bool:
+        conn = self._get_conn()
+        with conn:
+            cur = conn.execute(
+                "DELETE FROM profile_extensions "
+                "WHERE profile_name = ? AND extension_id = ?",
+                (profile_name, extension_id),
+            )
+            return (cur.rowcount or 0) > 0
+
+    def profile_extensions_mark_installed(self, profile_name: str,
+                                          extension_id: str) -> None:
+        """Stamp installed_at = now. Runtime calls this after verifying
+        an extension's pool path exists at launch (pre-flight)."""
+        self._get_conn().execute(
+            "UPDATE profile_extensions SET installed_at = datetime('now') "
+            "WHERE profile_name = ? AND extension_id = ?",
+            (profile_name, extension_id),
+        )
+        self._get_conn().commit()
 
     # ──────────────────────────────────────────────────────────
     # VAULT ITEMS — credential / wallet / secret vault records
@@ -3357,12 +3694,19 @@ class DB:
         silently so callers don't have to care about schema drift.
 
         Accepts: tags (list), proxy_url, proxy_is_rotating,
-        rotation_api_url, rotation_provider, rotation_api_key, notes.
+        rotation_api_url, rotation_provider, rotation_api_key, notes,
+        use_script_on_launch, script_id.
         """
         allowed = {
             "tags", "proxy_url", "proxy_is_rotating",
             "rotation_api_url", "rotation_provider", "rotation_api_key",
             "notes",
+            # use_script_on_launch + script_id were silently dropped
+            # by the previous whitelist -- so when the Profile page's
+            # Save button POSTed {use_script_on_launch: 1}, nothing
+            # changed in DB. The toggle appeared to "work" only on the
+            # frontend's optimistic state, then reverted on reload.
+            "use_script_on_launch", "script_id",
         }
         updates = {k: v for k, v in fields.items() if k in allowed}
         if not updates:
@@ -3415,7 +3759,6 @@ class DB:
         return {
             "url":              _pick("proxy_url",        "proxy.url", ""),
             "is_rotating":      bool(_pick("proxy_is_rotating", "proxy.is_rotating", True)),
-            "rotation_api_url": _pick("rotation_api_url", "proxy.rotation_api_url"),
             "rotation_provider":_pick("rotation_provider","proxy.rotation_provider", "none"),
             "rotation_api_key": _pick("rotation_api_key", "proxy.rotation_api_key"),
         }

@@ -315,10 +315,84 @@
         <div class="profile-fp-summary-meta" id="profile-session-meta"></div>
       </div>
       <div style="display: flex; gap: 6px;">
+        <button class="btn btn-secondary btn-small"
+                id="profile-cookie-pool-btn"
+                title="Inject cookies from another profile's snapshot">
+          🍯 Inject from pool
+        </button>
         <a href="#" data-nav="session" class="btn btn-primary btn-small"
            id="profile-session-open-btn">
           Open session manager →
         </a>
+      </div>
+    </div>
+  </div>
+
+  <!-- Cookie pool injection modal. Shows: auto-pick recommendation
+       (highest-priority match for this profile's country/category),
+       full filtered list, manual snapshot picker. Browserless --
+       writes to target profile's session_dir/cookies.json which the
+       next launch reads via existing CDP session-restore. -->
+  <div class="profile-modal" id="cookie-pool-modal" style="display:none;">
+    <div class="profile-modal-backdrop" data-close="cookie-pool-modal"></div>
+    <div class="profile-modal-content" style="width: 720px; max-width: 92vw;">
+      <div class="profile-modal-header">
+        <div class="profile-modal-title">🍯 Inject cookies from pool</div>
+        <button class="profile-modal-close" data-close="cookie-pool-modal">×</button>
+      </div>
+      <div class="profile-modal-body" id="cookie-pool-modal-body">
+        Loading…
+      </div>
+      <div class="profile-modal-footer">
+        <button class="btn btn-secondary" data-close="cookie-pool-modal">Cancel</button>
+        <button class="btn btn-primary" id="cookie-pool-inject-btn" disabled>
+          Inject selected
+        </button>
+      </div>
+    </div>
+  </div>
+
+  <!-- ─── EXTENSIONS ─────────────────────────────────────────
+       Per-profile assignment from the shared Extensions pool. Chips
+       show what's currently assigned; "+ Add" opens a picker that
+       toggles assignments. Extension data (Local Storage / IndexedDB
+       / settings) lives in user-data-dir so wallets stay isolated. -->
+  <div class="card profile-ext-card">
+    <div class="card-title">
+      🧩 Extensions
+      <span class="muted">— auto-installed at launch (data persists per profile)</span>
+      <div style="margin-left: auto; display: flex; gap: 6px;">
+        <a href="#" data-nav="extensions" class="btn btn-secondary btn-small"
+           id="profile-ext-manage-btn">Manage pool →</a>
+        <button class="btn btn-primary btn-small" id="profile-ext-add-btn">
+          + Add from pool
+        </button>
+      </div>
+    </div>
+    <div class="profile-ext-chips" id="profile-ext-chips">
+      <span class="muted" style="font-size: 12px;">Loading…</span>
+    </div>
+    <div class="form-hint" id="profile-ext-hint" style="margin-bottom: 0;">
+      Each assigned extension is loaded with <code>--load-extension</code>
+      every time this profile launches. To install new extensions into the
+      pool first, head to the <a href="#" data-nav="extensions" class="inline-link">Extensions page</a>.
+    </div>
+  </div>
+
+  <!-- Add-from-pool modal — picker grid of all enabled pool entries
+       with chips that toggle on click. Saves on each click immediately. -->
+  <div class="profile-modal" id="profile-ext-modal" style="display:none;">
+    <div class="profile-modal-backdrop" data-close="profile-ext-modal"></div>
+    <div class="profile-modal-content" style="width: 720px; max-width: 92vw;">
+      <div class="profile-modal-header">
+        <div class="profile-modal-title">🧩 Extensions for this profile</div>
+        <button class="profile-modal-close" data-close="profile-ext-modal">×</button>
+      </div>
+      <div class="profile-modal-body" id="profile-ext-modal-body">
+        Loading pool…
+      </div>
+      <div class="profile-modal-footer">
+        <button class="btn btn-secondary" data-close="profile-ext-modal">Done</button>
       </div>
     </div>
   </div>

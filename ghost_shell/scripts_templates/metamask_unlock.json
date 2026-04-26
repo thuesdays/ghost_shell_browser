@@ -1,0 +1,39 @@
+{
+  "name": "MetaMask — unlock wallet",
+  "description": "Opens MetaMask's popup in a new tab and unlocks it with a password from the credential vault. Pattern is reusable for OKX, Phantom, and other wallets — just swap extension_id and the unlock-button selector. Requires: (1) MetaMask installed in the pool and assigned to this profile, (2) a Vault item with the wallet's password (referenced as {vault.<id>.password}). The unlock state lives in the extension's IndexedDB inside the profile's user-data-dir, so this only needs to run after fresh launches.",
+  "category": "wallet",
+  "tags": ["metamask", "wallet", "extension", "crypto"],
+  "flow": [
+    {
+      "type": "open_extension_popup",
+      "extension_name": "MetaMask",
+      "wait_for_selector": "input[type='password'], [data-testid='unlock-password']",
+      "timeout": 20,
+      "save_handle_as": "ext_tab"
+    },
+    {
+      "type": "extension_fill",
+      "selector": "input[type='password'], [data-testid='unlock-password']",
+      "value": "{vault.metamask_main.password}",
+      "clear_first": true,
+      "typewriter": true
+    },
+    {
+      "type": "extension_click",
+      "selector": "[data-testid='unlock-submit'], button[type='submit']"
+    },
+    {
+      "type": "extension_wait_for",
+      "selector": "[data-testid='account-menu-icon'], [data-testid='multichain-account-menu-popover-list']",
+      "timeout": 15
+    },
+    {
+      "type": "extension_eval",
+      "code": "return window?.ethereum?.selectedAddress || (document.querySelector('[data-testid=\"account-menu-icon\"]') ? 'unlocked' : 'unknown');",
+      "save_as": "wallet_state"
+    },
+    {
+      "type": "extension_close"
+    }
+  ]
+}

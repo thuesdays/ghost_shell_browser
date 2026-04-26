@@ -65,6 +65,20 @@ const Profiles = {
 
     $("#reload-profiles-btn").addEventListener("click", () => this.reload());
     $("#btn-create-profile").addEventListener("click", () => CreateProfileModal.open());
+    $("#btn-bulk-create-profile").addEventListener("click", () => this._openBulkCreateModal());
+
+    // Modal close handlers (idempotent)
+    document.querySelectorAll('[data-close="bulk-create-modal"]').forEach(el => {
+      el.addEventListener("click", () => {
+        const m = document.getElementById("bulk-create-modal");
+        if (m) m.style.display = "none";
+      });
+    });
+    const bcSubmit = document.getElementById("bc-submit-btn");
+    if (bcSubmit && bcSubmit.dataset._wired !== "1") {
+      bcSubmit.dataset._wired = "1";
+      bcSubmit.addEventListener("click", () => this._bulkCreateSubmit());
+    }
     $("#column-picker-btn").addEventListener("click", (e) => {
       e.stopPropagation();
       const dd = $("#column-picker-dropdown");
@@ -121,6 +135,177 @@ const Profiles = {
     if (this._statusTimer) {
       clearInterval(this._statusTimer);
       this._statusTimer = null;
+    }
+  },
+
+  // ── Bulk-create modal ───────────────────────────────────────
+  // Opens the modal pre-populated with proxy + script options
+  // pulled live from the backend. Submit hits /api/profiles/bulk
+  // and renders a partial-success summary in the status box.
+  async _openBulkCreateModal() {
+    const modal = document.getElementById("bulk-create-modal");
+    if (!modal) return;
+    modal.style.display = "";
+    const status = document.getElementById("bc-status");
+    if (status) { status.style.display = "none"; status.innerHTML = ""; }
+    document.getElementById("bc-submit-btn").disabled = false;
+
+    // Populate proxy pool dropdown
+    const psel = document.getElementById("bc-proxy-pool");
+    if (psel) {
+      psel.innerHTML = `<option disabled>Loading…</option>`;
+      try {
+        const pr = await api("/api/proxies");
+        const list = pr?.proxies || pr || [];
+        if (!list.length) {
+          psel.innerHTML = `<option disabled>(no proxies in library)</option>`;
+        } else {
+          psel.innerHTML = list.map(p => {
+            const tag = p.is_rotating ? " (rotating)" : "";
+            const country = p.last_country ? ` · ${escapeHtml(p.last_country)}` : "";
+            return `<option value="${p.id}">${escapeHtml(p.name || p.url || ("#"+p.id))}${tag}${country}</option>`;
+          }).join("");
+        }
+      } catch (e) {
+        psel.innerHTML = `<option disabled>(load failed)</option>`;
+      }
+    }
+
+    // Populate script dropdown
+    const ssel = document.getElementById("bc-script");
+    if (ssel) {
+      try {
+        const r = await api("/api/scripts");
+        const list = r?.scripts || r || [];
+        ssel.innerHTML = `<option value="">— don't bind any script —</option>` +
+          list.map(s => `<option value="${s.id}">${escapeHtml(s.name)}${s.is_default ? " ★" : ""}</option>`).join("");
+      } catch (e) {
+        // keep the default option
+      }
+    }
+  },
+
+  async _bulkCreateSubmit() {
+    const btn    = document.getElementById("bc-submit-btn");
+    const status = document.getElementById("bc-status");
+
+    const prefix = (document.getElementById("bc-prefix")?.value || "").trim();
+    const count  = parseInt(document.getElementById("bc-count")?.value || "10", 10);
+    const start  = parseInt(document.getElementById("bc-start")?.value || "1", 10);
+    const lang   = (document.getElementById("bc-lang")?.value || "uk-UA").trim();
+    const tpl    = document.getElementById("bc-template")?.value || "auto";
+    const psel   = document.getElementById("bc-proxy-pool");
+    const ssel   = document.getElementById("bc-script");
+    const tagsRaw = (document.getElementById("bc-tags")?.value || "").trim();
+    const skip   = !!document.getElementById("bc-skip-cookies")?.checked;
+
+    if (!prefix || !/^[A-Za-z0-9_\-]+$/.test(prefix)) {
+      toast("Name prefix is required (letters/digits/_- only)", true);
+      return;
+    }
+    if (!count || count < 1 || count > 100) {
+      toast("Count must be 1-100", true);
+      return;
+    }
+
+    const proxyPool = psel
+      ? Array.from(psel.selectedOptions).map(o => parseInt(o.value, 10)).filter(Boolean)
+      : [];
+    const scriptId = ssel?.value ? parseInt(ssel.value, 10) : null;
+    const tags = tagsRaw
+      ? tagsRaw.split(",").map(s => s.trim()).filter(Boolean)
+      : [];
+
+    const ok = await confirmDialog({
+      title:        `Create ${count} profiles?`,
+      message:      `This will create ${count} profiles with prefix "${prefix}", ` +
+                    (proxyPool.length ? `${proxyPool.length} proxies round-robin, ` : "no proxy assignment, ") +
+                    (scriptId ? "1 script bound, " : "no script bound, ") +
+                    `${tags.length ? tags.length + ' tags applied. ' : 'no tags. '}` +
+                    `Cookie pool: ${skip ? "disabled" : "auto-inject if matching snapshot exists"}.`,
+      confirmText:  `Create ${count}`,
+      confirmStyle: "primary",
+    });
+    if (!ok) return;
+
+    btn.disabled = true;
+    btn.textContent = "⏳ Creating…";
+    if (status) {
+      status.style.display = "";
+      status.innerHTML = `<div>Submitting bulk request… (this can take 5-30s for large batches)</div>`;
+    }
+
+    try {
+      const r = await api("/api/profiles/bulk", {
+        method: "POST",
+        body: JSON.stringify({
+          count, name_prefix: prefix, start_index: start,
+          template:    tpl,
+          language:    lang,
+          proxy_pool:  proxyPool.length ? proxyPool : null,
+          script_id:   scriptId,
+          tags:        tags,
+          skip_cookie_pool: skip,
+        }),
+      });
+
+      const created = r?.created || [];
+      const failed  = r?.failed  || [];
+      const lines = [];
+      lines.push(`<div><strong>Created ${created.length}</strong> profile(s)${failed.length ? `, <strong style="color:var(--critical,#ef4444)">${failed.length} failed</strong>` : ""}.</div>`);
+      if (created.length) {
+        lines.push(`<details style="margin-top:8px;"><summary>Show created (${created.length})</summary>`);
+        lines.push(`<div style="max-height:200px; overflow-y:auto; margin-top:6px;">`);
+        for (const c of created) {
+          const cookieBit = c.cookie_pool
+            ? ` · 🍯 ${c.cookie_pool.injected} cookies`
+            : "";
+          lines.push(`<div>✓ ${escapeHtml(c.name)} <span class="muted">(${escapeHtml(c.template || "?")})${cookieBit}</span></div>`);
+        }
+        lines.push(`</div></details>`);
+      }
+      if (failed.length) {
+        lines.push(`<details open style="margin-top:8px;"><summary style="color:var(--critical,#ef4444)">Failed (${failed.length})</summary>`);
+        for (const f of failed) {
+          lines.push(`<div>✗ ${escapeHtml(f.name)}: ${escapeHtml(f.error || "")}</div>`);
+        }
+        lines.push(`</details>`);
+      }
+      if (status) status.innerHTML = lines.join("");
+
+      toast(`✓ Created ${created.length} profile(s)${failed.length ? `, ${failed.length} failed` : ""}`,
+            failed.length > 0);
+      // Reload the table so new profiles appear
+      this.reload();
+
+      // Auto-close on full success after a short delay so the user
+      // can read the "Created N" line before the dialog disappears.
+      // If anything failed, leave open so they can review the errors.
+      if (created.length && !failed.length) {
+        setTimeout(() => {
+          const m = document.getElementById("bulk-create-modal");
+          if (m) m.style.display = "none";
+        }, 900);
+      } else if (failed.length) {
+        // On partial / total failure: turn the submit button into a
+        // close button so the modal can still be dismissed without
+        // forcing the user to hit Cancel + lose the error details.
+        btn.disabled = false;
+        btn.textContent = "Close";
+        btn.onclick = () => {
+          const m = document.getElementById("bulk-create-modal");
+          if (m) m.style.display = "none";
+          btn.onclick = null;
+          btn.textContent = "⚡ Create profiles";
+        };
+        return;  // skip the finally block's reset
+      }
+    } catch (e) {
+      if (status) status.innerHTML = `<div style="color:var(--critical,#ef4444)">Error: ${escapeHtml(e.message || e)}</div>`;
+      toast("Bulk create failed: " + (e.message || e), true);
+    } finally {
+      btn.disabled = false;
+      btn.textContent = "⚡ Create profiles";
     }
   },
 

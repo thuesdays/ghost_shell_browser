@@ -89,6 +89,7 @@
         <div class="canvas-toolbar">
           <div class="canvas-toolbar-info">
             <span class="canvas-chip"><span class="chip-dot dot-flow"></span>flow</span>
+            <span class="canvas-chip"><span class="chip-dot dot-ads"></span>ads</span>
             <span class="canvas-chip"><span class="chip-dot dot-nav"></span>navigation</span>
             <span class="canvas-chip"><span class="chip-dot dot-int"></span>interaction</span>
             <span class="canvas-chip"><span class="chip-dot dot-data"></span>data</span>
@@ -96,6 +97,19 @@
           </div>
           <div class="canvas-stats" id="canvas-stats">
             <span><strong id="stat-total-count">0</strong> steps</span>
+            <!-- Figma-style zoom controls. Ctrl/Cmd+wheel inside the
+                 canvas zooms; these buttons are the discoverability
+                 affordance + a quick way to reset to 100%. -->
+            <span class="canvas-zoom-ctrls" id="canvas-zoom-ctrls"
+                  title="Ctrl/Cmd + scroll inside canvas to zoom">
+              <button class="canvas-zoom-btn" id="canvas-zoom-out"
+                      type="button" title="Zoom out (Ctrl+-)">−</button>
+              <span class="canvas-zoom-level" id="canvas-zoom-level">100%</span>
+              <button class="canvas-zoom-btn" id="canvas-zoom-in"
+                      type="button" title="Zoom in (Ctrl++)">+</button>
+              <button class="canvas-zoom-btn" id="canvas-zoom-reset"
+                      type="button" title="Reset to 100% (Ctrl+0)">⌂</button>
+            </span>
           </div>
         </div>
 

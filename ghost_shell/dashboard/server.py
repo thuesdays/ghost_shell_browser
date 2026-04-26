@@ -519,6 +519,212 @@ def api_config_set():
 # API: STATS
 # ──────────────────────────────────────────────────────────────
 
+@app.route("/api/metrics/ad-density", methods=["GET"])
+def api_metrics_ad_density():
+    """Ad density trend metrics for the dashboard widget.
+
+    Without this metric the user can't tell whether algo improvements
+    (commercial_inflate, deep_dive, comparison-scan, geo-warmup, etc.)
+    are actually moving the needle or we're just optimising in
+    isolation. Returns:
+
+      summary:
+        avg_ads_per_query_7d   - rolling 7-day average
+        avg_ads_per_query_24h  - last 24h
+        delta_pct              - 7d vs preceding 7d (% change)
+        total_runs_7d          - sample size
+        total_clicks_7d        - from action_events (click_ad type)
+        ctr_7d                 - clicks / ads_seen (proxy for CTR)
+      daily:
+        [{date, runs, ads, queries, ads_per_query}, ...] last 14 days
+      per_profile:
+        [{profile_name, ads_per_query, runs}, ...] last 7d, top 10
+      per_ip:
+        [{ip, country, runs, ads_per_query}, ...] last 7d, top 10
+
+    Designed so the frontend just plots .daily as a sparkline + shows
+    summary as headline numbers + lists per_profile / per_ip as
+    drill-down tables.
+    """
+    db = get_db()
+    conn = db._get_conn()
+    from datetime import datetime, timedelta as _td
+
+    now = datetime.now()
+    cutoff_7d  = (now - _td(days=7)).isoformat(timespec="seconds")
+    cutoff_14d = (now - _td(days=14)).isoformat(timespec="seconds")
+    cutoff_24h = (now - _td(hours=24)).isoformat(timespec="seconds")
+    cutoff_prev_7d = (now - _td(days=14)).isoformat(timespec="seconds")
+    end_prev_7d    = cutoff_7d  # the "previous week" ends where current week begins
+
+    def _avg_density(start: str, end: str = None) -> tuple[float, int, int, int]:
+        """Returns (ads_per_query, total_runs, total_ads, total_queries)
+        for runs.started_at in [start, end?). end=None -> open-ended."""
+        if end:
+            row = conn.execute("""
+                SELECT
+                    COUNT(*) AS runs,
+                    COALESCE(SUM(total_ads),     0) AS ads,
+                    COALESCE(SUM(total_queries), 0) AS queries
+                FROM runs
+                WHERE started_at >= ? AND started_at < ?
+                  AND finished_at IS NOT NULL
+            """, (start, end)).fetchone()
+        else:
+            row = conn.execute("""
+                SELECT
+                    COUNT(*) AS runs,
+                    COALESCE(SUM(total_ads),     0) AS ads,
+                    COALESCE(SUM(total_queries), 0) AS queries
+                FROM runs
+                WHERE started_at >= ?
+                  AND finished_at IS NOT NULL
+            """, (start,)).fetchone()
+        runs    = row["runs"]    or 0
+        ads     = row["ads"]     or 0
+        queries = row["queries"] or 0
+        per_q   = (ads / queries) if queries else 0.0
+        return (round(per_q, 2), runs, ads, queries)
+
+    avg_7d, runs_7d, ads_7d, q_7d = _avg_density(cutoff_7d)
+    avg_24h, _, _, _              = _avg_density(cutoff_24h)
+    avg_prev, runs_prev, _, _     = _avg_density(cutoff_prev_7d, end_prev_7d)
+    delta_pct = (
+        ((avg_7d - avg_prev) / avg_prev * 100) if avg_prev > 0 else None
+    )
+
+    # Click count (proxy for CTR) -- pulls from action_events if it
+    # exists, otherwise falls back to "0 clicks tracked yet".
+    clicks_7d = 0
+    try:
+        row = conn.execute("""
+            SELECT COUNT(*) AS n
+            FROM action_events
+            WHERE action_type = 'click_ad'
+              AND ts >= ?
+        """, (cutoff_7d,)).fetchone()
+        clicks_7d = (row["n"] if row else 0) or 0
+    except Exception:
+        # action_events table may not exist on older DBs
+        pass
+    ctr_7d = round(clicks_7d / ads_7d, 3) if ads_7d > 0 else 0.0
+
+    # Daily breakdown for the last 14 days (sparkline data)
+    daily_rows = conn.execute("""
+        SELECT substr(started_at, 1, 10) AS date,
+               COUNT(*)                   AS runs,
+               COALESCE(SUM(total_ads),     0) AS ads,
+               COALESCE(SUM(total_queries), 0) AS queries
+        FROM runs
+        WHERE started_at >= ?
+          AND finished_at IS NOT NULL
+        GROUP BY date
+        ORDER BY date
+    """, (cutoff_14d,)).fetchall()
+    daily = []
+    for r in daily_rows:
+        ads = r["ads"] or 0
+        qs  = r["queries"] or 0
+        daily.append({
+            "date":         r["date"],
+            "runs":         r["runs"] or 0,
+            "ads":          ads,
+            "queries":      qs,
+            "ads_per_query": round(ads / qs, 2) if qs else 0.0,
+        })
+
+    # Per-profile breakdown (top 10 by run count)
+    pp_rows = conn.execute("""
+        SELECT profile_name,
+               COUNT(*)                   AS runs,
+               COALESCE(SUM(total_ads),     0) AS ads,
+               COALESCE(SUM(total_queries), 0) AS queries
+        FROM runs
+        WHERE started_at >= ?
+          AND finished_at IS NOT NULL
+        GROUP BY profile_name
+        ORDER BY runs DESC
+        LIMIT 10
+    """, (cutoff_7d,)).fetchall()
+    per_profile = []
+    for r in pp_rows:
+        ads = r["ads"] or 0
+        qs  = r["queries"] or 0
+        per_profile.append({
+            "profile_name": r["profile_name"],
+            "runs":         r["runs"] or 0,
+            "ads":          ads,
+            "ads_per_query": round(ads / qs, 2) if qs else 0.0,
+        })
+
+    # Per-IP breakdown — guarded behind a column-exists check because
+    # older DB schemas (pre-geo-detect) didn't have runs.ip. We probe
+    # via PRAGMA so the metrics endpoint stays usable on every install
+    # rather than throwing OperationalError.
+    per_ip = []
+    has_ip_column = False
+    try:
+        cols = conn.execute("PRAGMA table_info(runs)").fetchall()
+        has_ip_column = any(
+            (c["name"] if isinstance(c, dict) else c[1]) == "ip"
+            for c in cols
+        )
+    except Exception:
+        has_ip_column = False
+
+    if has_ip_column:
+        try:
+            ip_rows = conn.execute("""
+                SELECT ip,
+                       COUNT(*)                   AS runs,
+                       COALESCE(SUM(total_ads),     0) AS ads,
+                       COALESCE(SUM(total_queries), 0) AS queries
+                FROM runs
+                WHERE started_at >= ?
+                  AND finished_at IS NOT NULL
+                  AND ip IS NOT NULL
+                GROUP BY ip
+                ORDER BY runs DESC
+                LIMIT 10
+            """, (cutoff_7d,)).fetchall()
+        except Exception as e:
+            logging.debug(f"[metrics] per-ip query failed: {e}")
+            ip_rows = []
+        for r in ip_rows:
+            ads = r["ads"] or 0
+            qs  = r["queries"] or 0
+            country = None
+            try:
+                ip_meta = db.ip_get(r["ip"]) if hasattr(db, "ip_get") else None
+                country = (ip_meta or {}).get("country")
+            except Exception:
+                pass
+            per_ip.append({
+                "ip":           r["ip"],
+                "country":      country,
+                "runs":         r["runs"] or 0,
+                "ads_per_query": round(ads / qs, 2) if qs else 0.0,
+            })
+
+    return jsonify({
+        "summary": {
+            "avg_ads_per_query_7d":  avg_7d,
+            "avg_ads_per_query_24h": avg_24h,
+            "avg_ads_per_query_prev_7d": avg_prev,
+            "delta_pct":             delta_pct,
+            "total_runs_7d":         runs_7d,
+            "total_ads_7d":          ads_7d,
+            "total_queries_7d":      q_7d,
+            "total_clicks_7d":       clicks_7d,
+            "ctr_7d":                ctr_7d,
+        },
+        "daily":       daily,
+        "per_profile": per_profile,
+        "per_ip":      per_ip,
+        "checked_at":  now.isoformat(timespec="seconds"),
+    })
+
+
 @app.route("/api/stats", methods=["GET"])
 def api_stats():
     db = get_db()
@@ -3041,6 +3247,165 @@ def api_profile_preview_fingerprint():
         return jsonify({"error": str(e)}), 500
 
 
+@app.route("/api/profiles/bulk", methods=["POST"])
+def api_profiles_bulk_create():
+    """Create N profiles in one shot. Each gets a unique fingerprint,
+    optional proxy from a round-robin pool, optional script binding,
+    and auto cookie-pool injection (same as single-create).
+
+    Body:
+        {
+          "count":         10,                          // 1-100
+          "name_prefix":   "ua_med_",                   // unique suffix appended
+          "start_index":   1,                           // suffix counter start
+          "template":      "auto" | "<id>" | null,      // FP template strategy
+          "language":      "uk-UA",
+          "proxy_pool":    [1, 2, 3] | null,            // proxy ids round-robin
+          "script_id":     5 | null,                    // script binding for all
+          "tags":          ["ua", "medical"],           // applied to each profile
+          "skip_cookie_pool": false
+        }
+
+    Returns: {ok, created: [...], failed: [{name, error}]}
+    Partial-success aware -- if 7 of 10 succeed, response shows what
+    worked and what didn't, not a blanket 500.
+    """
+    from ghost_shell.fingerprint.device_templates import DeviceTemplateBuilder
+
+    data = request.get_json(silent=True) or {}
+    count = max(1, min(100, int(data.get("count") or 1)))
+    prefix = (data.get("name_prefix") or "").strip()
+    if not prefix or not re.match(r"^[A-Za-z0-9_\-]+$", prefix):
+        return jsonify({
+            "error": "name_prefix is required and must be letters/digits/_-only"
+        }), 400
+    start_index   = int(data.get("start_index") or 1)
+    template      = data.get("template") or None
+    language      = data.get("language") or "uk-UA"
+    proxy_pool    = data.get("proxy_pool") or []
+    script_id     = data.get("script_id") or None
+    bulk_tags     = data.get("tags") or []
+    skip_cookies  = bool(data.get("skip_cookie_pool"))
+
+    if not isinstance(proxy_pool, list):
+        proxy_pool = []
+    if not isinstance(bulk_tags, list):
+        bulk_tags = []
+
+    db = get_db()
+    created: list = []
+    failed: list = []
+
+    # Find existing names to avoid collisions; we'll auto-bump
+    # start_index past any conflict.
+    try:
+        all_existing = {p.get("name") for p in db.profiles_list()}
+    except Exception:
+        all_existing = set()
+
+    idx = start_index
+    while len(created) + len(failed) < count:
+        # Build a name with zero-padded suffix (3 digits = up to 999)
+        # and skip past existing collisions.
+        name = f"{prefix}{idx:03d}"
+        idx += 1
+        if name in all_existing:
+            continue
+
+        try:
+            # 1. Generate unique fingerprint
+            tpl = template if template not in (None, "auto") else None
+            builder = DeviceTemplateBuilder(
+                profile_name       = name,
+                preferred_language = language,
+                force_template     = tpl,
+            )
+            payload = builder.generate_payload_dict()
+            db.fingerprint_save(name, payload)
+
+            # 2. Persist profile metadata (template + status)
+            if hasattr(db, "profile_save"):
+                db.profile_save(name, {
+                    "template_name":      payload.get("template_name"),
+                    "preferred_language": language,
+                    "enrich_on_create":   True,
+                    "status":             "ready",
+                })
+
+            # 3. Assign proxy from pool (round-robin)
+            assigned_proxy_id = None
+            if proxy_pool:
+                assigned_proxy_id = proxy_pool[
+                    (len(created) + len(failed)) % len(proxy_pool)
+                ]
+                try:
+                    if hasattr(db, "proxy_assign_to_profile"):
+                        db.proxy_assign_to_profile(name, int(assigned_proxy_id))
+                except Exception as e:
+                    logging.debug(f"[bulk] proxy assign failed for {name}: {e}")
+
+            # 4. Apply tags
+            if bulk_tags and hasattr(db, "profile_meta_upsert"):
+                try:
+                    db.profile_meta_upsert(name, tags=bulk_tags)
+                except Exception:
+                    pass
+
+            # 5. Bind script (auto-enables use_script_on_launch via
+            # the same path as single-profile Apply)
+            if script_id:
+                try:
+                    db.script_assign_to_profile(name, int(script_id))
+                except Exception as e:
+                    logging.debug(f"[bulk] script assign failed for {name}: {e}")
+
+            # 6. Create user-data dir
+            prof_dir = os.path.join(PROJECT_ROOT, "profiles", name)
+            os.makedirs(prof_dir, exist_ok=True)
+
+            # 7. Cookie pool injection (browserless)
+            pool_summary = None
+            if not skip_cookies:
+                try:
+                    from ghost_shell.session.cookie_pool import inject_to_profile_dir
+                    country = db.config_get("browser.expected_country") or None
+                    category = None
+                    for t in bulk_tags:
+                        ts = str(t).strip()
+                        if ts and not ts.startswith("__"):
+                            category = ts.lower(); break
+                    pool_summary = inject_to_profile_dir(
+                        target_profile=name,
+                        country=country, category=category,
+                        base_dir=os.path.join(PROJECT_ROOT, "profiles"),
+                    )
+                except Exception as e:
+                    pool_summary = {"ok": False, "error": str(e)}
+
+            created.append({
+                "name":       name,
+                "template":   payload.get("template_name"),
+                "proxy_id":   assigned_proxy_id,
+                "script_id":  script_id,
+                "tags":       bulk_tags,
+                "cookie_pool": (
+                    {"injected": pool_summary.get("cookies_written", 0)}
+                    if pool_summary and pool_summary.get("ok") else None
+                ),
+            })
+        except Exception as e:
+            failed.append({"name": name, "error": str(e)})
+            logging.warning(f"[bulk] create {name!r} failed: {e}")
+
+    return jsonify({
+        "ok":       len(created) > 0,
+        "count_created": len(created),
+        "count_failed":  len(failed),
+        "created":  created,
+        "failed":   failed,
+    })
+
+
 @app.route("/api/profiles", methods=["POST"])
 def api_profile_create():
     """
@@ -3104,8 +3469,51 @@ def api_profile_create():
         prof_dir = _os.path.join(PROJECT_ROOT, "profiles", name)
         _os.makedirs(prof_dir, exist_ok=True)
 
-        return jsonify({"ok": True, "name": name,
-                        "template": payload.get("template_name")})
+        # ── Cookie pool auto-injection (browserless) ─────────────
+        # If we have a snapshot in the pool tagged for this profile's
+        # country/category, write its cookies + storage to the new
+        # profile's session_dir. At first launch the existing
+        # session-restore code reads them and injects via CDP, so
+        # the profile starts looking aged on Google instead of cold.
+        # Opt-out via body {"skip_cookie_pool": true}.
+        pool_summary = None
+        if not data.get("skip_cookie_pool"):
+            try:
+                from ghost_shell.session.cookie_pool import inject_to_profile_dir
+                country = (
+                    db.config_get("browser.expected_country") or None
+                )
+                # Profile's first non-system tag as category, if any.
+                category = None
+                tags = data.get("tags") or []
+                if isinstance(tags, list):
+                    for t in tags:
+                        ts = str(t).strip()
+                        if ts and not ts.startswith("__"):
+                            category = ts.lower(); break
+                pool_summary = inject_to_profile_dir(
+                    target_profile=name,
+                    country=country,
+                    category=category,
+                    base_dir=_os.path.join(PROJECT_ROOT, "profiles"),
+                )
+                if pool_summary.get("ok"):
+                    logging.info(
+                        f"[profile-create] cookie pool injected: "
+                        f"{pool_summary.get('cookies_written')} cookies "
+                        f"from snapshot #{pool_summary.get('snapshot_id')} "
+                        f"({pool_summary.get('source_profile')!r})"
+                    )
+            except Exception as e:
+                logging.debug(f"[profile-create] pool inject skipped: {e}")
+                pool_summary = {"ok": False, "error": str(e)}
+
+        return jsonify({
+            "ok":          True,
+            "name":        name,
+            "template":    payload.get("template_name"),
+            "cookie_pool": pool_summary,
+        })
     except Exception as e:
         import traceback
         traceback.print_exc()
@@ -4536,6 +4944,378 @@ def api_proxies_delete(proxy_id):
     return jsonify({"ok": True})
 
 
+# ──────────────────────────────────────────────────────────────
+# EXTENSIONS — pool catalogue + per-profile assignment
+# ──────────────────────────────────────────────────────────────
+
+@app.route("/api/extensions", methods=["GET"])
+def api_extensions_list():
+    """List all pool extensions for the Extensions page grid."""
+    try:
+        rows = get_db().extension_list()
+        return jsonify({"extensions": rows, "count": len(rows)})
+    except Exception as e:
+        logging.exception("[ext] list failed")
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/extensions/<ext_id>", methods=["GET"])
+def api_extensions_get(ext_id: str):
+    """Single extension detail. Returned bare (not wrapped in
+    {"extension": ...}) so the dashboard JS can use it directly —
+    matches install_and_register's response shape."""
+    row = get_db().extension_get(ext_id)
+    if not row:
+        return jsonify({"error": "not found"}), 404
+    return jsonify(row)
+
+
+@app.route("/api/extensions/<ext_id>", methods=["DELETE"])
+def api_extensions_delete(ext_id: str):
+    """Remove an extension from the pool. Cascades to profile_extensions
+    via FK, and removes the on-disk pool dir."""
+    db = get_db()
+    row = db.extension_get(ext_id)
+    if not row:
+        return jsonify({"error": "not found"}), 404
+    try:
+        from ghost_shell.extensions.pool import remove_from_pool
+        remove_from_pool(ext_id)
+    except Exception as e:
+        logging.warning(f"[ext] pool dir removal failed: {e}")
+    db.extension_delete(ext_id)
+    return jsonify({"ok": True, "id": ext_id})
+
+
+@app.route("/api/extensions/<ext_id>", methods=["PATCH"])
+def api_extensions_update(ext_id: str):
+    """Patch mutable fields: is_enabled, auto_install_for_new, name,
+    description. Other fields are derived from manifest and read-only."""
+    data = request.get_json(silent=True) or {}
+    if not get_db().extension_get(ext_id):
+        return jsonify({"error": "not found"}), 404
+    ok = get_db().extension_update_meta(ext_id, **data)
+    if not ok:
+        return jsonify({"ok": False, "error": "no allowed fields in body"}), 400
+    return jsonify({"ok": True})
+
+
+@app.route("/api/extensions/upload", methods=["POST"])
+def api_extensions_upload():
+    """Upload a CRX file (.crx) or unpacked-extension zip (.zip).
+
+    multipart/form-data with field "file". The detection is by file
+    extension and CRX magic header — both autodetected so the user
+    doesn't need to declare the type.
+    """
+    f = request.files.get("file")
+    if not f or not f.filename:
+        return jsonify({"ok": False, "error": "no file uploaded"}), 400
+    name = f.filename
+    raw = f.read()
+
+    is_crx = (
+        name.lower().endswith(".crx")
+        or (len(raw) > 4 and raw[:4] == b"Cr24")
+    )
+    try:
+        from ghost_shell.extensions.pool import install_and_register
+        if is_crx:
+            result = install_and_register(
+                raw, source="manual_crx", source_url=name,
+            )
+        else:
+            # Treat as unpacked-zip
+            result = install_and_register(
+                raw, source="manual_unpacked", source_url=name,
+            )
+        return jsonify(result)
+    except Exception as e:
+        logging.exception("[ext] upload failed")
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@app.route("/api/extensions/install-cws", methods=["POST"])
+def api_extensions_install_cws():
+    """Install an extension from the Chrome Web Store by ID or URL.
+
+    Body: {"id_or_url": "cgcoblpapocaiplgmhlhgaipmddglngm"}
+    or:   {"id_or_url": "https://chromewebstore.google.com/detail/okx-wallet/cgcoblp..."}
+    """
+    data = request.get_json(silent=True) or {}
+    ref = (data.get("id_or_url") or data.get("id") or "").strip()
+    if not ref:
+        return jsonify({"ok": False, "error": "id_or_url is required"}), 400
+    try:
+        from ghost_shell.extensions.pool import (
+            install_from_cws, _extract_cws_id, install_and_register,
+        )
+        ext_id = _extract_cws_id(ref)
+        if not ext_id:
+            return jsonify({
+                "ok": False,
+                "error": "could not extract extension id from input",
+            }), 400
+        # Download CRX bytes via CWS update endpoint, then run through
+        # install_and_register so the DB row gets created (the helper
+        # install_from_cws does the unpack but doesn't write DB).
+        import requests
+        from ghost_shell.extensions.pool import _CWS_UPDATE_URL
+        url = _CWS_UPDATE_URL.format(ext_id=ext_id)
+        r = requests.get(url, timeout=30, allow_redirects=True)
+        if not r.ok or len(r.content) < 100:
+            return jsonify({
+                "ok": False,
+                "error": f"CWS download failed: HTTP {r.status_code}",
+            }), 502
+        result = install_and_register(
+            r.content, source="cws",
+            source_url=f"https://chromewebstore.google.com/detail/{ext_id}",
+        )
+        return jsonify(result)
+    except Exception as e:
+        logging.exception("[ext] CWS install failed")
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+# ──────────────────────────────────────────────────────────────
+# Per-profile extension assignment
+# ──────────────────────────────────────────────────────────────
+
+@app.route("/api/profiles/<name>/extensions", methods=["GET"])
+def api_profile_extensions_list(name: str):
+    """List extensions assigned to a profile (both enabled + disabled)."""
+    try:
+        rows = get_db().profile_extensions_get(name, only_enabled=False)
+        return jsonify({"extensions": rows, "count": len(rows)})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/profiles/<name>/extensions", methods=["POST"])
+def api_profile_extensions_set(name: str):
+    """Assign / re-enable an extension on a profile.
+    Body: {"extension_id": "...", "enabled": true}
+    """
+    data = request.get_json(silent=True) or {}
+    ext_id = (data.get("extension_id") or "").strip()
+    enabled = bool(data.get("enabled", True))
+    if not ext_id:
+        return jsonify({"error": "extension_id required"}), 400
+    db = get_db()
+    if not db.extension_get(ext_id):
+        return jsonify({"error": "extension not in pool"}), 404
+    db.profile_extensions_set(name, ext_id, enabled=enabled)
+    return jsonify({"ok": True})
+
+
+@app.route("/api/profiles/<name>/extensions/<ext_id>", methods=["DELETE"])
+def api_profile_extensions_remove(name: str, ext_id: str):
+    """Unassign an extension from a profile (does NOT delete the pool
+    extension itself; other profiles can still use it)."""
+    ok = get_db().profile_extensions_remove(name, ext_id)
+    return jsonify({"ok": ok})
+
+
+# ──────────────────────────────────────────────────────────────
+# Chrome Web Store search (best-effort scrape)
+# ──────────────────────────────────────────────────────────────
+
+@app.route("/api/extensions/cws-search", methods=["GET"])
+def api_extensions_cws_search():
+    """Search Chrome Web Store via best-effort HTML scrape.
+
+    CWS has no public search API. We hit the public search results
+    page and extract enough to render result cards (id, name, icon,
+    short description, rating). When CWS HTML changes (which happens
+    every few months) this can break — the user can always fall back
+    to direct ID input which always works.
+
+    Query: ?q=<keyword>
+    """
+    q = (request.args.get("q") or "").strip()
+    if not q:
+        return jsonify({"results": [], "error": "empty query"})
+    try:
+        import requests
+        import re as _re
+        import urllib.parse as _urlparse
+        url = f"https://chromewebstore.google.com/search/{_urlparse.quote(q)}"
+        r = requests.get(
+            url,
+            headers={
+                "User-Agent": (
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/147.0.7780.88 Safari/537.36"
+                ),
+                "Accept-Language": "en-US,en;q=0.9",
+            },
+            timeout=15,
+        )
+        if not r.ok:
+            return jsonify({
+                "results": [],
+                "error": f"CWS returned HTTP {r.status_code}",
+            })
+        html = r.text
+
+        # CWS embeds initial state in JSON inside the HTML. Look for
+        # extension-detail links — these reliably contain the 32-char
+        # extension id and the slug. Format: /detail/<slug>/<id>
+        # Matches the canonical chromewebstore.google.com URL shape.
+        results = []
+        seen = set()
+        # Each card has a link to /detail/<slug>/<id>
+        for m in _re.finditer(
+            r"/detail/([a-zA-Z0-9\-]+)/([a-p]{32})", html,
+        ):
+            slug, eid = m.group(1), m.group(2)
+            if eid in seen:
+                continue
+            seen.add(eid)
+            results.append({
+                "id":   eid,
+                "name": slug.replace("-", " ").title(),
+                "url":  f"https://chromewebstore.google.com/detail/{slug}/{eid}",
+            })
+            if len(results) >= 20:
+                break
+
+        return jsonify({"results": results, "count": len(results)})
+    except Exception as e:
+        logging.exception("[ext] CWS search failed")
+        return jsonify({"results": [], "error": str(e)}), 500
+
+
+# ──────────────────────────────────────────────────────────────
+# COOKIE POOL
+# ──────────────────────────────────────────────────────────────
+
+@app.route("/api/cookies/pool", methods=["GET"])
+def api_cookies_pool_list():
+    """List snapshots available for cross-profile injection.
+
+    Query params:
+      country         - filter by country tag (e.g. UA)
+      category        - filter by category (commerce, medical, etc)
+      exclude_profile - skip snapshots from this profile
+      min_cookies     - default 5
+      limit           - default 50
+
+    Sorted by cookie_count DESC then created_at DESC.
+    """
+    db = get_db()
+    rows = db.snapshot_pool_list(
+        country         = request.args.get("country") or None,
+        category        = request.args.get("category") or None,
+        exclude_profile = request.args.get("exclude_profile") or None,
+        min_cookies     = int(request.args.get("min_cookies") or 5),
+        limit           = int(request.args.get("limit") or 50),
+    )
+    return jsonify({"snapshots": rows, "count": len(rows)})
+
+
+@app.route("/api/cookies/pool/match", methods=["GET"])
+def api_cookies_pool_match():
+    """Preview which snapshot would be auto-picked for the given
+    country/category. Useful for the Profile page's "Inject from
+    pool" UI to show the user what they'd get before they confirm.
+    """
+    db = get_db()
+    snap = db.snapshot_pool_pick_best(
+        country         = request.args.get("country") or None,
+        category        = request.args.get("category") or None,
+        exclude_profile = request.args.get("exclude_profile") or None,
+    )
+    if not snap:
+        return jsonify({"match": None})
+    # Strip raw cookies/storage for preview -- caller uses the
+    # summary fields only. Full data is fetched at inject time.
+    return jsonify({"match": {
+        "id":            snap.get("id"),
+        "profile_name":  snap.get("profile_name"),
+        "created_at":    snap.get("created_at"),
+        "country":       snap.get("country"),
+        "category":      snap.get("category"),
+        "cookie_count":  snap.get("cookie_count"),
+        "domain_count":  snap.get("domain_count"),
+        "trigger":       snap.get("trigger"),
+    }})
+
+
+@app.route("/api/cookies/pool/inject", methods=["POST"])
+def api_cookies_pool_inject():
+    """Inject a snapshot into a target profile's session_dir.
+    Browserless: writes cookies.json + storage.json that the next
+    launch reads and applies via CDP.
+
+    Body: {target_profile, snapshot_id?, country?, category?}.
+    If snapshot_id is omitted, auto-picks via snapshot_pool_pick_best
+    using country + category filters.
+    """
+    data = request.get_json(silent=True) or {}
+    target = (data.get("target_profile") or "").strip()
+    if not target:
+        return jsonify({"ok": False, "error": "target_profile required"}), 400
+
+    if RUNNER_POOL.is_profile_running(target):
+        return jsonify({
+            "ok":    False,
+            "error": "target profile is currently running -- stop it first",
+        }), 409
+
+    try:
+        from ghost_shell.session.cookie_pool import inject_to_profile_dir
+        result = inject_to_profile_dir(
+            target_profile = target,
+            snapshot_id    = data.get("snapshot_id") or None,
+            country        = data.get("country") or None,
+            category       = data.get("category") or None,
+            base_dir       = os.path.join(PROJECT_ROOT, "profiles"),
+        )
+        return jsonify(result)
+    except Exception as e:
+        logging.exception("[cookie_pool] inject failed")
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@app.route("/api/proxy/test-url", methods=["POST"])
+def api_proxy_test_url():
+    """Test a proxy URL ad-hoc (no DB row required).
+
+    Used by the Profile detail page's Proxy override section, where
+    the user has typed a custom proxy URL but hasn't saved it as a
+    library row yet -- they want to verify it works before clicking
+    Save. Body: {"url": "http://user:pass@host:port"}.
+
+    Returns the same diagnostic shape as /api/proxies/<id>/test, just
+    without persisting anything to the proxies table.
+    """
+    data = request.get_json(silent=True) or {}
+    url = (data.get("url") or "").strip()
+    if not url:
+        return jsonify({"ok": False, "error": "url is required"}), 400
+    try:
+        from ghost_shell.proxy.diagnostics import test_proxy
+        diag = test_proxy(url, timeout=15)
+        # Flatten the diag dict into the response so the frontend
+        # doesn't need to descend an extra level. Matches the shape
+        # _testProxyOverride in profile-detail.js expects:
+        #   { ok, exit_ip, country, latency_ms, error? }
+        return jsonify({
+            "ok":         bool(diag.get("ok")),
+            "exit_ip":    diag.get("exit_ip") or diag.get("ip"),
+            "country":    diag.get("country") or diag.get("country_code"),
+            "latency_ms": diag.get("latency_ms"),
+            "error":      diag.get("error"),
+            "diag":       diag,
+        })
+    except Exception as e:
+        logging.exception("proxy test-url failed")
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
 @app.route("/api/proxies/<int:proxy_id>/test", methods=["POST"])
 def api_proxies_test(proxy_id):
     """Run a diagnostic probe through a single proxy and cache the
@@ -4551,6 +5331,7 @@ def api_proxies_test(proxy_id):
         db.proxy_record_diagnostics(proxy_id, diag)
         return jsonify({"ok": True, "diag": diag})
     except Exception as e:
+        logging.exception("proxy test failed")
         logging.exception("proxy test failed")
         return jsonify({
             "ok": False,
@@ -6029,6 +6810,49 @@ if __name__ == "__main__":
     _phase("init  : cleanup_orphan_config_keys")
     cleanup_orphan_config_keys()
     _phase("ok    : orphan keys cleaned")
+
+    # One-shot pool repair: walk every extension in data/extensions_pool/
+    # and apply _ensure_default_locale + _sanitize_match_patterns to its
+    # manifest. Fixes pool entries installed before those checks landed
+    # so the user doesn't have to re-install. Runs synchronously on
+    # startup; cheap (~10ms per extension).
+    _phase("init  : extension pool manifest repair")
+    try:
+        from ghost_shell.extensions.pool import (
+            parse_manifest, _ensure_default_locale,
+            _sanitize_match_patterns, _ensure_required_fields,
+        )
+        import json as _json_repair
+        rows = _db_boot.extension_list()
+        repaired = 0
+        for r in rows:
+            pp = r.get("pool_path")
+            if not pp or not os.path.isdir(pp):
+                continue
+            mf_path = os.path.join(pp, "manifest.json")
+            try:
+                manifest = parse_manifest(mf_path)
+                if not manifest:
+                    continue
+                before = _json_repair.dumps(manifest, sort_keys=True)
+                _ensure_default_locale(pp, manifest)
+                _ensure_required_fields(pp, manifest)
+                _sanitize_match_patterns(manifest)
+                after = _json_repair.dumps(manifest, sort_keys=True)
+                if before != after:
+                    with open(mf_path, "w", encoding="utf-8") as _f:
+                        _json_repair.dump(manifest, _f,
+                                          ensure_ascii=False, indent=2)
+                    repaired += 1
+                    print(f"[startup] repaired manifest for "
+                          f"{r.get('name') or r.get('id')}")
+            except Exception as _e:
+                print(f"[startup] repair skipped for {r.get('id')}: {_e}")
+        if repaired:
+            print(f"[startup] extension pool: repaired {repaired} manifest(s)")
+    except Exception as e:
+        print(f"[startup] pool repair pass skipped: {e}")
+    _phase("ok    : extension pool repair done")
 
     # Traffic-stats retention cleanup — deletes rows older than
     # traffic.retention_days (default 90). Runs once at startup; the

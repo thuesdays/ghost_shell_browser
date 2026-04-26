@@ -110,7 +110,12 @@ const ProfileDetail = {
         this.loadCookies(this.currentProfile),
         this.loadActiveScript(this.currentProfile),
         this.loadActiveProxy(this.currentProfile),
+        // Extensions card (Phase 3): list assigned chips + wire the
+        // "+ Add from pool" picker. Stays a no-op for users who never
+        // touched Extensions — chips just render as "(none assigned)".
+        this.loadProfileExtensions(this.currentProfile),
       ]);
+      this._wireProfileExtBtn();
     } else {
       toast("No profile selected — redirecting to the Profiles list", true);
       if (typeof navigate === "function") {
@@ -755,6 +760,8 @@ const ProfileDetail = {
         navigate("session");
       };
     }
+    // Wire cookie pool button (idempotent)
+    this._wireCookiePoolBtn();
 
     try {
       const r = await api(`/api/session/${encodeURIComponent(name)}`);
@@ -1794,5 +1801,422 @@ const ProfileDetail = {
       btn.disabled = false;
       btn.textContent = original;
     }
+  },
+
+  // ─── Cookie pool button + modal (Task #26) ────────────────────
+  // Lets the user inject cookies from another profile's snapshot
+  // into THIS profile, browserless. Handy when you've warmed a
+  // throwaway "donor" profile and want to seed real-looking cookies
+  // into a freshly-created production profile so its first request
+  // doesn't look like a brand-new browser.
+  //
+  // Flow:
+  //   1. Open modal → fetch /api/cookies/pool/match  (auto-pick)
+  //                +  /api/cookies/pool             (full list)
+  //   2. User picks a snapshot (or accepts the auto-recommendation)
+  //   3. POST /api/cookies/pool/inject — backend writes cookies.json
+  //      into target profile's session_dir; next launch restores
+  //      them via the existing CDP cookie-load path.
+  _wireCookiePoolBtn() {
+    const btn = document.getElementById("profile-cookie-pool-btn");
+    if (!btn || btn.dataset._wired === "1") return;
+    btn.dataset._wired = "1";
+    btn.addEventListener("click", () => this._openCookiePoolModal());
+
+    document.querySelectorAll('[data-close="cookie-pool-modal"]').forEach(el => {
+      el.addEventListener("click", () => {
+        const m = document.getElementById("cookie-pool-modal");
+        if (m) m.style.display = "none";
+      });
+    });
+
+    const injectBtn = document.getElementById("cookie-pool-inject-btn");
+    if (injectBtn && injectBtn.dataset._wired !== "1") {
+      injectBtn.dataset._wired = "1";
+      injectBtn.addEventListener("click", () => this._cookiePoolInject());
+    }
+  },
+
+  async _openCookiePoolModal() {
+    const modal = document.getElementById("cookie-pool-modal");
+    const body  = document.getElementById("cookie-pool-modal-body");
+    const inject = document.getElementById("cookie-pool-inject-btn");
+    if (!modal || !body) return;
+    if (!this.currentProfile) {
+      toast("No profile selected", true);
+      return;
+    }
+
+    body.innerHTML = `<div class="muted">Loading pool…</div>`;
+    if (inject) {
+      inject.disabled = true;
+      inject.textContent = "Inject selected";
+    }
+    this._selectedSnapshotId = null;
+    modal.style.display = "";
+
+    // Pull expected_country off this profile so the auto-pick is
+    // locale-aware (UA cookies onto a UA profile, etc). Fall back
+    // to global default if the profile didn't set one.
+    let country = null;
+    try {
+      const meta = await api(`/api/profiles/${encodeURIComponent(this.currentProfile)}/meta`);
+      country = (meta?.expected_country) || null;
+    } catch {}
+    if (!country) {
+      try {
+        const cfg = await api("/api/config");
+        country = (cfg && cfg["browser.expected_country"]) || null;
+      } catch {}
+    }
+    this._cookiePoolCountry = country;
+
+    // Auto-pick + full list, in parallel
+    let match = null, list = [];
+    try {
+      const m = await api(
+        "/api/cookies/pool/match" +
+        (country ? `?country=${encodeURIComponent(country)}` : "?") +
+        `${country ? "&" : ""}exclude_profile=${encodeURIComponent(this.currentProfile)}`
+      );
+      match = m?.match || null;
+    } catch (e) {
+      console.warn("pool match failed:", e);
+    }
+    try {
+      const l = await api(
+        "/api/cookies/pool" +
+        (country ? `?country=${encodeURIComponent(country)}` : "?") +
+        `${country ? "&" : ""}exclude_profile=${encodeURIComponent(this.currentProfile)}` +
+        "&limit=20"
+      );
+      list = l?.snapshots || [];
+    } catch (e) {
+      console.warn("pool list failed:", e);
+    }
+
+    body.innerHTML = this._renderCookiePoolModalBody(country, match, list);
+
+    // Wire row selection
+    body.querySelectorAll("[data-snap-id]").forEach(row => {
+      row.addEventListener("click", () => {
+        body.querySelectorAll("[data-snap-id]").forEach(r => r.classList.remove("selected"));
+        row.classList.add("selected");
+        this._selectedSnapshotId = parseInt(row.dataset.snapId, 10);
+        if (inject) inject.disabled = false;
+      });
+    });
+
+    // Pre-select the auto-pick so user can hit Inject without thinking
+    if (match && match.id) {
+      const r = body.querySelector(`[data-snap-id="${match.id}"]`);
+      if (r) {
+        r.classList.add("selected");
+        this._selectedSnapshotId = match.id;
+        if (inject) inject.disabled = false;
+      }
+    }
+  },
+
+  _renderCookiePoolModalBody(country, match, list) {
+    const escapeHtml = (s) => String(s == null ? "" : s)
+      .replace(/&/g, "&amp;").replace(/</g, "&lt;")
+      .replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+    const matchBlock = match
+      ? `<div class="cookie-pool-rec">
+           <div class="cookie-pool-rec-title">⭐ Recommended pick</div>
+           <div class="cookie-pool-rec-meta">
+             <strong>${escapeHtml(match.profile_name)}</strong>
+             — ${match.cookie_count || 0} cookies
+             across ${match.domain_count || 0} domains,
+             ${match.country ? escapeHtml(match.country) : "no country"}/${match.category ? escapeHtml(match.category) : "any"},
+             ${match.created_at ? timeAgo(match.created_at) : "unknown age"}
+           </div>
+         </div>`
+      : `<div class="muted" style="padding: 6px 0; font-size: 12px;">
+           No auto-pick available${country ? ` for country <strong>${escapeHtml(country)}</strong>` : ""}.
+           Pick from the list manually below.
+         </div>`;
+
+    if (!list.length) {
+      return matchBlock + `
+        <div class="dense-empty" style="padding: 30px 16px; text-align: center;">
+          <div style="font-size: 28px; opacity: 0.4; margin-bottom: 8px;">🍪</div>
+          <div style="font-size: 13px; opacity: 0.7;">
+            No snapshots in the pool yet. Run a profile that triggers a
+            cookie snapshot (warmup, search session, etc) first — then
+            come back here to inject those cookies into other profiles.
+          </div>
+        </div>`;
+    }
+
+    const rows = list.map(s => `
+      <div class="cookie-pool-row" data-snap-id="${s.id}">
+        <div class="cookie-pool-row-name">
+          ${escapeHtml(s.profile_name || "(unknown)")}
+          ${s.country ? `<span class="cookie-pool-row-country">${escapeHtml(s.country)}</span>` : ""}
+          ${s.category ? `<span class="cookie-pool-row-cat">${escapeHtml(s.category)}</span>` : ""}
+        </div>
+        <div class="cookie-pool-row-meta">
+          <span><strong>${s.cookie_count || 0}</strong> cookies</span>
+          <span><strong>${s.domain_count || 0}</strong> domains</span>
+          <span class="muted">${s.created_at ? timeAgo(s.created_at) : "—"}</span>
+          ${s.trigger ? `<span class="muted">via ${escapeHtml(s.trigger)}</span>` : ""}
+        </div>
+      </div>
+    `).join("");
+
+    return matchBlock + `
+      <div class="form-hint" style="margin: 10px 0 6px;">
+        Pick a snapshot to copy its cookies into <strong>${escapeHtml(this.currentProfile)}</strong>.
+        The target profile's existing cookies are merged with the donor's
+        — duplicates by (name, domain) are overwritten with the donor copy.
+      </div>
+      <div class="cookie-pool-list">${rows}</div>`;
+  },
+
+  async _cookiePoolInject() {
+    if (!this.currentProfile) return;
+    const btn = document.getElementById("cookie-pool-inject-btn");
+    if (!btn) return;
+    if (!this._selectedSnapshotId) {
+      toast("Pick a snapshot first", true);
+      return;
+    }
+    btn.disabled = true;
+    btn.textContent = "Injecting…";
+    try {
+      const r = await api("/api/cookies/pool/inject", {
+        method: "POST",
+        body: JSON.stringify({
+          target_profile: this.currentProfile,
+          snapshot_id:    this._selectedSnapshotId,
+        }),
+      });
+      if (r && r.ok !== false) {
+        toast(
+          `✓ Injected ${r.cookies_written || 0} new cookies` +
+          (r.source_profile ? ` from ${r.source_profile}` : "") +
+          (r.total_cookies_after ? ` (${r.total_cookies_after} total now)` : "")
+        );
+        const m = document.getElementById("cookie-pool-modal");
+        if (m) m.style.display = "none";
+        // Refresh the session summary so the new cookie count shows up
+        try { await this.loadSessionSummary(this.currentProfile); } catch {}
+      } else {
+        toast(`Inject failed: ${(r && r.error) || "unknown"}`, true);
+      }
+    } catch (e) {
+      toast(`Inject failed: ${e.message || e}`, true);
+    } finally {
+      btn.disabled = false;
+      btn.textContent = "Inject selected";
+    }
+  },
+
+  // ─── Extensions card (Phase 3) ─────────────────────────────────
+  // Per-profile assignment from the shared Extensions pool. Renders
+  // chips for what's currently assigned and opens a picker modal
+  // listing every enabled pool entry. Toggling a card immediately
+  // POSTs/DELETEs the assignment — at next launch runtime.py builds
+  // --load-extension from this set.
+  async loadProfileExtensions(name) {
+    const chips = document.getElementById("profile-ext-chips");
+    if (!chips) return;
+    try {
+      const [pool, assigned] = await Promise.all([
+        api("/api/extensions").catch(() => ({ extensions: [] })),
+        api(`/api/profiles/${encodeURIComponent(name)}/extensions`).catch(() => ({ extensions: [] })),
+      ]);
+      this._extPoolCache     = pool?.extensions || pool || [];
+      this._extAssignedCache = (assigned?.extensions || assigned || []).map(r => ({
+        extension_id: r.extension_id || r.id,
+        enabled:      r.enabled !== 0 && r.enabled !== false,
+      }));
+      this._renderProfileExtChips();
+    } catch (e) {
+      chips.innerHTML = `<span class="muted" style="font-size: 12px; color:#fca5a5;">
+        Failed to load extensions: ${escapeHtml(e.message)}
+      </span>`;
+    }
+  },
+
+  _renderProfileExtChips() {
+    const chips = document.getElementById("profile-ext-chips");
+    if (!chips) return;
+    const assigned = this._extAssignedCache || [];
+    const pool     = this._extPoolCache || [];
+    if (!assigned.length) {
+      chips.innerHTML = `<div class="profile-ext-empty">
+        No extensions assigned. Click <strong>+ Add from pool</strong>
+        to install one at next launch.
+      </div>`;
+      return;
+    }
+    chips.innerHTML = assigned.map(a => {
+      const x = pool.find(p => p.id === a.extension_id);
+      const name = x?.name || "(missing from pool)";
+      const ver  = x?.version ? `v${x.version}` : "";
+      const icon = x?.icon_b64
+        ? `<img src="${(x?.icon_b64?.startsWith('data:') ? x.icon_b64 : 'data:image/png;base64,' + x.icon_b64)}" alt="">`
+        : `🧩`;
+      const disabled = !a.enabled || (x && (x.is_enabled === 0 || x.is_enabled === false));
+      const tip = disabled
+        ? "Disabled — won't load at next launch"
+        : `Will be loaded with --load-extension at next launch${ver ? " (" + ver + ")" : ""}`;
+      return `
+        <span class="profile-ext-chip ${disabled ? "is-disabled" : ""}" title="${escapeHtml(tip)}">
+          <span class="profile-ext-chip-icon">${icon}</span>
+          <span class="profile-ext-chip-name">${escapeHtml(name)}</span>
+          <button class="profile-ext-chip-x" data-eid="${escapeHtml(a.extension_id)}"
+                  title="Remove from this profile">×</button>
+        </span>`;
+    }).join("");
+
+    chips.querySelectorAll(".profile-ext-chip-x").forEach(btn => {
+      btn.addEventListener("click", (e) => {
+        e.stopPropagation();
+        this._removeProfileExt(btn.dataset.eid);
+      });
+    });
+  },
+
+  async _removeProfileExt(eid) {
+    if (!this.currentProfile || !eid) return;
+    try {
+      await api(
+        `/api/profiles/${encodeURIComponent(this.currentProfile)}/extensions/${encodeURIComponent(eid)}`,
+        { method: "DELETE" }
+      );
+      this._extAssignedCache = (this._extAssignedCache || []).filter(a => a.extension_id !== eid);
+      this._renderProfileExtChips();
+      toast("Removed from profile");
+    } catch (e) {
+      toast(`Remove failed: ${e.message}`, true);
+    }
+  },
+
+  _wireProfileExtBtn() {
+    const btn = document.getElementById("profile-ext-add-btn");
+    if (!btn || btn.dataset._wired === "1") return;
+    btn.dataset._wired = "1";
+    btn.addEventListener("click", () => this._openProfileExtModal());
+    document.querySelectorAll('[data-close="profile-ext-modal"]').forEach(el => {
+      el.addEventListener("click", () => {
+        const m = document.getElementById("profile-ext-modal");
+        if (m) m.style.display = "none";
+      });
+    });
+  },
+
+  async _openProfileExtModal() {
+    const modal = document.getElementById("profile-ext-modal");
+    const body  = document.getElementById("profile-ext-modal-body");
+    if (!modal || !body) return;
+    if (!this.currentProfile) {
+      toast("No profile selected", true);
+      return;
+    }
+    modal.style.display = "";
+
+    body.innerHTML = `<div class="muted" style="font-size: 12px;">Loading pool…</div>`;
+    try {
+      const [pool, assigned] = await Promise.all([
+        api("/api/extensions"),
+        api(`/api/profiles/${encodeURIComponent(this.currentProfile)}/extensions`),
+      ]);
+      this._extPoolCache     = pool?.extensions || pool || [];
+      this._extAssignedCache = (assigned?.extensions || assigned || []).map(r => ({
+        extension_id: r.extension_id || r.id,
+        enabled:      r.enabled !== 0 && r.enabled !== false,
+      }));
+    } catch (e) {
+      body.innerHTML = `<div class="muted" style="color:#fca5a5;">Load failed: ${escapeHtml(e.message)}</div>`;
+      return;
+    }
+
+    body.innerHTML = this._renderProfileExtModalBody();
+    this._wireProfileExtModalCards();
+  },
+
+  _renderProfileExtModalBody() {
+    const pool = (this._extPoolCache || []).filter(
+      x => x.is_enabled !== 0 && x.is_enabled !== false
+    );
+    const assignedSet = new Set((this._extAssignedCache || []).map(a => a.extension_id));
+    if (!pool.length) {
+      return `
+        <div class="dense-empty" style="padding: 30px 16px; text-align: center;">
+          <div style="font-size: 28px; opacity: 0.4; margin-bottom: 8px;">📭</div>
+          <div style="font-size: 13px; opacity: 0.75;">
+            The pool is empty. Head to the
+            <a href="#" data-nav="extensions" class="inline-link"
+               onclick="document.getElementById('profile-ext-modal').style.display='none';"
+            >Extensions page</a> to install your first extension.
+          </div>
+        </div>`;
+    }
+
+    const cards = pool.map(x => {
+      const assigned = assignedSet.has(x.id);
+      const icon = x.icon_b64
+        ? `<img src="${(x.icon_b64.startsWith('data:') ? x.icon_b64 : 'data:image/png;base64,' + x.icon_b64)}" alt="">`
+        : `<span style="font-size: 22px;">🧩</span>`;
+      return `
+        <div class="profile-ext-picker-card ${assigned ? "is-assigned" : ""}"
+             data-eid="${escapeHtml(x.id)}">
+          <div class="profile-ext-picker-icon">${icon}</div>
+          <div style="min-width: 0;">
+            <div class="profile-ext-picker-name" title="${escapeHtml(x.name)}">${escapeHtml(x.name || "(unnamed)")}</div>
+            ${x.version ? `<div class="profile-ext-picker-version">v${escapeHtml(x.version)}</div>` : ""}
+          </div>
+          <div class="profile-ext-picker-check">${assigned ? "✓" : ""}</div>
+        </div>`;
+    }).join("");
+    return `
+      <div class="form-hint" style="margin-bottom: 8px;">
+        Click an extension to toggle. Changes apply immediately —
+        the next time you launch this profile, the assigned set is
+        loaded into Chrome with <code>--load-extension</code>.
+      </div>
+      <div class="profile-ext-picker-grid">${cards}</div>
+    `;
+  },
+
+  _wireProfileExtModalCards() {
+    const body = document.getElementById("profile-ext-modal-body");
+    if (!body) return;
+    body.querySelectorAll(".profile-ext-picker-card").forEach(card => {
+      card.addEventListener("click", async () => {
+        const eid = card.dataset.eid;
+        if (!eid) return;
+        const wasAssigned = card.classList.contains("is-assigned");
+        card.style.opacity = "0.55";
+        try {
+          if (wasAssigned) {
+            await api(
+              `/api/profiles/${encodeURIComponent(this.currentProfile)}/extensions/${encodeURIComponent(eid)}`,
+              { method: "DELETE" }
+            );
+            this._extAssignedCache = (this._extAssignedCache || []).filter(a => a.extension_id !== eid);
+            card.classList.remove("is-assigned");
+            card.querySelector(".profile-ext-picker-check").textContent = "";
+          } else {
+            await api(
+              `/api/profiles/${encodeURIComponent(this.currentProfile)}/extensions`,
+              { method: "POST", body: JSON.stringify({ extension_id: eid, enabled: true }) }
+            );
+            (this._extAssignedCache = this._extAssignedCache || []).push({ extension_id: eid, enabled: true });
+            card.classList.add("is-assigned");
+            card.querySelector(".profile-ext-picker-check").textContent = "✓";
+          }
+          this._renderProfileExtChips();
+        } catch (e) {
+          toast(`Toggle failed: ${e.message}`, true);
+        } finally {
+          card.style.opacity = "";
+        }
+      });
+    });
   },
 };

@@ -367,6 +367,79 @@ def _act_click_ad(driver, action: dict, ctx: dict):
             pass
         _random_sleep(1, 3)
 
+    # ── DEEP DIVE: click 1-2 internal links ──────────────────────
+    # A real shopper who clicks an ad doesn't just scroll the
+    # landing page and leave -- they click into a product, look at
+    # the catalog, maybe check shipping. This pattern is one of
+    # Google's strongest "engaged user" signals (CTR-prediction
+    # gets a noticeable bump). Same-host links only -- we don't
+    # want to wander off into Facebook share buttons or back to
+    # Google.
+    if action.get("deep_dive", False) and tabs:
+        try:
+            depth_min = int(action.get("depth_min", 1))
+            depth_max = int(action.get("depth_max", 2))
+            inner_lo  = float(action.get("inner_dwell_min", 5))
+            inner_hi  = float(action.get("inner_dwell_max", 12))
+            depth     = random.randint(depth_min, max(depth_min, depth_max))
+            for step_i in range(1, depth + 1):
+                # Find a same-host internal link via JS. Skip nav,
+                # footer, and social (heuristic: prefer links inside
+                # main/article/[role=main] / product-card containers).
+                clicked_href = driver.execute_script(r"""
+                const here = location.hostname;
+                const candidates = [];
+                // Prefer "content" containers; fall back to any <a>
+                const containers = document.querySelectorAll(
+                    'main a, article a, [role="main"] a, ' +
+                    '[class*="product"] a, [class*="catalog"] a, ' +
+                    '[class*="card"] a, .container a'
+                );
+                const all = containers.length ? containers
+                                              : document.querySelectorAll('a[href]');
+                for (const a of all) {
+                    if (!a.href || !a.href.startsWith('http')) continue;
+                    let host;
+                    try { host = new URL(a.href).hostname; }
+                    catch { continue; }
+                    // Same host (or subdomain of it)
+                    if (host !== here && !host.endsWith('.' + here) &&
+                        !here.endsWith('.' + host)) continue;
+                    // Skip obvious nav / utility / share links
+                    const txt = (a.innerText || '').toLowerCase();
+                    if (!txt || txt.length < 2 || txt.length > 80) continue;
+                    if (/^(home|main|menu|cart|корзин|меню|логин|search|пошук|войти|вийти)$/.test(txt)) continue;
+                    if (a.href.includes('/cart') || a.href.includes('/checkout') ||
+                        a.href.includes('/auth') || a.href.includes('mailto:') ||
+                        a.href.includes('tel:') || a.href.includes('#')) continue;
+                    // Candidate looks reasonable
+                    candidates.push(a);
+                }
+                if (!candidates.length) return null;
+                // Random pick from top 8 -- top of catalog usually
+                // most relevant
+                const pool = candidates.slice(0, 8);
+                const pick = pool[Math.floor(Math.random() * pool.length)];
+                pick.scrollIntoView({block: 'center', behavior: 'smooth'});
+                // Strip target=_blank to keep navigation in-tab
+                pick.removeAttribute('target');
+                pick.click();
+                return pick.href;
+                """)
+                if not clicked_href:
+                    log.debug(f"    deep_dive[{step_i}/{depth}]: no good internal link -- stopping")
+                    break
+                log.info(f"    ↪ deep_dive[{step_i}/{depth}]: → {clicked_href[:80]}")
+                _random_sleep(inner_lo, inner_hi)
+                # Light scroll on the inner page
+                try:
+                    _human_scroll(driver)
+                except Exception:
+                    pass
+                _random_sleep(0.8, 2.0)
+        except Exception as e:
+            log.debug(f"    deep_dive failed: {e}")
+
     # Close tab and return to SERP
     if action.get("close_after", True) and tabs:
         try:
@@ -1829,9 +1902,12 @@ def _action_catalog_raw() -> list[dict]:
         {
             "type": "click_ad",
             "label": "Click on advertisement",
+            "category": "ads",
             "description": "Finds the ad anchor, moves mouse along a curve, "
                           "Ctrl+Clicks it to open in new tab. The most "
-                          "realistic ad-click signal.",
+                          "realistic ad-click signal. Optional deep_dive "
+                          "clicks 1-2 internal links on the landing page "
+                          "to simulate engaged shopping behaviour.",
             "params": [
                 {"name": "dwell_min", "type": "number", "default": 6,  "label": "Min dwell (s)"},
                 {"name": "dwell_max", "type": "number", "default": 18, "label": "Max dwell (s)"},
@@ -1839,6 +1915,20 @@ def _action_catalog_raw() -> list[dict]:
                  "label": "Scroll page after click"},
                 {"name": "close_after", "type": "bool", "default": True,
                  "label": "Close tab afterward"},
+                {"name": "deep_dive", "type": "bool", "default": False,
+                 "label": "Deep dive (click internal links)",
+                 "hint": "After landing on competitor's site, click 1-2 "
+                         "internal links (catalog, product page) and dwell "
+                         "on each. Strongest 'engaged user' signal -- "
+                         "Google CTR-prediction loves this."},
+                {"name": "depth_min", "type": "number", "default": 1,
+                 "label": "Deep-dive min clicks"},
+                {"name": "depth_max", "type": "number", "default": 2,
+                 "label": "Deep-dive max clicks"},
+                {"name": "inner_dwell_min", "type": "number", "default": 5,
+                 "label": "Inner dwell min (s)"},
+                {"name": "inner_dwell_max", "type": "number", "default": 12,
+                 "label": "Inner dwell max (s)"},
             ],
         },
         {
@@ -1998,7 +2088,8 @@ def _action_catalog_raw() -> list[dict]:
         # ═════════════════════════════════════════════════════════
         {
             "type": "search_query",
-            "label": "Run one search query",
+            "label": "Search query",
+            "category": "navigation",
             "scope": "loop",
             "description": "Navigate to google.com/search?q=… for the given "
                           "query, wait for the SERP, parse ads, and (if ads "
@@ -2011,6 +2102,22 @@ def _action_catalog_raw() -> list[dict]:
                  "label": "Fail if no ads",
                  "hint": "Normally no ads = just move on. Enable this if an "
                          "empty SERP should abort the whole script."},
+                {"name": "refine_on_zero_ads", "type": "bool", "default": True,
+                 "label": "⟳ Auto-refine to long-tail when 0 ads",
+                 "hint": "If the brand query returns 0 ads, automatically "
+                         "retry with long-tail commercial variants ('купити', "
+                         "'ціна', 'відгуки', etc) before giving up. Real "
+                         "users refine queries; this turns dead navigational "
+                         "queries into productive commercial ones. "
+                         "Big win for brand-only monitoring."},
+                {"name": "refine_max_attempts", "type": "number", "default": 3,
+                 "label": "Refine: max variants to try",
+                 "hint": "Caps how many long-tail variants to attempt before "
+                         "giving up. 3 is the sweet spot."},
+                {"name": "refine_locale", "type": "text", "default": "UA",
+                 "label": "Refine: suffix locale",
+                 "hint": "UA / RU / EN or combos (UA+RU). Determines which "
+                         "commercial-suffix pool is used to generate variants."},
             ],
         },
         {
@@ -2126,8 +2233,8 @@ def _action_catalog_raw() -> list[dict]:
         },
         {
             "type":        "commercial_inflate",
-            "label":       "🔥 Commercial inflate (boost ad density)",
-            "category":    "navigation",
+            "label":       "Pre-search inflate",
+            "category":    "ads",
             "scope":       "any",
             "description": (
                 "Pre-warm Google's commercial-intent context BEFORE the "
@@ -2710,6 +2817,26 @@ def _exec_single(step: dict, ctx: RunContext):
     if act_type == "rotate_ip":
         return _flow_rotate_ip(step, ctx)
 
+    # ── Extensions automation (Phase 5) ────────────────────────
+    # Crypto wallets and other CWS extensions can be driven by
+    # opening their popup in a new tab (chrome-extension://<id>/popup.html)
+    # rather than the toolbar icon — toolbar popups close on focus
+    # loss, the URL form stays open and is fully scriptable.
+    if act_type == "open_extension_popup":
+        return _flow_open_extension_popup(step, ctx)
+    if act_type == "open_extension_page":
+        return _flow_open_extension_page(step, ctx)
+    if act_type == "extension_eval":
+        return _flow_extension_eval(step, ctx)
+    if act_type == "extension_wait_for":
+        return _flow_extension_wait_for(step, ctx)
+    if act_type == "extension_click":
+        return _flow_extension_click(step, ctx)
+    if act_type == "extension_fill":
+        return _flow_extension_fill(step, ctx)
+    if act_type == "extension_close":
+        return _flow_extension_close(step, ctx)
+
     # ── Navigation & interaction: delegate to legacy handlers ─
     # These already accept (driver, action, ctx_dict); we adapt
     # the RunContext to the dict shape they expect.
@@ -2820,7 +2947,18 @@ def _flow_if(step: dict, ctx: RunContext):
 
 def _flow_foreach_ad(step: dict, ctx: RunContext):
     """Iterate ctx.ads, run nested steps with ctx.ad = current ad.
-    Respects break/continue within iterations."""
+    Respects break/continue within iterations.
+
+    Comparison-shopping pattern (Task #17): between iterations (after
+    one ad's click_ad has closed its tab and we're back on the SERP),
+    do a short scan-pause that simulates a real user re-reading the
+    SERP before clicking the next competitor's ad. Without this gap,
+    foreach_ad fires click_ad N times back-to-back — a machine-perfect
+    cadence that Google's ad-fraud heuristics flag.
+
+    Default ON because it costs only 5-10s per ad gap and the realism
+    boost is worth it. Disable via scan_between_ads=False on the step.
+    """
     ads = list(ctx.ads or [])
     if not ads:
         log.info(f"  [foreach_ad] skipped — no ads in context")
@@ -2834,10 +2972,23 @@ def _flow_foreach_ad(step: dict, ctx: RunContext):
         try: ads = ads[:int(limit)]
         except (TypeError, ValueError): pass
 
-    log.info(f"  [foreach_ad] {len(ads)} ad(s)")
+    # Comparison-shopping config (per-step overrideable from the UI)
+    scan_enabled  = bool(step.get("scan_between_ads", True))
+    scan_min      = float(step.get("scan_dwell_min", 3))
+    scan_max      = float(step.get("scan_dwell_max", 8))
+    scan_scroll   = bool(step.get("scan_scroll", True))
+
+    log.info(f"  [foreach_ad] {len(ads)} ad(s)"
+             f"{' (scan-between ON)' if scan_enabled else ''}")
     for i, ad in enumerate(ads, 1):
         if ctx.should_break:
             break
+        # Scan-pause BETWEEN ads (not before the first, not after the last)
+        if scan_enabled and i > 1:
+            try:
+                _foreach_ad_scan_pause(ctx, scan_min, scan_max, scan_scroll, i, len(ads))
+            except Exception as _e:
+                log.debug(f"    foreach_ad scan-pause skipped: {_e}")
         log.info(f"    [ad {i}/{len(ads)}] {ad.get('domain', '?')}")
         child = ctx.child(ad=ad)
         _exec_steps(inner, child)
@@ -2846,6 +2997,41 @@ def _flow_foreach_ad(step: dict, ctx: RunContext):
         if child.should_break:
             ctx.should_break = True
             break
+
+
+def _foreach_ad_scan_pause(ctx: RunContext, dwell_min: float, dwell_max: float,
+                           scroll_enabled: bool, ad_idx: int, total: int):
+    """Comparison-shopping pause between two foreach_ad iterations.
+    Simulates a user re-reading the SERP: small scrolls + a randomised
+    dwell. No-op if the driver isn't available or we're not on a
+    Google SERP-like page."""
+    drv = ctx.driver
+    if not drv:
+        return
+    cur = ""
+    try: cur = (drv.current_url or "")
+    except Exception: pass
+    # Only scan if we appear to be back on a search page. Otherwise
+    # the previous iteration's click_ad may not have closed cleanly,
+    # and scrolling would mess with the popup.
+    if "/search" not in cur and "google." not in cur:
+        log.debug(f"    scan-pause skipped (current URL not a SERP)")
+        return
+    dwell = random.uniform(dwell_min, dwell_max)
+    log.info(f"    [scan {ad_idx-1}→{ad_idx}/{total}] re-reading SERP for {dwell:.1f}s")
+    if scroll_enabled:
+        # Couple of small scrolls — like a user glancing down/back up
+        try:
+            for _ in range(random.randint(1, 3)):
+                amt = random.randint(80, 240)
+                if random.random() < 0.4:
+                    amt = -amt
+                drv.execute_script(f"window.scrollBy(0, {amt});")
+                time.sleep(random.uniform(0.6, 1.4))
+        except Exception:
+            pass
+    # Remaining dwell budget — sit and "read"
+    time.sleep(max(0, dwell - 2.0))
 
 
 # ── generic foreach ────────────────────────────────────────────────
@@ -3162,6 +3348,300 @@ CONDITION_KINDS = [
 ]
 
 
+
+# ════════════════════════════════════════════════════════════════
+# EXTENSIONS automation (Phase 5)
+#
+# Drive Chrome extensions (crypto wallets, ad blockers, dev tools)
+# from a script. Pattern: open the extension's popup HTML in a new
+# tab, drive it with normal Selenium calls, then close the tab.
+#
+# Why "open in a new tab" rather than triggering the toolbar icon:
+#   - Selenium can't click toolbar icons reliably (they're outside
+#     the page's DOM)
+#   - Toolbar popups (the ones that pop down from the icon) close
+#     on focus loss — any Selenium call that switches tabs kills
+#     the popup mid-flow
+#   - The popup HTML itself works fine in a regular tab — wallets
+#     check their own context, not "are you in a real popup"
+# So: navigate to chrome-extension://<id>/popup.html in a new tab,
+# do the work, close the tab. Persistent storage (seed phrase,
+# unlock state) lives in the extension's IndexedDB which survives
+# tab close.
+# ════════════════════════════════════════════════════════════════
+
+def _ext_resolve_id(step: dict, ctx: "RunContext") -> "str | None":
+    """Resolve the extension id from a step. Accepts:
+       - extension_id (32-char id directly, preferred)
+       - extension_name (looks up DB by case-insensitive name match,
+         picks the only match or warns if ambiguous)
+    Returns the id or None (with a warning logged)."""
+    eid = (step.get("extension_id") or "").strip().lower()
+    if eid:
+        return eid
+    name = (step.get("extension_name") or "").strip()
+    if not name:
+        log.warning("  [ext] no extension_id or extension_name given")
+        return None
+    try:
+        from ghost_shell.db import get_db
+        rows = get_db().extension_list()
+    except Exception as e:
+        log.warning(f"  [ext] DB lookup failed: {e}")
+        return None
+    matches = [r for r in rows if (r.get("name") or "").lower() == name.lower()]
+    if not matches:
+        # Fallback: substring match
+        matches = [r for r in rows if name.lower() in (r.get("name") or "").lower()]
+    if not matches:
+        log.warning(f"  [ext] no extension named '{name}' in pool")
+        return None
+    if len(matches) > 1:
+        log.warning(f"  [ext] '{name}' is ambiguous ({len(matches)} matches); "
+                    f"picking first ({matches[0].get('id')})")
+    return matches[0].get("id")
+
+
+def _ext_popup_url(ext_id: str, page: str = None) -> "str | None":
+    """Build chrome-extension://<id>/<page>. If page is None, look
+    up the manifest's default_popup. Returns None if the extension
+    has no popup and no page is specified."""
+    if page:
+        return f"chrome-extension://{ext_id}/{page.lstrip('/')}"
+    # Look up the manifest from the pool to find default_popup
+    try:
+        from ghost_shell.db import get_db
+        row = get_db().extension_get(ext_id)
+        if row and row.get("manifest_json"):
+            import json as _j
+            manifest = _j.loads(row["manifest_json"])
+            action = manifest.get("action") or manifest.get("browser_action") or {}
+            popup = action.get("default_popup")
+            if popup:
+                return f"chrome-extension://{ext_id}/{popup.lstrip('/')}"
+    except Exception as e:
+        log.debug(f"  [ext] manifest lookup failed: {e}")
+    return None
+
+
+def _ext_open_in_new_tab(ctx: "RunContext", url: str,
+                         save_handle_as: str = None) -> "str | None":
+    """Open `url` in a new tab and switch to it. Records the new tab
+    handle in ctx.vars (default key "ext_tab", or `save_handle_as`)
+    plus ctx.vars["_ext_origin_tab"] for cleanup."""
+    drv = ctx.driver
+    if not drv:
+        log.warning("  [ext] no driver in context")
+        return None
+    origin = drv.current_window_handle
+    drv.execute_script("window.open(arguments[0], '_blank');", url)
+    # Wait briefly for the new tab and switch to it
+    import time as _t
+    deadline = _t.time() + 5
+    while _t.time() < deadline:
+        handles = drv.window_handles
+        if len(handles) > 1 and handles[-1] != origin:
+            drv.switch_to.window(handles[-1])
+            ctx.vars["_ext_origin_tab"] = origin
+            ctx.vars[save_handle_as or "ext_tab"] = handles[-1]
+            return handles[-1]
+        _t.sleep(0.1)
+    log.warning("  [ext] new tab did not appear within 5s")
+    return None
+
+
+# ── open_extension_popup ──────────────────────────────────────────
+
+def _flow_open_extension_popup(step: dict, ctx: "RunContext"):
+    """Open the extension's default popup HTML in a new tab, then
+    optionally wait for a selector to appear (typical: the unlock
+    screen for a wallet)."""
+    ext_id = _ext_resolve_id(step, ctx)
+    if not ext_id:
+        return
+    url = _ext_popup_url(ext_id)
+    if not url:
+        log.warning(f"  [ext] {ext_id} has no default_popup in manifest — "
+                    f"use open_extension_page with explicit `page` instead")
+        return
+    log.info(f"  [open_extension_popup] {ext_id} → {url}")
+    _ext_open_in_new_tab(ctx, url, step.get("save_handle_as"))
+
+    wait_sel = step.get("wait_for_selector")
+    if wait_sel:
+        timeout = float(step.get("timeout", 15))
+        _ext_wait_for_selector(ctx, wait_sel, timeout)
+
+
+# ── open_extension_page ───────────────────────────────────────────
+
+def _flow_open_extension_page(step: dict, ctx: "RunContext"):
+    """Open an arbitrary extension page (popup.html, options.html,
+    home.html, sidepanel.html). Useful when the extension uses a
+    non-standard popup name (MetaMask uses popup.html, OKX uses
+    home.html, Phantom uses popup.html)."""
+    ext_id = _ext_resolve_id(step, ctx)
+    if not ext_id:
+        return
+    page = (step.get("page") or "popup.html").strip()
+    url = _ext_popup_url(ext_id, page=page)
+    log.info(f"  [open_extension_page] {ext_id} / {page}")
+    _ext_open_in_new_tab(ctx, url, step.get("save_handle_as"))
+
+    wait_sel = step.get("wait_for_selector")
+    if wait_sel:
+        timeout = float(step.get("timeout", 15))
+        _ext_wait_for_selector(ctx, wait_sel, timeout)
+
+
+# ── extension_eval ────────────────────────────────────────────────
+
+def _flow_extension_eval(step: dict, ctx: "RunContext"):
+    """Run JavaScript in the currently-active extension tab. Saves
+    the return value to ctx.vars[save_as] if given.
+
+    Distinct from a generic `eval` because it asserts we're actually
+    inside a chrome-extension:// page — most wallets refuse to expose
+    APIs to non-extension contexts."""
+    drv = ctx.driver
+    if not drv:
+        return
+    code = step.get("code") or ""
+    if not code:
+        log.warning("  [extension_eval] empty code")
+        return
+    cur_url = drv.current_url
+    if not cur_url.startswith("chrome-extension://"):
+        log.warning(f"  [extension_eval] not in an extension tab "
+                    f"(current: {cur_url[:60]}). Run open_extension_popup first.")
+        return
+    try:
+        result = drv.execute_script(code)
+        save_as = step.get("save_as")
+        if save_as:
+            ctx.vars[save_as] = result
+        log.info(f"  [extension_eval] OK ({len(code)} chars)")
+    except Exception as e:
+        log.warning(f"  [extension_eval] {type(e).__name__}: {e}")
+        if step.get("abort_on_error"):
+            raise
+
+
+# ── extension_wait_for ────────────────────────────────────────────
+
+def _ext_wait_for_selector(ctx: "RunContext", selector: str, timeout: float):
+    """Poll for a selector to appear in the current tab. Returns the
+    element or None on timeout."""
+    drv = ctx.driver
+    if not drv:
+        return None
+    from selenium.webdriver.common.by import By
+    from selenium.webdriver.support.ui import WebDriverWait
+    from selenium.webdriver.support import expected_conditions as EC
+    try:
+        by = (By.CSS_SELECTOR, selector)
+        return WebDriverWait(drv, timeout).until(EC.presence_of_element_located(by))
+    except Exception as e:
+        log.warning(f"  [ext] wait timeout '{selector[:50]}': {type(e).__name__}")
+        return None
+
+
+def _flow_extension_wait_for(step: dict, ctx: "RunContext"):
+    sel = step.get("selector") or ""
+    timeout = float(step.get("timeout", 15))
+    if not sel:
+        log.warning("  [extension_wait_for] missing selector")
+        return
+    el = _ext_wait_for_selector(ctx, sel, timeout)
+    if el and step.get("save_as"):
+        # Save the element's text content (most useful thing) as a var
+        try:
+            ctx.vars[step["save_as"]] = el.text or ""
+        except Exception:
+            pass
+
+
+# ── extension_click ───────────────────────────────────────────────
+
+def _flow_extension_click(step: dict, ctx: "RunContext"):
+    """Click an element inside the open extension popup. Implicitly
+    waits for the selector to appear (default 10s)."""
+    sel = step.get("selector") or ""
+    if not sel:
+        log.warning("  [extension_click] missing selector")
+        return
+    timeout = float(step.get("timeout", 10))
+    el = _ext_wait_for_selector(ctx, sel, timeout)
+    if not el:
+        return
+    try:
+        # Scroll into view first — extension popups are often small
+        # and clickable elements may be partially off-screen.
+        ctx.driver.execute_script("arguments[0].scrollIntoView({block:'center'});", el)
+        import time as _t; _t.sleep(0.15)
+        el.click()
+        log.info(f"  [extension_click] clicked '{sel[:50]}'")
+    except Exception as e:
+        log.warning(f"  [extension_click] {type(e).__name__}: {e}")
+        if step.get("abort_on_error"):
+            raise
+
+
+# ── extension_fill ────────────────────────────────────────────────
+
+def _flow_extension_fill(step: dict, ctx: "RunContext"):
+    """Fill a text field in the open extension popup. Use {vault.x.y}
+    placeholders for sensitive values — the runner pre-resolves these
+    against the credential vault so secrets never appear in the
+    saved script."""
+    sel = step.get("selector") or ""
+    val = step.get("value") or ""
+    if not sel:
+        log.warning("  [extension_fill] missing selector")
+        return
+    timeout = float(step.get("timeout", 10))
+    el = _ext_wait_for_selector(ctx, sel, timeout)
+    if not el:
+        return
+    try:
+        if step.get("clear_first", True):
+            try: el.clear()
+            except Exception: pass
+        # Prefer typing one key at a time so React-style listeners fire
+        if step.get("typewriter", True):
+            for ch in val:
+                el.send_keys(ch)
+                import time as _t; _t.sleep(0.02)
+        else:
+            el.send_keys(val)
+        log.info(f"  [extension_fill] '{sel[:40]}' ← {len(val)} chars")
+    except Exception as e:
+        log.warning(f"  [extension_fill] {type(e).__name__}: {e}")
+        if step.get("abort_on_error"):
+            raise
+
+
+# ── extension_close ───────────────────────────────────────────────
+
+def _flow_extension_close(step: dict, ctx: "RunContext"):
+    """Close the extension tab and switch back to the original tab.
+    Looks up the saved handles from ctx.vars (set by
+    open_extension_*). Safe no-op if the tab is already gone."""
+    drv = ctx.driver
+    if not drv:
+        return
+    target = ctx.vars.get(step.get("handle") or "ext_tab")
+    origin = ctx.vars.get("_ext_origin_tab")
+    try:
+        if target and target in drv.window_handles:
+            drv.switch_to.window(target)
+            drv.close()
+        if origin and origin in drv.window_handles:
+            drv.switch_to.window(origin)
+        log.info("  [extension_close] tab closed")
+    except Exception as e:
+        log.warning(f"  [extension_close] {type(e).__name__}: {e}")
+
 def _unified_catalog() -> list[dict]:
     """Catalog entries for the new unified-flow actions. Merged into
     the main action_catalog() result. Every entry has `category` so
@@ -3335,6 +3815,178 @@ def _unified_catalog() -> list[dict]:
                          "in var.<save_as>."},
                 {"name": "timeout", "type": "number", "default": 15,
                  "label": "Timeout (s)"},
+            ],
+        },
+        # ── EXTENSIONS (Phase 5) ─────────────────────────────
+        # All extension actions take an extension picker (the UI
+        # populates an "extension_id" select from /api/extensions).
+        # The "extension_name" fallback is for hand-edited scripts —
+        # the runner does case-insensitive substring matching.
+        {
+            "type":        "open_extension_popup",
+            "label":       "Open extension popup",
+            "category":    "extensions",
+            "scope":       "any",
+            "description": "Open an installed extension's popup in a "
+                           "new tab (the popup HTML, not the toolbar "
+                           "icon). Toolbar popups close on focus loss; "
+                           "the URL form stays open and is fully "
+                           "scriptable. Required first step before any "
+                           "other extension_* action.",
+            "params": [
+                {"name": "extension_id", "type": "extension", "required": False,
+                 "label": "Extension",
+                 "hint": "Pick from the pool. Or set extension_name "
+                         "below if you prefer a name match."},
+                {"name": "extension_name", "type": "text", "default": "",
+                 "label": "…or by name",
+                 "placeholder": "MetaMask, OKX Wallet, Phantom",
+                 "hint": "Case-insensitive substring match against the "
+                         "pool. Use only if extension_id is blank."},
+                {"name": "wait_for_selector", "type": "text", "default": "",
+                 "label": "Wait for selector",
+                 "placeholder": ".unlock-page, [data-testid='unlock-button']",
+                 "hint": "Wait for this CSS selector after opening so "
+                         "the popup has finished its initial render."},
+                {"name": "timeout", "type": "number", "default": 15,
+                 "label": "Wait timeout (s)"},
+                {"name": "save_handle_as", "type": "text", "default": "ext_tab",
+                 "label": "Save tab handle as",
+                 "hint": "Variable name for the tab handle. Default "
+                         "ext_tab — extension_close uses this name."},
+            ],
+        },
+        {
+            "type":        "open_extension_page",
+            "label":       "Open extension page (custom)",
+            "category":    "extensions",
+            "scope":       "any",
+            "description": "Like open_extension_popup but lets you "
+                           "pick a non-default page. OKX Wallet uses "
+                           "home.html, Coinbase uses index.html, "
+                           "MetaMask uses popup.html. Check the "
+                           "extension's manifest to find the right one.",
+            "params": [
+                {"name": "extension_id", "type": "extension", "required": False,
+                 "label": "Extension"},
+                {"name": "extension_name", "type": "text", "default": "",
+                 "label": "…or by name"},
+                {"name": "page", "type": "text", "default": "popup.html",
+                 "label": "Page",
+                 "placeholder": "popup.html / options.html / home.html"},
+                {"name": "wait_for_selector", "type": "text", "default": "",
+                 "label": "Wait for selector"},
+                {"name": "timeout", "type": "number", "default": 15,
+                 "label": "Wait timeout (s)"},
+                {"name": "save_handle_as", "type": "text", "default": "ext_tab",
+                 "label": "Save tab handle as"},
+            ],
+        },
+        {
+            "type":        "extension_wait_for",
+            "label":       "Wait for element in extension",
+            "category":    "extensions",
+            "scope":       "any",
+            "description": "Pause until a CSS selector appears in the "
+                           "open extension tab. Use between login steps "
+                           "to handle the wallet's loading screens.",
+            "params": [
+                {"name": "selector", "type": "text", "required": True,
+                 "label": "CSS selector",
+                 "placeholder": "input[type='password']"},
+                {"name": "timeout", "type": "number", "default": 15,
+                 "label": "Timeout (s)"},
+                {"name": "save_as", "type": "text", "default": "",
+                 "label": "Save text as",
+                 "hint": "Optional. If set, save the element's "
+                         "textContent into var.<name> when found."},
+            ],
+        },
+        {
+            "type":        "extension_click",
+            "label":       "Click in extension",
+            "category":    "extensions",
+            "scope":       "any",
+            "description": "Click an element inside the open extension "
+                           "tab. Auto-waits for the selector and "
+                           "scrolls it into view first.",
+            "params": [
+                {"name": "selector", "type": "text", "required": True,
+                 "label": "CSS selector",
+                 "placeholder": "[data-testid='unlock-button']"},
+                {"name": "timeout", "type": "number", "default": 10,
+                 "label": "Wait timeout (s)"},
+                {"name": "abort_on_error", "type": "bool", "default": False,
+                 "label": "Abort run on error"},
+            ],
+        },
+        {
+            "type":        "extension_fill",
+            "label":       "Fill input in extension",
+            "category":    "extensions",
+            "scope":       "any",
+            "description": "Type into a text input inside the open "
+                           "extension. Use {vault.<id>.password} or "
+                           "{vault.<id>.seed} placeholders for "
+                           "sensitive values — they're resolved from "
+                           "the credential vault at run-time.",
+            "params": [
+                {"name": "selector", "type": "text", "required": True,
+                 "label": "CSS selector",
+                 "placeholder": "input#password"},
+                {"name": "value", "type": "text", "required": True,
+                 "label": "Value",
+                 "placeholder": "{vault.metamask_main.password}",
+                 "hint": "Plain text or {vault.x.y} reference. The "
+                         "vault is decrypted before launch and pre-"
+                         "loaded into the runner's environment."},
+                {"name": "clear_first", "type": "bool", "default": True,
+                 "label": "Clear field before typing"},
+                {"name": "typewriter", "type": "bool", "default": True,
+                 "label": "Type one character at a time",
+                 "hint": "Slower but plays nicer with React-style "
+                         "input listeners that some wallets use."},
+                {"name": "timeout", "type": "number", "default": 10,
+                 "label": "Wait timeout (s)"},
+            ],
+        },
+        {
+            "type":        "extension_eval",
+            "label":       "Eval JS in extension",
+            "category":    "extensions",
+            "scope":       "any",
+            "description": "Run arbitrary JavaScript in the open "
+                           "extension tab. Asserts the current URL "
+                           "is chrome-extension:// so it fails loud "
+                           "if the popup isn't open. For reading "
+                           "wallet state via the extension's exposed "
+                           "API or for advanced scripting.",
+            "params": [
+                {"name": "code", "type": "textarea", "required": True,
+                 "label": "JavaScript",
+                 "placeholder": "return window.ethereum?.selectedAddress;",
+                 "hint": "Use a 'return' statement to send a value "
+                         "back into save_as."},
+                {"name": "save_as", "type": "text", "default": "",
+                 "label": "Save return value as"},
+                {"name": "abort_on_error", "type": "bool", "default": False,
+                 "label": "Abort run on error"},
+            ],
+        },
+        {
+            "type":        "extension_close",
+            "label":       "Close extension tab",
+            "category":    "extensions",
+            "scope":       "any",
+            "description": "Close the extension popup tab and switch "
+                           "back to the originating tab. Pairs with "
+                           "open_extension_popup. Safe no-op if the "
+                           "tab is already gone.",
+            "params": [
+                {"name": "handle", "type": "text", "default": "ext_tab",
+                 "label": "Tab handle variable",
+                 "hint": "Defaults to the same name "
+                         "open_extension_popup saved."},
             ],
         },
     ]

@@ -46,6 +46,7 @@ const ScriptsPage = {
     this.wireKeyboard();
     this.wireVarPicker();
     this.wireNewScriptModal();
+    this.wireCanvasZoom();
 
     window.addEventListener("beforeunload", e => {
       if (this.dirty) { e.preventDefault(); e.returnValue = ""; }
@@ -53,6 +54,111 @@ const ScriptsPage = {
     window.addEventListener("resize", () => this._scheduleArrowsRedraw());
 
     this._showLibrary();
+  },
+
+  // ── Figma-style canvas zoom ──────────────────────────────────
+  // Ctrl/Cmd + wheel anywhere inside .canvas-flow-wrap rescales
+  // the inner .canvas-flow via CSS transform: scale(--zoom). Plain
+  // wheel keeps default vertical scroll. Three toolbar buttons
+  // (− / + / ⌂) provide a click affordance and a reset target.
+  // Level persists in localStorage per editor session.
+  wireCanvasZoom() {
+    const ZOOM_KEY  = "scripts.canvas_zoom";
+    const MIN_ZOOM  = 0.30;
+    const MAX_ZOOM  = 3.00;
+    const STEP      = 1.10;     // 10% per wheel tick / button press
+
+    // Restore saved zoom or default to 1.0
+    let saved = parseFloat(localStorage.getItem(ZOOM_KEY) || "1");
+    if (!isFinite(saved) || saved < MIN_ZOOM || saved > MAX_ZOOM) saved = 1.0;
+    this._zoom = saved;
+
+    const apply = (newZoom, focal) => {
+      const z = Math.min(MAX_ZOOM, Math.max(MIN_ZOOM, newZoom));
+      this._zoom = z;
+      const flow = document.getElementById("canvas-flow");
+      if (flow) flow.style.setProperty("--zoom", String(z));
+      const lvl = document.getElementById("canvas-zoom-level");
+      if (lvl) lvl.textContent = `${Math.round(z * 100)}%`;
+      localStorage.setItem(ZOOM_KEY, String(z));
+      // Re-draw arrows after the transform settles -- their SVG
+      // coords are computed against the visible bounding boxes.
+      this._scheduleArrowsRedraw();
+
+      // Keep the focal point under the cursor: adjust scrollLeft/Top
+      // so the page point under the mouse stays put across zoom.
+      // Without this, zooming feels like the canvas jumps away from
+      // the cursor.
+      if (focal) {
+        const wrap = document.querySelector(".canvas-flow-wrap");
+        if (wrap) {
+          // ratio of NEW vs OLD is just newZoom/oldZoom; we don't
+          // track oldZoom explicitly because we already updated _zoom,
+          // but the focal-correction math needs the delta. We pass
+          // it via focal.deltaScale.
+          const ds = focal.deltaScale;
+          if (ds && isFinite(ds)) {
+            wrap.scrollLeft = (wrap.scrollLeft + focal.x) * ds - focal.x;
+            wrap.scrollTop  = (wrap.scrollTop  + focal.y) * ds - focal.y;
+          }
+        }
+      }
+    };
+
+    // Initial paint (in case localStorage had a non-default value)
+    apply(saved);
+
+    // Wheel listener on the wrap. preventDefault only when modifier
+    // is held -- otherwise let the browser scroll natively.
+    const wrap = document.querySelector(".canvas-flow-wrap");
+    if (wrap && wrap.dataset._zoomWired !== "1") {
+      wrap.dataset._zoomWired = "1";
+      wrap.addEventListener("wheel", (e) => {
+        if (!(e.ctrlKey || e.metaKey)) return;   // only modified scroll = zoom
+        e.preventDefault();
+        const oldZoom = this._zoom;
+        const factor  = e.deltaY < 0 ? STEP : 1 / STEP;
+        const newZoom = oldZoom * factor;
+        // Compute focal point relative to the wrap's content origin
+        const rect = wrap.getBoundingClientRect();
+        const focal = {
+          x: e.clientX - rect.left,
+          y: e.clientY - rect.top,
+          deltaScale: newZoom / oldZoom,
+        };
+        apply(newZoom, focal);
+      }, { passive: false });
+    }
+
+    // Toolbar buttons
+    const wireBtn = (id, fn) => {
+      const el = document.getElementById(id);
+      if (!el || el.dataset._zoomBtnWired === "1") return;
+      el.dataset._zoomBtnWired = "1";
+      el.addEventListener("click", fn);
+    };
+    wireBtn("canvas-zoom-in",    () => apply(this._zoom * STEP));
+    wireBtn("canvas-zoom-out",   () => apply(this._zoom / STEP));
+    wireBtn("canvas-zoom-reset", () => apply(1.0));
+
+    // Keyboard shortcuts: Ctrl++ / Ctrl+- / Ctrl+0 (mirror Figma/IDE).
+    // Only when editor view is visible -- otherwise we'd hijack the
+    // user's browser-level zoom on the library page.
+    document.addEventListener("keydown", (e) => {
+      const editor = document.getElementById("scripts-editor-view");
+      if (!editor || editor.style.display === "none") return;
+      if (!(e.ctrlKey || e.metaKey)) return;
+      if (e.key === "=" || e.key === "+") {
+        e.preventDefault();
+        apply(this._zoom * STEP);
+      } else if (e.key === "-" || e.key === "_") {
+        e.preventDefault();
+        apply(this._zoom / STEP);
+      } else if (e.key === "0") {
+        e.preventDefault();
+        apply(1.0);
+      }
+    });
   },
 
   teardown() {
@@ -771,8 +877,8 @@ const ScriptsPage = {
       body.innerHTML = `<div class="palette-empty">No actions available</div>`;
       return;
     }
-    const order = ["flow", "navigation", "interaction", "timing",
-                   "data", "external", "input", "power", "other"];
+    const order = ["flow", "ads", "navigation", "interaction", "timing",
+                   "data", "external", "extensions", "input", "power", "other"];
     const grouped = {};
     order.forEach(c => grouped[c] = []);
     this.catalog.forEach(a => {
@@ -781,11 +887,13 @@ const ScriptsPage = {
     });
     const groupLabels = {
       flow:        ["#22d3ee", "Flow control"],
+      ads:         ["#f97316", "Ads"],
       navigation:  ["#60a5fa", "Navigation"],
       interaction: ["#a78bfa", "Interaction"],
       timing:      ["#f59e0b", "Timing"],
       data:        ["#34d399", "Data"],
       external:    ["#fb7185", "External"],
+      extensions:  ["#a855f7", "Extensions"],
       input:       ["#94a3b8", "Input"],
       power:       ["#94a3b8", "Power"],
       other:       ["#94a3b8", "Other"],
@@ -1623,6 +1731,44 @@ const ScriptsPage = {
           ${hint}
         </div>`;
     }
+    // Extensions param type — picker populated from /api/extensions.
+    // We render a placeholder select + lazy-fetch the list on first
+    // mount; subsequent steps reuse the cached list. The picker keeps
+    // the existing value selected even if the pool is loading so the
+    // value isn't lost on re-render.
+    if (p.type === "extension") {
+      // Lazy cache shared across all extension fields in this session
+      if (!ScriptsPage._extPoolCache) ScriptsPage._extPoolCache = null;
+      const cache = ScriptsPage._extPoolCache;
+      const id = `ext-pick-${Math.random().toString(36).slice(2, 8)}`;
+      // If we don't have the cache yet, fire a load and re-render
+      // this field once it lands. Other fields rendered in the same
+      // pass will hook the same in-flight promise.
+      if (!cache && !ScriptsPage._extPoolPromise) {
+        ScriptsPage._extPoolPromise = fetch("/api/extensions")
+          .then(r => r.json())
+          .then(j => {
+            ScriptsPage._extPoolCache = j?.extensions || [];
+            // Re-render every pending picker by re-populating options
+            document.querySelectorAll("[data-ext-picker]").forEach(sel => {
+              const cur = sel.value;
+              sel.innerHTML = ScriptsPage._renderExtensionOptions(cur);
+            });
+          })
+          .catch(() => { ScriptsPage._extPoolCache = []; });
+      }
+      const optsHtml = cache
+        ? ScriptsPage._renderExtensionOptions(val)
+        : `<option value="${escapeHtml(String(val || ""))}">${val ? escapeHtml(String(val)) : "Loading…"}</option>`;
+      return `
+        <div class="inspector-field">
+          <div class="inspector-field-label">${label}</div>
+          <select class="select" data-param="${name}" data-ext-picker="1" id="${id}">
+            ${optsHtml}
+          </select>
+          ${hint}
+        </div>`;
+    }
     if (p.type === "select" && Array.isArray(p.options)) {
       const opts = p.options.map(o => {
         const ov = o.value ?? o;
@@ -1877,8 +2023,8 @@ const ScriptsPage = {
     const list  = $("#type-picker-list");
     const render = (q = "") => {
       const qLo = q.trim().toLowerCase();
-      const groups = { flow: [], navigation: [], interaction: [],
-                       timing: [], data: [], external: [],
+      const groups = { flow: [], ads: [], navigation: [], interaction: [],
+                       timing: [], data: [], external: [], extensions: [],
                        input: [], power: [], other: [] };
       this.catalog.forEach(c => {
         const cat = groups[c.category] ? c.category : "other";
@@ -1888,8 +2034,9 @@ const ScriptsPage = {
           groups[cat].push(c);
         }
       });
-      const order = ["flow", "navigation", "interaction", "timing",
-                     "data", "external", "input", "power", "other"];
+      const order = ["flow", "ads", "navigation", "interaction", "timing",
+                     "data", "external", "extensions",
+                     "input", "power", "other"];
       list.innerHTML = order.filter(k => groups[k].length).map(k => `
         <div class="palette-group-label" style="padding: 12px 4px 4px;">${k}</div>
         ${groups[k].map(a => `
@@ -2910,6 +3057,44 @@ const ScriptsPage = {
         ${hint}
       </div>`;
     }
+    // Extensions param type — picker populated from /api/extensions.
+    // We render a placeholder select + lazy-fetch the list on first
+    // mount; subsequent steps reuse the cached list. The picker keeps
+    // the existing value selected even if the pool is loading so the
+    // value isn't lost on re-render.
+    if (p.type === "extension") {
+      // Lazy cache shared across all extension fields in this session
+      if (!ScriptsPage._extPoolCache) ScriptsPage._extPoolCache = null;
+      const cache = ScriptsPage._extPoolCache;
+      const id = `ext-pick-${Math.random().toString(36).slice(2, 8)}`;
+      // If we don't have the cache yet, fire a load and re-render
+      // this field once it lands. Other fields rendered in the same
+      // pass will hook the same in-flight promise.
+      if (!cache && !ScriptsPage._extPoolPromise) {
+        ScriptsPage._extPoolPromise = fetch("/api/extensions")
+          .then(r => r.json())
+          .then(j => {
+            ScriptsPage._extPoolCache = j?.extensions || [];
+            // Re-render every pending picker by re-populating options
+            document.querySelectorAll("[data-ext-picker]").forEach(sel => {
+              const cur = sel.value;
+              sel.innerHTML = ScriptsPage._renderExtensionOptions(cur);
+            });
+          })
+          .catch(() => { ScriptsPage._extPoolCache = []; });
+      }
+      const optsHtml = cache
+        ? ScriptsPage._renderExtensionOptions(val)
+        : `<option value="${escapeHtml(String(val || ""))}">${val ? escapeHtml(String(val)) : "Loading…"}</option>`;
+      return `
+        <div class="inspector-field">
+          <div class="inspector-field-label">${label}</div>
+          <select class="select" data-param="${name}" data-ext-picker="1" id="${id}">
+            ${optsHtml}
+          </select>
+          ${hint}
+        </div>`;
+    }
     if (p.type === "select" && Array.isArray(p.options)) {
       const opts = p.options.map(o => {
         const v = typeof o === "string" ? o : o.value;
@@ -3162,6 +3347,32 @@ const ScriptsPage = {
       move_random: "🖱", random_delay: "⏳", open_url: "🌐",
     };
     return map[type] || "·";
+  },
+
+  // Build <option> tags for the extension picker. Empty option first
+  // so the user can clear the selection (then fall back to extension_name).
+  _renderExtensionOptions(currentValue) {
+    const pool = this._extPoolCache || [];
+    const cur = String(currentValue || "");
+    const escapeHtml = (s) => String(s == null ? "" : s)
+      .replace(/&/g, "&amp;").replace(/</g, "&lt;")
+      .replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+    const opts = [
+      `<option value="" ${cur === "" ? "selected" : ""}>— pick an extension —</option>`,
+    ];
+    for (const x of pool) {
+      const id = x.id || "";
+      const label = `${x.name || "(unnamed)"}${x.version ? "  v" + x.version : ""}`;
+      opts.push(
+        `<option value="${escapeHtml(id)}" ${cur === id ? "selected" : ""}>${escapeHtml(label)}</option>`
+      );
+    }
+    if (cur && !pool.some(x => x.id === cur)) {
+      // Preserve a value that points at an extension no longer in
+      // the pool (so we don't silently drop it on save).
+      opts.push(`<option value="${escapeHtml(cur)}" selected>${escapeHtml(cur)} (missing)</option>`);
+    }
+    return opts.join("");
   },
 };
 

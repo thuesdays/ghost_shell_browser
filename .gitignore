@@ -30,3 +30,4 @@ dist/
 # installer/ — maintainer-only build pipeline. End users
 # download GhostShellAntySetup.exe from GitHub Releases.
 installer/
+data/extensions_pool/

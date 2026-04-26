@@ -227,3 +227,154 @@ def delete_snapshot(snapshot_id: int) -> bool:
 
 def get_stats(profile_name: str) -> dict:
     return get_db().snapshot_stats(profile_name)
+
+
+# ═══════════════════════════════════════════════════════════════
+# Cross-profile injection (browserless)
+#
+# Pulls a snapshot from the pool and writes it to TARGET profile's
+# session_dir as cookies.json + storage.json. At next launch of the
+# target profile, the existing session-restore code (in
+# session/manager.py) reads these files and injects them via CDP
+# Network.setCookie. Result: target profile starts with ~50 third-
+# party tracking cookies from a real UA-commerce session instead of
+# cold zero-state -- looks aged to Google on first SERP visit.
+#
+# No browser launch needed. The actual injection happens
+# transparently the next time the user starts the target profile.
+# ═══════════════════════════════════════════════════════════════
+
+def inject_to_profile_dir(target_profile: str,
+                          snapshot_id: int = None,
+                          *,
+                          country: str = None,
+                          category: str = None,
+                          base_dir: str = None) -> dict:
+    """Write a snapshot's cookies+storage to target_profile's
+    session_dir/cookies.json + storage.json.
+
+    If snapshot_id is None, auto-pick the best matching snapshot
+    via snapshot_pool_pick_best(country, category, exclude=target).
+
+    Existing files in the target session_dir are MERGED rather than
+    overwritten -- if the target already has cookies (from a previous
+    run), pool cookies are appended unless a same-name+domain entry
+    already exists.
+
+    Returns: {ok, snapshot_id, source_profile, cookies_written,
+              storage_origins_written, merged_with_existing}
+    """
+    import os
+    import json as _json
+    from ghost_shell.session.cookies import (
+        profile_session_dir, cookies_path, storage_path,
+    )
+
+    db = get_db()
+
+    # Resolve snapshot
+    snap = None
+    if snapshot_id:
+        snap = db.snapshot_get(snapshot_id)
+        if not snap:
+            return {"ok": False, "error": f"snapshot {snapshot_id} not found"}
+    else:
+        snap = db.snapshot_pool_pick_best(
+            country=country, category=category,
+            exclude_profile=target_profile,
+        )
+        if not snap:
+            return {
+                "ok":      False,
+                "error":   "no matching snapshot in pool",
+                "tried":   {"country": country, "category": category},
+            }
+        snapshot_id = snap.get("id")
+
+    pool_cookies = snap.get("cookies") or []
+    pool_storage = snap.get("storage") or {}
+
+    # Make sure session_dir exists
+    sdir = profile_session_dir(target_profile, base_dir)
+    os.makedirs(sdir, exist_ok=True)
+
+    cpath = cookies_path(target_profile, base_dir)
+    spath = storage_path(target_profile, base_dir)
+
+    # Merge with existing cookies.json if any
+    existing_cookies: list = []
+    merged_with_existing = False
+    if os.path.exists(cpath):
+        try:
+            with open(cpath, "r", encoding="utf-8") as f:
+                existing_cookies = _json.load(f) or []
+            merged_with_existing = True
+        except Exception as e:
+            logging.warning(f"[cookie_pool] couldn't read existing cookies: {e}")
+            existing_cookies = []
+
+    # Index existing by (name, domain) for dedupe
+    seen = set()
+    for c in existing_cookies:
+        if isinstance(c, dict):
+            seen.add((c.get("name"), c.get("domain")))
+
+    appended = 0
+    for c in pool_cookies:
+        if not isinstance(c, dict):
+            continue
+        key = (c.get("name"), c.get("domain"))
+        if key in seen:
+            continue
+        existing_cookies.append(c)
+        seen.add(key)
+        appended += 1
+
+    try:
+        with open(cpath, "w", encoding="utf-8") as f:
+            _json.dump(existing_cookies, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        return {"ok": False,
+                "error": f"couldn't write {cpath}: {e}"}
+
+    # Merge storage similarly -- per-origin
+    existing_storage: dict = {}
+    if os.path.exists(spath):
+        try:
+            with open(spath, "r", encoding="utf-8") as f:
+                existing_storage = _json.load(f) or {}
+        except Exception:
+            existing_storage = {}
+
+    storage_origins_added = 0
+    for origin, data in (pool_storage or {}).items():
+        if origin not in existing_storage:
+            existing_storage[origin] = data
+            storage_origins_added += 1
+
+    try:
+        with open(spath, "w", encoding="utf-8") as f:
+            _json.dump(existing_storage, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        # Non-fatal -- cookies are the most important thing
+        logging.warning(f"[cookie_pool] storage write failed: {e}")
+
+    logging.info(
+        f"[cookie_pool] injected snapshot #{snapshot_id} "
+        f"from {snap.get('profile_name')!r} into "
+        f"{target_profile!r}: +{appended} cookies, "
+        f"+{storage_origins_added} storage origins "
+        f"(merged_existing={merged_with_existing})"
+    )
+
+    return {
+        "ok":                       True,
+        "snapshot_id":              snapshot_id,
+        "source_profile":           snap.get("profile_name"),
+        "cookies_written":          appended,
+        "storage_origins_written":  storage_origins_added,
+        "total_cookies_after":      len(existing_cookies),
+        "merged_with_existing":     merged_with_existing,
+        "country":                  snap.get("country"),
+        "category":                 snap.get("category"),
+    }

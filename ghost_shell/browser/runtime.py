@@ -37,6 +37,135 @@ except Exception:
 # Import our deterministic payload builder
 from ghost_shell.fingerprint.device_templates import DeviceTemplateBuilder
 
+
+# ─── Extension Preferences pre-accept (Phase 6) ─────────────────────
+#
+# When Chrome launches with --load-extension, the loaded extensions
+# are marked as "developer-mode" and trigger:
+#   1. a yellow "Disable developer mode extensions" warning bar at the
+#      top of every window (suppressible with --disable-features=…
+#      already set elsewhere)
+#   2. a "Did you mean to install this extension?" sidebar callout the
+#      first time it loads
+#   3. for permission-heavy extensions (wallets), a per-permission
+#      accept modal blocking the first popup
+#
+# This helper writes the right entries into the profile's
+# Default/Preferences JSON BEFORE Chrome reads it on launch — the
+# extension shows up as already-trusted with all permissions granted.
+# Idempotent: re-runs safely on every launch and merges into existing
+# state if the user has touched the file in DevTools.
+#
+# The mechanism uses Chrome's "extensions.settings" preferences, which
+# are documented (sort of) in the Chrome ExtensionPrefs spec. Each
+# extension gets:
+#   - "location": 4   → "command line"; recognized as not-sideloaded
+#   - "state":    1   → enabled
+#   - "from_webstore": True (only for source=cws extensions)
+#   - "granted_permissions": copy of the manifest's permission set
+def _ext_pre_accept_prefs(user_data_dir: str, ext_id_paths: list):
+    """ext_id_paths is a list of (ext_id, pool_dir) tuples."""
+    import json as _json, os as _os
+    if not user_data_dir or not ext_id_paths:
+        return
+    pref_path = _os.path.join(user_data_dir, "Default", "Preferences")
+    _os.makedirs(_os.path.dirname(pref_path), exist_ok=True)
+    if _os.path.exists(pref_path):
+        try:
+            with open(pref_path, "r", encoding="utf-8") as f:
+                prefs = _json.load(f)
+        except Exception:
+            prefs = {}
+    else:
+        prefs = {}
+
+    extensions = prefs.setdefault("extensions", {})
+    settings   = extensions.setdefault("settings", {})
+
+    for ext_id, pool_dir in ext_id_paths:
+        if not ext_id:
+            continue
+        # Read the manifest to extract permissions
+        permissions = []
+        host_permissions = []
+        manifest_dict = {}
+        if pool_dir:
+            mf_path = _os.path.join(pool_dir, "manifest.json")
+            try:
+                with open(mf_path, "r", encoding="utf-8-sig") as f:
+                    manifest_dict = _json.load(f)
+                permissions      = list(manifest_dict.get("permissions") or [])
+                host_permissions = list(manifest_dict.get("host_permissions") or [])
+                # MV2 puts host patterns into "permissions"
+                if int(manifest_dict.get("manifest_version") or 2) == 2:
+                    splits = [], []
+                    for p in permissions:
+                        (splits[0] if "://" in p else splits[1]).append(p)
+                    host_permissions = splits[0] + host_permissions
+                    permissions      = splits[1]
+            except Exception:
+                pass
+
+        entry = settings.get(ext_id, {})
+        entry.update({
+            "location":      4,           # COMMAND_LINE — not flagged as sideload
+            "state":         1,           # ENABLED
+            "from_webstore": False,       # we don't claim CWS to avoid signature check
+            "was_installed_by_default":   False,
+            "was_installed_by_oem":       False,
+            "creation_flags":              38,   # NO_WHITELIST | INSTALL_FLAG_FROM_WEBSTORE off
+            "ack_external":                True, # silence "you have a new extension" toast
+        })
+        # Pre-grant requested permissions so first popup-launch doesn't
+        # show the "needs your permission" modal.
+        if permissions or host_permissions:
+            entry["granted_permissions"] = {
+                "api":             permissions,
+                "explicit_host":   host_permissions,
+                "scriptable_host": host_permissions,
+            }
+            entry["active_permissions"] = entry["granted_permissions"]
+        if manifest_dict:
+            entry["manifest"] = manifest_dict
+        settings[ext_id] = entry
+
+    # Pin every installed extension to the toolbar so the icon shows
+    # up next to the address bar by default — instead of being hidden
+    # in the puzzle-piece overflow menu. The user can still unpin
+    # manually via the puzzle-piece UI; we only set the initial state.
+    #
+    # IMPORTANT: the actual key Chrome 138+ checks is
+    # `extensions.pinned_actions` (a list of extension IDs as
+    # strings). Verified empirically against the user's manually-
+    # pinned profile Preferences file in 2026-04. Earlier Chrome
+    # versions had `pinned_extensions` and `toolbar` as the same-
+    # shape backups — we set all three so any Chrome from 88 to 149+
+    # finds the right one and the others are silently ignored.
+    pinned_actions = extensions.setdefault("pinned_actions", [])
+    pinned_extensions = extensions.setdefault("pinned_extensions", [])
+    legacy_toolbar = extensions.setdefault("toolbar", [])
+    for ext_id, _ in ext_id_paths:
+        if not ext_id:
+            continue
+        if ext_id not in pinned_actions:
+            pinned_actions.append(ext_id)
+        if ext_id not in pinned_extensions:
+            pinned_extensions.append(ext_id)
+        if ext_id not in legacy_toolbar:
+            legacy_toolbar.append(ext_id)
+
+    # `alerts.initialized` skips the "extensions you didn't install"
+    # warning balloon Chrome shows on first launch with side-loaded code.
+    extensions.setdefault("alerts", {})["initialized"] = True
+
+    try:
+        with open(pref_path, "w", encoding="utf-8") as f:
+            _json.dump(prefs, f, ensure_ascii=False)
+    except Exception:
+        pass
+
+
+
 class GhostShellBrowser:
     def __init__(
         self,
@@ -594,6 +723,134 @@ class GhostShellBrowser:
         options.add_argument("--disable-infobars")
         options.add_argument("--disable-notifications")
         options.add_argument("--disable-popup-blocking")
+
+        # ── Per-profile extensions ───────────────────────────────────
+        # Pull the assigned extension list from DB and inject the
+        # --load-extension flag pointing at the shared pool. Each
+        # profile gets the same code (read-only mount), but writes
+        # state into its own user-data-dir under
+        # Default/Local Extension Settings/<id>/ etc — so login
+        # state, IndexedDB, and chrome.storage all persist per
+        # profile without us copying any files.
+        #
+        # We also pass --disable-extensions-except so Chrome doesn't
+        # silently load any default/component extensions we didn't
+        # ask for (component extensions can be a fingerprint signal).
+        try:
+            from ghost_shell.db.database import get_db as _getdb
+            _db = _getdb()
+            assigned = _db.profile_extensions_get(
+                self.profile_name, only_enabled=True,
+            ) if hasattr(_db, "profile_extensions_get") else []
+            ext_paths = []
+            for row in assigned:
+                pp = row.get("pool_path")
+                if pp and os.path.isdir(pp):
+                    # One-shot repair: if the on-disk manifest is missing
+                    # default_locale but uses __MSG_ placeholders, Chrome
+                    # refuses to load it. Fix in place so existing pool
+                    # entries installed before that fix landed don't need
+                    # to be manually re-installed by the user.
+                    try:
+                        from ghost_shell.extensions.pool import (
+                            parse_manifest, _ensure_default_locale,
+                            _sanitize_match_patterns,
+                            _ensure_required_fields,
+                        )
+                        import json as _json
+                        mf_path = os.path.join(pp, "manifest.json")
+                        manifest = parse_manifest(mf_path)
+                        if manifest:
+                            # Snapshot the keys we mutate to detect
+                            # whether anything actually changed (avoid
+                            # rewriting the file every launch when the
+                            # manifest is already clean).
+                            before = _json.dumps({
+                                "name":            manifest.get("name"),
+                                "version":         manifest.get("version"),
+                                "default_locale":  manifest.get("default_locale"),
+                                "content_scripts": manifest.get("content_scripts"),
+                                "host_permissions": manifest.get("host_permissions"),
+                                "permissions":     manifest.get("permissions"),
+                                "war":             manifest.get("web_accessible_resources"),
+                            }, sort_keys=True)
+                            _ensure_default_locale(pp, manifest)
+                            _ensure_required_fields(pp, manifest)
+                            _sanitize_match_patterns(manifest)
+                            after = _json.dumps({
+                                "name":            manifest.get("name"),
+                                "version":         manifest.get("version"),
+                                "default_locale":  manifest.get("default_locale"),
+                                "content_scripts": manifest.get("content_scripts"),
+                                "host_permissions": manifest.get("host_permissions"),
+                                "permissions":     manifest.get("permissions"),
+                                "war":             manifest.get("web_accessible_resources"),
+                            }, sort_keys=True)
+                            if before != after:
+                                with open(mf_path, "w", encoding="utf-8") as _f:
+                                    _json.dump(manifest, _f,
+                                               ensure_ascii=False, indent=2)
+                                logging.info(
+                                    f"[GhostShellBrowser] manifest repaired "
+                                    f"for {os.path.basename(pp)}"
+                                )
+                    except Exception as _e:
+                        logging.debug(
+                            f"[GhostShellBrowser] manifest repair skipped "
+                            f"for {pp}: {_e}"
+                        )
+                    ext_paths.append(pp)
+                else:
+                    logging.warning(
+                        f"[GhostShellBrowser] extension {row.get('extension_id')!r} "
+                        f"has no pool_path or it doesn't exist on disk -- skipping"
+                    )
+            if ext_paths:
+                joined = ",".join(ext_paths)
+                options.add_argument(f"--load-extension={joined}")
+                options.add_argument(f"--disable-extensions-except={joined}")
+                # Suppress the "Disable developer mode extensions" bubble
+                # that appears at the top of every Chrome window when
+                # --load-extension is used. The flag was added in Chrome
+                # 137; on older builds it's a no-op (harmless).
+                #
+                # CRITICAL: must be merged into the unified --disable-features
+                # at the bottom of this method — Chrome's CLI parser keeps
+                # only the LAST --disable-features argument. We stash the
+                # feature names on self so the unified block can pick them up.
+                self._extra_disable_features = list(getattr(
+                    self, "_extra_disable_features", []
+                )) + ["DisableLoadExtensionCommandLineSwitch"]
+
+                # Phase 6: pre-populate the profile's Preferences JSON so
+                # the extension is marked "user-installed" rather than
+                # sideloaded. This skips the "Disable developer mode
+                # extensions" prompt AND the per-permission accept dialog
+                # on first launch. Idempotent — safe to call every launch.
+                try:
+                    _ext_pre_accept_prefs(
+                        self.user_data_path,
+                        [(row["extension_id"], row.get("pool_path"))
+                         for row in assigned if row.get("pool_path")],
+                    )
+                except Exception as _e:
+                    logging.debug(f"[GhostShellBrowser] extension prefs pre-accept skipped: {_e}")
+
+                logging.info(
+                    f"[GhostShellBrowser] loaded {len(ext_paths)} "
+                    f"extension(s) for profile {self.profile_name!r}"
+                )
+                # Stamp installed_at on each row so the UI can show
+                # "last verified present" timestamps.
+                for row in assigned:
+                    try:
+                        _db.profile_extensions_mark_installed(
+                            self.profile_name, row["extension_id"],
+                        )
+                    except Exception:
+                        pass
+        except Exception as e:
+            logging.debug(f"[GhostShellBrowser] extension load skipped: {e}")
         # --disable-blink-features=AutomationControlled REMOVED - redundant
         # with C++ patches and is itself a detection marker.
 
@@ -665,8 +922,11 @@ class GhostShellBrowser:
         options.add_argument("--disable-translate")
         # ONE unified --disable-features flag. Chrome overwrites duplicates,
         # so we merge WebRtcHideLocalIpsWithMdns (fingerprint hardening)
-        # with traffic-saving feature disables.
-        options.add_argument("--disable-features=" + ",".join([
+        # with traffic-saving feature disables AND any per-launch features
+        # registered earlier in this method (extensions module appends
+        # `DisableLoadExtensionCommandLineSwitch` here so the dev-mode
+        # warning bubble is suppressed only when extensions actually load).
+        _disable_features = [
             # Fingerprint hardening — kept from the prior WebRTC block
             "WebRtcHideLocalIpsWithMdns",
             # Traffic savings
@@ -678,7 +938,14 @@ class GhostShellBrowser:
             "Translate",
             "AutofillServerCommunication",
             "CertificateTransparencyComponentUpdater",
-        ]))
+        ]
+        _disable_features += list(getattr(self, "_extra_disable_features", []))
+        # de-dupe while preserving order (some Chrome builds care)
+        _seen = set(); _ordered = []
+        for _f in _disable_features:
+            if _f not in _seen:
+                _seen.add(_f); _ordered.append(_f)
+        options.add_argument("--disable-features=" + ",".join(_ordered))
         # Per-pref knob — belt and suspenders. `prefs` gets merged into
         # the profile's Preferences JSON before Chrome reads it.
         options.add_experimental_option("prefs", {
@@ -2693,89 +2960,4 @@ class GhostShellBrowser:
 
     def close(self):
         """Gracefully terminates the driver and background processes."""
-        # Release our profile lock ASAP — even if the rest of shutdown
-        # fails, a follow-up run against the same profile should be able
-        # to start (other protections will still catch true double-spawn).
-        gs_lock = getattr(self, "_gs_lock_path", None)
-        if gs_lock and os.path.exists(gs_lock):
-            try:
-                os.remove(gs_lock)
-            except OSError:
-                pass
-
-        # Stop watchdog FIRST — we don't want it killing Chrome mid-shutdown
-        # if our save operations take >30s.
-        try:
-            self._watchdog_stop.set()
-        except Exception:
-            pass
-
-        # Stop traffic collector SECOND — it does one final poll via
-        # execute_script(). That requires the driver to still be alive.
-        if getattr(self, "_traffic_collector", None):
-            try:
-                self._traffic_collector.stop()
-            except Exception as e:
-                logging.debug(f"[GhostShellBrowser] traffic collector stop: {e}")
-            self._traffic_collector = None
-
-        if self.driver and self.auto_session and self.is_alive():
-            try:
-                self._auto_save_session()
-            except Exception as e:
-                logging.warning(f"[GhostShellBrowser] Session auto-save failed during shutdown: {e}")
-
-        if self.driver:
-            try:
-                self.driver.quit()
-            except Exception:
-                pass
-            self.driver = None
-
-        if self._proxy_forwarder:
-            try:
-                self._proxy_forwarder.stop()
-                logging.info("[GhostShellBrowser] Local proxy forwarder terminated.")
-            except Exception:
-                pass
-
-        # Re-stamp Preferences with exited_cleanly=true. driver.quit()
-        # sends SIGTERM/closes handles, which Chrome uses to write its
-        # own clean-exit markers. BUT if we got here via the hang
-        # detector killing the process (SIGKILL), or the process was
-        # terminated by the OS, Chrome never gets that chance — its
-        # Preferences still has exited_cleanly=false. On next launch
-        # Chrome treats that as a crash and tries to restore tabs
-        # (THIS is the "9 tabs pile up" symptom from the user's report).
-        #
-        # Post-shutdown re-stamp fixes this unconditionally: whatever
-        # Chrome wrote during its own shutdown gets overwritten by us
-        # with exit_type=Normal and exited_cleanly=true, so next launch
-        # has a clean-exit marker regardless of how we got here.
-        try:
-            pref_path = os.path.join(self.user_data_path, "Default", "Preferences")
-            if os.path.exists(pref_path):
-                with open(pref_path, "r", encoding="utf-8") as f:
-                    prefs = json.load(f)
-                if isinstance(prefs, dict):
-                    prefs.setdefault("profile", {})
-                    prefs["profile"]["exit_type"]      = "Normal"
-                    prefs["profile"]["exited_cleanly"] = True
-                    tmp = pref_path + ".tmp"
-                    with open(tmp, "w", encoding="utf-8") as f:
-                        json.dump(prefs, f)
-                    os.replace(tmp, pref_path)
-        except Exception as e:
-            logging.debug(f"[GhostShellBrowser] post-shutdown pref stamp: {e}")
-
-        # Detach our profile-specific file handler so logs from the next
-        # run don't double up if the process stays alive (e.g. scheduler).
-        if getattr(self, "_profile_log_handler", None) is not None:
-            try:
-                logging.getLogger().removeHandler(self._profile_log_handler)
-                self._profile_log_handler.close()
-            except Exception:
-                pass
-            self._profile_log_handler = None
-
-        logging.info(f"[GhostShellBrowser] Session successfully closed. Profile: {self.profile_name}")
+        # Release our profile lock ASAP 

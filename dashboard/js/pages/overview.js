@@ -23,7 +23,14 @@ const Overview = {
       this.loadProfileHealth(),
       this.loadActivityFeed(),
       this.loadFingerprintHealth(),
+      this.loadAdDensity(),
     ]);
+    // Wire the refresh button on the density panel (idempotent)
+    const refreshBtn = document.getElementById("ov-density-refresh");
+    if (refreshBtn && refreshBtn.dataset._wired !== "1") {
+      refreshBtn.dataset._wired = "1";
+      refreshBtn.addEventListener("click", () => this.loadAdDensity());
+    }
 
     // Auto-refresh — quick polls, only the cheap stuff
     clearInterval(this._pollTimer);
@@ -186,6 +193,195 @@ const Overview = {
       countEl.textContent = "—";
       subEl.textContent   = "—";
     }
+  },
+
+  // ─── Ad density trend widget ───────────────────────────────
+  // The "is our algo improving things" panel. Headline numbers +
+  // 14-day sparkline + per-profile/per-IP drill-downs. Single
+  // backend call to /api/metrics/ad-density returns everything.
+  async loadAdDensity() {
+    const body = document.getElementById("ov-density-body");
+    if (!body) return;
+    try {
+      const m = await api("/api/metrics/ad-density");
+      body.innerHTML = this._renderDensityWidget(m);
+    } catch (e) {
+      body.innerHTML =
+        `<div class="muted" style="padding:12px;">
+           Failed to load metrics: ${escapeHtml(e.message || e)}
+         </div>`;
+    }
+  },
+
+  _renderDensityWidget(m) {
+    const s = m.summary || {};
+    const daily = m.daily || [];
+    const profiles = m.per_profile || [];
+    const ips = m.per_ip || [];
+
+    // Headline: avg ads/query 7d + delta + run count + ctr
+    const avg7  = (s.avg_ads_per_query_7d ?? 0).toFixed(2);
+    const avg24 = (s.avg_ads_per_query_24h ?? 0).toFixed(2);
+    const delta = s.delta_pct;
+    const deltaStr = delta == null
+      ? `<span class="muted">first week — no comparison yet</span>`
+      : (delta >= 0
+         ? `<span style="color:var(--healthy,#22c55e)">▲ ${delta.toFixed(1)}%</span> vs prior 7d`
+         : `<span style="color:var(--critical,#ef4444)">▼ ${Math.abs(delta).toFixed(1)}%</span> vs prior 7d`);
+    const runs7 = s.total_runs_7d ?? 0;
+    const ads7  = s.total_ads_7d ?? 0;
+    const q7    = s.total_queries_7d ?? 0;
+    const clicks7 = s.total_clicks_7d ?? 0;
+    const ctr   = ((s.ctr_7d ?? 0) * 100).toFixed(1);
+
+    // Sparkline: ads_per_query for last 14 days, simple SVG
+    const spark = this._renderSparkline(
+      daily.map(d => d.ads_per_query || 0),
+      daily.map(d => d.date),
+    );
+
+    // Per-profile mini table
+    const profileRows = profiles.length
+      ? profiles.map(p => `
+          <tr>
+            <td>${escapeHtml(p.profile_name)}</td>
+            <td class="num">${p.runs}</td>
+            <td class="num"><strong>${p.ads_per_query.toFixed(2)}</strong></td>
+          </tr>`).join("")
+      : `<tr><td colspan="3" class="dense-empty-cell">No completed runs in last 7 days</td></tr>`;
+
+    // Per-IP mini table
+    const ipRows = ips.length
+      ? ips.map(p => `
+          <tr>
+            <td><code style="font-size:11px;">${escapeHtml(p.ip || "?")}</code>
+                ${p.country ? `<span class="muted" style="font-size:11px;"> · ${escapeHtml(p.country)}</span>` : ""}</td>
+            <td class="num">${p.runs}</td>
+            <td class="num"><strong>${p.ads_per_query.toFixed(2)}</strong></td>
+          </tr>`).join("")
+      : `<tr><td colspan="3" class="dense-empty-cell">No IP data yet (runs without geo lookup)</td></tr>`;
+
+    return `
+      <div style="display: grid;
+                  grid-template-columns: minmax(260px, 1fr) minmax(280px, 2fr);
+                  gap: 16px; padding: 12px;">
+        <!-- Left: headline numbers -->
+        <div>
+          <div style="display:flex; align-items:baseline; gap:8px;">
+            <div style="font-size: 32px; font-weight: 600;
+                        color: var(--accent, #6366f1);">
+              ${avg7}
+            </div>
+            <div class="muted" style="font-size: 12px;">ads / query · 7d</div>
+          </div>
+          <div style="font-size: 12px; margin-top: 4px;">${deltaStr}</div>
+
+          <div style="display: grid; grid-template-columns: 1fr 1fr;
+                      gap: 8px; margin-top: 14px; font-size: 12px;">
+            <div>
+              <div class="muted">Last 24h avg</div>
+              <div style="font-size: 16px; font-weight: 500;">${avg24}</div>
+            </div>
+            <div>
+              <div class="muted">Runs 7d</div>
+              <div style="font-size: 16px; font-weight: 500;">${runs7}</div>
+            </div>
+            <div>
+              <div class="muted">Total ads 7d</div>
+              <div style="font-size: 16px; font-weight: 500;">${ads7}</div>
+            </div>
+            <div>
+              <div class="muted">CTR proxy</div>
+              <div style="font-size: 16px; font-weight: 500;">${ctr}%
+                <span class="muted" style="font-size:10px;">(${clicks7}/${ads7})</span>
+              </div>
+            </div>
+          </div>
+
+          <div style="margin-top: 14px;">
+            <div class="muted" style="font-size: 10px; text-transform: uppercase;
+                                       margin-bottom: 4px;">
+              14-day trend
+            </div>
+            ${spark}
+          </div>
+        </div>
+
+        <!-- Right: drill-down tables -->
+        <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 12px;">
+          <div>
+            <div class="muted" style="font-size: 10px; text-transform: uppercase;
+                                       margin-bottom: 6px;">
+              Top profiles · 7d
+            </div>
+            <table class="dense-table" style="font-size: 12px;">
+              <thead><tr>
+                <th>Profile</th><th class="num">Runs</th><th class="num">Ads/q</th>
+              </tr></thead>
+              <tbody>${profileRows}</tbody>
+            </table>
+          </div>
+          <div>
+            <div class="muted" style="font-size: 10px; text-transform: uppercase;
+                                       margin-bottom: 6px;">
+              Top IPs · 7d
+            </div>
+            <table class="dense-table" style="font-size: 12px;">
+              <thead><tr>
+                <th>IP</th><th class="num">Runs</th><th class="num">Ads/q</th>
+              </tr></thead>
+              <tbody>${ipRows}</tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+    `;
+  },
+
+  _renderSparkline(values, labels) {
+    if (!values || !values.length) {
+      return `<div class="muted" style="font-size: 11px;">No data yet</div>`;
+    }
+    const W = 240, H = 50, P = 4;
+    const max = Math.max(...values, 0.5);  // avoid /0
+    const stepX = values.length > 1 ? (W - 2 * P) / (values.length - 1) : 0;
+    const points = values.map((v, i) => {
+      const x = P + i * stepX;
+      const y = H - P - ((v / max) * (H - 2 * P));
+      return [x, y];
+    });
+    const path = points.map((p, i) =>
+      (i === 0 ? "M" : "L") + p[0].toFixed(1) + "," + p[1].toFixed(1)
+    ).join(" ");
+    // Gradient fill underneath the line
+    const fill = `M${points[0][0]},${H - P} ` +
+                 points.map(p => `L${p[0].toFixed(1)},${p[1].toFixed(1)}`).join(" ") +
+                 ` L${points[points.length - 1][0]},${H - P} Z`;
+
+    const tooltips = values.map((v, i) =>
+      `${labels[i] || ""}: ${v.toFixed(2)} ads/q`
+    ).join(" · ");
+
+    return `
+      <svg viewBox="0 0 ${W} ${H}" width="100%" height="${H}"
+           preserveAspectRatio="none"
+           style="display: block; width: 100%;">
+        <title>${escapeHtml(tooltips)}</title>
+        <defs>
+          <linearGradient id="sparkfill" x1="0" y1="0" x2="0" y2="1">
+            <stop offset="0%" stop-color="var(--accent, #6366f1)" stop-opacity=".3"/>
+            <stop offset="100%" stop-color="var(--accent, #6366f1)" stop-opacity="0"/>
+          </linearGradient>
+        </defs>
+        <path d="${fill}" fill="url(#sparkfill)" stroke="none"/>
+        <path d="${path}" fill="none"
+              stroke="var(--accent, #6366f1)" stroke-width="1.8"/>
+        ${points.map(p => `
+          <circle cx="${p[0].toFixed(1)}" cy="${p[1].toFixed(1)}"
+                  r="2" fill="var(--accent, #6366f1)"/>
+        `).join("")}
+      </svg>
+    `;
   },
 
   // ─── Profile health (left column) ──────────────────────────
