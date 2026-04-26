@@ -2688,24 +2688,48 @@ const ScriptsPage = {
 
   async _exportScript(sc) {
     try {
-      const full = await api(`/api/scripts/${sc.id}`);
+      // Bug fix: endpoint returns {"script": {...}} (envelope) but
+      // the previous code read fields directly off `full`, so
+      // full.name was undefined -> "Cannot read properties of
+      // undefined (reading 'replace')". Unwrap the envelope and
+      // also guard against partial / null fields so the export
+      // never crashes mid-download.
+      const resp = await api(`/api/scripts/${sc.id}`);
+      const full = (resp && resp.script) || resp || {};
+      const name        = full.name || sc.name || `script_${sc.id}`;
+      const description = full.description || "";
+      const flow        = Array.isArray(full.flow) ? full.flow : [];
+      const tags        = Array.isArray(full.tags) ? full.tags : [];
       const blob = new Blob(
         [JSON.stringify({
-          name:        full.name,
-          description: full.description || "",
-          flow:        full.flow || [],
+          // Match the format the importer expects (see /api/scripts
+          // POST + the existing _exportScript at line 669 which uses
+          // a _meta envelope). Add _meta here too for symmetry.
+          _meta: {
+            format:      "ghost-shell-flow",
+            version:     1,
+            name:        name,
+            description: description,
+            exported_at: new Date().toISOString(),
+          },
+          name:        name,
+          description: description,
+          tags:        tags,
+          flow:        flow,
         }, null, 2)],
         { type: "application/json" });
       const url = URL.createObjectURL(blob);
       const a = document.createElement("a");
       a.href = url;
-      a.download = `${full.name.replace(/[^\w.-]+/g, "_")}.json`;
+      const safeName = String(name).replace(/[^\w.-]+/g, "_") || `script_${sc.id}`;
+      a.download = `${safeName}.json`;
       document.body.appendChild(a);
       a.click();
       a.remove();
       setTimeout(() => URL.revokeObjectURL(url), 0);
+      toast(`✓ Exported ${safeName}.json`);
     } catch (e) {
-      toast(`Export failed: ${e.message}`, true);
+      toast(`Export failed: ${e.message || e}`, true);
     }
   },
 

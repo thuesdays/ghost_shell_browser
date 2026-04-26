@@ -1,8 +1,8 @@
 {
   "name": "Smart Search & Click (competitor-only)",
-  "description": "Loops through your search queries. If the SERP has no ads on first load, refreshes up to 3 times (Google often reveals ads only on the 2nd or 3rd impression). For each ad found, the if-branches let you treat each class differently: competitor ads get clicked + read with a realistic dwell, your own / target-domain ads can be skipped (extend the condition list per row). Replace the queries placeholder with your own keyword list before running.",
+  "description": "Loops through your search queries. Each iteration runs commercial_inflate FIRST (2 generic commercial pre-queries) so Google's commercial-intent context is warm, then the brand search returns 2-5x more ads. If the SERP has no ads on first load, refreshes up to 3 times (Google often reveals ads only on the 2nd or 3rd impression). For each ad found, the if-branches let you treat each class differently: competitor ads get clicked + read with a realistic dwell, your own / target-domain ads are skipped automatically (ad_is_competitor filter). Replace the queries placeholder with your own keyword list before running.",
   "category": "recon",
-  "tags": ["google", "ads", "competitors", "smart"],
+  "tags": ["google", "ads", "competitors", "smart", "ad-density"],
   "flow": [
     {
       "type": "loop",
@@ -11,6 +11,17 @@
       "item_var": "item",
       "shuffle": true,
       "steps": [
+        {
+          "type": "commercial_inflate",
+          "enabled": true,
+          "brand": "{item}",
+          "n": 2,
+          "dwell_min": 8,
+          "dwell_max": 15,
+          "locale": "UA",
+          "click_organic": false,
+          "_comment": "Pre-warm Google's commercial-intent context. Set click_organic=true for a stronger signal at the cost of ~10s per pre-query."
+        },
         {
           "type": "search_query",
           "enabled": true,

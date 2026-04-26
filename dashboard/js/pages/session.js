@@ -97,6 +97,10 @@ const SessionPage = (() => {
 
     // Chrome import
     $("#sess-import-run-btn").addEventListener("click", runChromeImport);
+    // Pre-fill the source path on page load + render the candidate
+    // dropdown for multi-profile Chrome users. Non-blocking: page is
+    // usable even while this is in flight or if it fails entirely.
+    _autodetectChromeSource();
 
     // Tabs
     $("#session-tabs").addEventListener("click", (e) => {
@@ -524,12 +528,108 @@ const SessionPage = (() => {
     try {
       const r = await api(`/api/profiles/${encodeURIComponent(state.currentProfile)}/chrome-import`,
                           { method: "POST", body: JSON.stringify(body) });
-      status.textContent = `✓ ${r.urls_imported ?? 0} URLs, ${r.bookmarks_imported ?? 0} bookmarks`;
-      toast("Chrome data imported");
+      // Bug fix: backend returns {ok, source, summary:{history:int, bookmarks:int, preferences:dict, top_sites:dict}}.
+      // The previous code read r.urls_imported / r.bookmarks_imported,
+      // which are undefined -- always rendered "0 URLs, 0 bookmarks"
+      // even when the import worked. Read from r.summary instead.
+      const sum = (r && r.summary) || {};
+      const urls   = typeof sum.history   === "number" ? sum.history   : (sum.history?.imported ?? 0);
+      const bms    = typeof sum.bookmarks === "number" ? sum.bookmarks : (sum.bookmarks?.imported ?? 0);
+      const prefs  = sum.preferences && (sum.preferences === true || sum.preferences.ok) ? "✓" : "—";
+      const tops   = sum.top_sites   && (sum.top_sites   === true || sum.top_sites.ok)   ? "✓" : "—";
+      const srcLine = r && r.source
+        ? `from ${(r.source || "").length > 50 ? "…" + r.source.slice(-50) : r.source}`
+        : "";
+      status.textContent = `✓ ${urls} URLs, ${bms} bookmarks, prefs ${prefs}, top-sites ${tops}  ${srcLine}`;
+      // Diagnostic: if all four came back as zero/missing, surface a
+      // hint -- often this means Chrome's User Data dir was deleted/empty
+      // OR the source profile genuinely had no history in the window.
+      if (!urls && !bms) {
+        toast(
+          "Import succeeded but 0 items imported. Check: source path is right, " +
+          "the days window covers actual browsing, and 'Skip sensitive' didn't drop everything.",
+          true
+        );
+      } else {
+        toast(`✓ Imported ${urls} URLs + ${bms} bookmarks`);
+      }
     } catch (e) {
       status.textContent = "";
       toast("Import failed: " + e.message, true);
     } finally { btn.disabled = false; }
+  }
+
+  // Auto-detect on page load: call /api/chrome-import/discover and
+  // pre-fill the source field. Also store the candidate list for a
+  // small dropdown picker so users with multi-profile Chrome can
+  // pick which Chrome account to import from without typing.
+  async function _autodetectChromeSource() {
+    const input = $("#sess-import-source");
+    const hint  = $("#sess-import-source-hint");
+    if (!input) return;
+    try {
+      const r = await api("/api/chrome-import/discover");
+      if (r && r.source && !input.value) {
+        input.value = r.source;
+        if (hint) hint.textContent = `Auto-detected. Edit the path or pick another profile from the list below.`;
+      } else if (hint && !r.source) {
+        hint.textContent =
+          "No Chrome installation auto-detected. Paste the path manually " +
+          "(e.g. C:\\Users\\<you>\\AppData\\Local\\Google\\Chrome\\User Data\\Default).";
+      }
+      // Render candidates list if any -- they're useful even when one
+      // matched, because Chrome users often have Profile 1, Profile 2,
+      // etc. and we only auto-pick "Default".
+      if (r && r.candidates && r.candidates.length) {
+        _renderChromeSourceCandidates(r.candidates, r.source);
+      }
+    } catch (e) {
+      // Non-fatal -- user can still type the path manually
+      console.debug("chrome discover failed:", e);
+    }
+  }
+
+  function _renderChromeSourceCandidates(candidates, current) {
+    // Inject a small "Pick from detected" list under the input.
+    // Keeps the UI minimal: each candidate is a clickable chip that
+    // fills the source input.
+    const input = $("#sess-import-source");
+    const hint  = $("#sess-import-source-hint");
+    if (!input || !hint) return;
+    if (document.getElementById("sess-import-source-picker")) return; // already rendered
+
+    const picker = document.createElement("div");
+    picker.id = "sess-import-source-picker";
+    picker.style.cssText =
+      "display:flex; flex-wrap:wrap; gap:6px; margin-top:6px;";
+    const seen = new Set();
+    candidates.forEach(p => {
+      if (seen.has(p)) return;
+      seen.add(p);
+      const exists = current && p === current;
+      const chip = document.createElement("button");
+      chip.type = "button";
+      chip.className = "btn btn-secondary btn-small";
+      chip.style.cssText =
+        "padding: 3px 10px; font-size: 11px; font-family: ui-monospace, monospace;";
+      // Friendly label = parent dirname (Chrome / Edge / Brave / ...)
+      let label = p;
+      try {
+        const parts = p.split(/[\\/]/);
+        const idx = parts.findIndex(x => x === "User Data");
+        if (idx > 0) label = parts.slice(idx - 1, idx + 2).join("\\");
+      } catch {}
+      chip.textContent = (exists ? "● " : "") + label;
+      chip.title = p;
+      chip.addEventListener("click", () => {
+        input.value = p;
+        // Re-render to update the active marker
+        picker.remove();
+        _renderChromeSourceCandidates(candidates, p);
+      });
+      picker.appendChild(chip);
+    });
+    hint.parentElement.appendChild(picker);
   }
 
   return { init, teardown };

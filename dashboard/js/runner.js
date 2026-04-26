@@ -94,12 +94,35 @@ async function primeLogBuffer() {
   }
 }
 
+// Module-level so we can close on visibility change and avoid
+// runaway retries piling up in DevTools.
+let _logSrc        = null;
+let _logRetries    = 0;
+let _logRetryTimer = null;
+
 function startLogStream() {
+  // Avoid double-subscribing if startLogStream() gets called while
+  // an existing EventSource is still alive (e.g., visibility flip).
+  if (_logSrc) {
+    try { _logSrc.close(); } catch {}
+    _logSrc = null;
+  }
+  if (_logRetryTimer) {
+    clearTimeout(_logRetryTimer);
+    _logRetryTimer = null;
+  }
+
   // Prime the buffer FIRST so by the time the page renders, the user
   // sees the last 2000 lines of history rather than empty.
   primeLogBuffer();
 
   const src = new EventSource("/api/logs/live");
+  _logSrc = src;
+  src.onopen = () => {
+    // Reset backoff on successful (re)connect. Without this, a
+    // transient blip permanently put us into the "30s retry" regime.
+    _logRetries = 0;
+  };
   src.onmessage = (e) => {
     try {
       _pushLogEntry(JSON.parse(e.data));
@@ -107,8 +130,40 @@ function startLogStream() {
   };
   src.onerror = () => {
     try { src.close(); } catch {}
-    setTimeout(startLogStream, 3000);
+    if (_logSrc === src) _logSrc = null;
+    // Exponential backoff capped at 30s. Werkzeug's dev server
+    // sometimes drops long-lived SSE under thread contention --
+    // hammering it every 3s wastes both sides. Backoff also keeps
+    // DevTools quieter when the dashboard server is briefly down
+    // (e.g. user installed an update).
+    _logRetries = Math.min(_logRetries + 1, 6);
+    const delay = Math.min(3000 * Math.pow(1.5, _logRetries - 1), 30000);
+    _logRetryTimer = setTimeout(startLogStream, delay);
   };
+}
+
+// Close the SSE explicitly when the page goes to bfcache / unload.
+// Without this, the browser logs ERR_CONNECTION_RESET as the OS
+// tears down the socket. Cleaner shutdown -> server frees the
+// subscriber queue immediately, and DevTools stays uncluttered.
+if (typeof window !== "undefined") {
+  window.addEventListener("pagehide", () => {
+    if (_logSrc) {
+      try { _logSrc.close(); } catch {}
+      _logSrc = null;
+    }
+    if (_logRetryTimer) {
+      clearTimeout(_logRetryTimer);
+      _logRetryTimer = null;
+    }
+  });
+  // Resume immediately when the page comes back from bfcache.
+  window.addEventListener("pageshow", (e) => {
+    if (e.persisted && !_logSrc) {
+      _logRetries = 0;
+      startLogStream();
+    }
+  });
 }
 
 // ─── Stop helpers ───────────────────────────────────────────────

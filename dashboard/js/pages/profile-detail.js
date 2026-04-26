@@ -172,26 +172,93 @@ const ProfileDetail = {
   async loadSelfcheck(name) {
     try {
       const sc = await api(`/api/profiles/${encodeURIComponent(name)}/selfcheck`);
-      $("#selfcheck-badge").textContent = `${sc.passed}/${sc.total}`;
-      $("#selfcheck-time").textContent = `Last check: ${sc.timestamp}`;
-
-      const tests = sc.tests || {};
-      const items = Object.entries(tests).map(([testName, result]) => {
-        const ok = result === true;
-        return `
-          <div class="selfcheck-item ${ok ? 'pass' : 'fail'}">
-            <span class="icon">${ok ? '✓' : '✗'}</span>
-            <span>${escapeHtml(testName)}</span>
-          </div>
-        `;
-      }).join("");
-      $("#selfcheck-grid").innerHTML = items || '<div class="empty-state">No data</div>';
+      // Backend now returns 200 with {empty:true, message:...} when
+      // there is no snapshot yet -- saves the DevTools console from
+      // the noisy "GET /selfcheck 404" line on every fresh-profile
+      // page load.
+      if (sc && sc.empty) {
+        // Empty network-selfcheck. But we may still have FINGERPRINT
+        // coherence data from the validator (writes on every browser
+        // launch). Use that to populate the grid so the card isn't
+        // blank for fresh / never-monitored profiles.
+        await this._renderSelfcheckFromCoherence(name);
+      } else {
+        $("#selfcheck-badge").textContent = `${sc.passed}/${sc.total}`;
+        $("#selfcheck-time").textContent  = `Last check: ${sc.timestamp || "—"}`;
+        const tests = sc.tests || {};
+        const items = Object.entries(tests).map(([testName, result]) => {
+          const ok = result === true;
+          return `
+            <div class="selfcheck-item ${ok ? 'pass' : 'fail'}">
+              <span class="icon">${ok ? '✓' : '✗'}</span>
+              <span>${escapeHtml(testName)}</span>
+            </div>
+          `;
+        }).join("");
+        $("#selfcheck-grid").innerHTML = items || '<div class="empty-state">No data</div>';
+      }
     } catch (e) {
       $("#selfcheck-badge").textContent = "—";
       $("#selfcheck-grid").innerHTML = `<div class="empty-state">${escapeHtml(e.message)}</div>`;
     }
     // Wire Probe button on first selfcheck load (idempotent).
     this._wireFpProbeButton();
+  },
+
+  // Fallback render path: when the network-selfcheck table has no
+  // row yet (typical for a freshly-created profile that's never
+  // been monitored), we still have the validator's per-test report
+  // from the most recent fingerprint save. That covers every signal
+  // an external tester would also examine -- UA coherence, GPU
+  // plausibility, font-count vs platform, timezone vs language, etc.
+  // Showing this in the Self-Check grid means the card has useful
+  // content from the very first time the user opens the page after
+  // launching their profile, not days later after a real monitor
+  // pass has run.
+  async _renderSelfcheckFromCoherence(name) {
+    try {
+      const c = await api(
+        `/api/profiles/${encodeURIComponent(name)}/fingerprint/coherence`);
+      if (!c || c.empty || !c.results || !c.results.length) {
+        // Nothing to show -- profile has never been launched, so no
+        // FP snapshot exists either. Keep the original message.
+        $("#selfcheck-badge").textContent = "—";
+        $("#selfcheck-time").textContent  = "";
+        $("#selfcheck-grid").innerHTML =
+          `<div class="empty-state">
+             ${escapeHtml((c && c.message) ||
+               "No selfcheck data yet. Launch the profile once to score it.")}
+           </div>`;
+        return;
+      }
+      const passed = c.results.filter(r => r.status === "pass").length;
+      const total  = c.results.length;
+      const score  = c.score != null ? `${c.score}/100` : "—";
+      const grade  = c.grade ? ` (${c.grade})` : "";
+      $("#selfcheck-badge").textContent = `${passed}/${total}`;
+      $("#selfcheck-time").textContent  =
+        `Fingerprint validator: score ${score}${grade}`
+        + (c.timestamp ? `  ·  last update ${c.timestamp}` : "");
+
+      // Render each validator check as a selfcheck-item, color-coded
+      // by status. Tooltip shows the validator's reason text.
+      $("#selfcheck-grid").innerHTML = c.results.map(r => {
+        const ico = r.status === "pass" ? "✓"
+                  : r.status === "warn" ? "⚠"
+                  : r.status === "fail" ? "✗" : "·";
+        const cl  = r.status === "pass" ? "pass"
+                  : r.status === "fail" ? "fail" : "warn";
+        return `<div class="selfcheck-item ${cl}"
+                     title="${escapeHtml(r.detail || '')}">
+          <span class="icon">${ico}</span>
+          <span>${escapeHtml(r.name)}</span>
+        </div>`;
+      }).join("");
+    } catch (e) {
+      $("#selfcheck-badge").textContent = "—";
+      $("#selfcheck-grid").innerHTML =
+        `<div class="empty-state">${escapeHtml(e.message || e)}</div>`;
+    }
   },
 
   // ── Fingerprint probe button ───────────────────────────────────
@@ -205,34 +272,320 @@ const ProfileDetail = {
     if (!btn || btn.dataset._wired === "1") return;
     btn.dataset._wired = "1";
     btn.addEventListener("click", () => this._runFpProbe());
+    // Render tester cards once -- list is static, hand-curated below.
+    this._renderTesterCards();
+    // Wire the modal close handlers (delegated -- cheap).
+    document.querySelectorAll('[data-close="fp-tester-modal"]').forEach(el => {
+      el.addEventListener("click", () => {
+        const m = document.getElementById("fp-tester-modal");
+        if (m) m.style.display = "none";
+      });
+    });
   },
 
-  async _runFpProbe() {
+  // Catalogue of external testers + what each measures + which
+  // coherence-validator categories are most relevant for each.
+  // Drives the modal: "Pixelscan checks canvas/webgl uniqueness ->
+  // here are this profile's canvas + gpu coherence results."
+  FP_TESTERS: {
+    creepjs: {
+      icon:        "🕵",
+      label:       "CreepJS",
+      url:         "https://abrahamjuliot.github.io/creepjs/",
+      tagline:     "Trust score 0-100, the strictest grader.",
+      description: "Detects mismatches between every browser API surface " +
+                   "(UA-CH, navigator, canvas, audio, font, WebGL, Workers, " +
+                   "iframes). Compares them all to expected combinations " +
+                   "and outputs a 'lies score' + 'trust score'. If your " +
+                   "fingerprint disagrees with itself anywhere, CreepJS " +
+                   "spots it.",
+      checks:      ["UA / navigator", "Canvas hash", "Audio context",
+                    "Fonts", "WebGL", "Workers", "Iframes", "Lies"],
+      relevant:    ["critical", "ua", "ua-ch", "canvas", "audio",
+                    "fonts", "gpu"],
+    },
+    sannysoft: {
+      icon:        "🤖",
+      label:       "Sannysoft Bot Test",
+      url:         "https://bot.sannysoft.com/",
+      tagline:     "The classic Selenium leak panel.",
+      description: "Original bot-detection test page. Checks webdriver " +
+                   "flag, plugin count + names, language array, " +
+                   "permissions API, iframe content-window contradictions, " +
+                   "and a few more low-hanging-fruit signals selenium-stealth " +
+                   "has historically tried to hide.",
+      checks:      ["webdriver", "Plugins / mimeTypes", "Languages",
+                    "Permissions", "WebGL Vendor / Renderer", "iframe.contentWindow"],
+      relevant:    ["critical", "ua", "plugins", "languages", "gpu"],
+    },
+    pixelscan: {
+      icon:        "🎨",
+      label:       "Pixelscan",
+      url:         "https://pixelscan.net/",
+      tagline:     "Canvas/WebGL hash uniqueness + geo correlation.",
+      description: "Computes a fingerprint hash from canvas + WebGL + " +
+                   "audio renderings and reports how unique you are " +
+                   "in their database. Also cross-checks declared " +
+                   "timezone vs IP geolocation -- a mismatch here is a " +
+                   "stronger flag than any single canvas leak.",
+      checks:      ["Canvas hash", "WebGL hash", "Audio hash",
+                    "Timezone vs IP geo", "Language vs IP locale", "Uniqueness rank"],
+      relevant:    ["critical", "canvas", "gpu", "timezone", "languages"],
+    },
+    amiunique: {
+      icon:        "🔍",
+      label:       "AmIUnique",
+      url:         "https://amiunique.org/fingerprint",
+      tagline:     "Compares to a public fingerprint DB.",
+      description: "Long-running research project (INRIA). Hashes your " +
+                   "fingerprint and tells you how many other browsers in " +
+                   "their dataset share the exact same signature. ~1-in-1 " +
+                   "uniqueness is bad; ~1-in-1000 is the realistic ceiling. " +
+                   "Useful as a sanity check, not a hard pass/fail.",
+      checks:      ["UA", "Plugins", "Fonts", "Canvas", "WebGL",
+                    "Headers", "Cookies enabled"],
+      relevant:    ["ua", "plugins", "fonts", "canvas", "gpu"],
+    },
+    browserleaks: {
+      icon:        "💧",
+      label:       "BrowserLeaks",
+      url:         "https://browserleaks.com/canvas",
+      tagline:     "Per-API leak breakdown. Gold standard.",
+      description: "Suite of one-page-per-API testers: canvas, WebRTC, " +
+                   "fonts, geolocation, audio context, ClientRects, " +
+                   "TLS-fingerprint (JA3). Doesn't aggregate into a " +
+                   "single score -- you read each page individually. " +
+                   "Best for hunting a specific leak you suspect.",
+      checks:      ["Canvas", "WebRTC IP leak", "Fonts list",
+                    "ClientRects", "Audio context", "JA3 TLS hash",
+                    "Geolocation"],
+      relevant:    ["critical", "canvas", "fonts", "audio", "webrtc"],
+    },
+    fpcom: {
+      icon:        "🛡",
+      label:       "Fingerprint.com BotD",
+      url:         "https://fingerprint.com/products/bot-detection/",
+      tagline:     "The realest test -- commercial bot-detect demo.",
+      description: "Demo of the same engine many real sites pay to " +
+                   "license. Returns 'Bot' vs 'Real Browser' verdict + " +
+                   "tells you which technique caught you (UA mismatch, " +
+                   "Selenium-driver leak, headless heuristics, " +
+                   "stack-trace fingerprint, ...). If you pass this, " +
+                   "you're statistically likely to pass commercial " +
+                   "bot-walls in production.",
+      checks:      ["Bot / Real Browser verdict", "Selenium / Playwright / Puppeteer detection",
+                    "Headless heuristics", "Stack-trace fingerprint", "UA consistency"],
+      relevant:    ["critical", "ua", "ua-ch"],
+    },
+  },
+
+  _renderTesterCards() {
+    const grid = document.getElementById("fp-tester-grid");
+    if (!grid || grid.dataset._rendered === "1") return;
+    grid.dataset._rendered = "1";
+    grid.innerHTML = Object.entries(this.FP_TESTERS).map(([id, t]) => `
+      <button type="button" class="fp-tester-card" data-tester-id="${id}"
+              style="display:block; text-align:left; padding: 10px 12px;
+                     border:1px solid var(--border,#2a3142);
+                     border-radius: 8px; background: transparent;
+                     color: inherit; cursor: pointer; transition: border-color .15s;">
+        <div style="font-weight:600;">${t.icon} ${escapeHtml(t.label)}</div>
+        <div class="muted" style="font-size:11px;">${escapeHtml(t.tagline)}</div>
+      </button>
+    `).join("");
+    grid.querySelectorAll("[data-tester-id]").forEach(btn => {
+      btn.addEventListener("click", () =>
+        this.openTesterModal(btn.dataset.testerId));
+    });
+    // Hover feedback so users learn these are clickable
+    grid.querySelectorAll(".fp-tester-card").forEach(c => {
+      c.addEventListener("mouseenter",
+        () => c.style.borderColor = "var(--accent, #6366f1)");
+      c.addEventListener("mouseleave",
+        () => c.style.borderColor = "var(--border,#2a3142)");
+    });
+  },
+
+  // Open the modal for one tester. Pulls coherence data from the
+  // backend so we can show the profile's score for the signals
+  // this particular tester checks.
+  async openTesterModal(testerId) {
+    const t = this.FP_TESTERS[testerId];
+    if (!t) return;
+    const modal  = document.getElementById("fp-tester-modal");
+    const title  = document.getElementById("fp-tester-modal-title");
+    const body   = document.getElementById("fp-tester-modal-body");
+    const probe  = document.getElementById("fp-tester-modal-probe-btn");
+    const link   = document.getElementById("fp-tester-modal-open-link");
+    if (!modal || !title || !body) return;
+
+    title.textContent = `${t.icon} ${t.label}`;
+    link.href         = t.url;
+    body.innerHTML    = `<div class="muted">Loading profile data…</div>`;
+    modal.style.display = "";
+
+    // Wire the probe button to spawn a single-tester probe run.
+    probe.onclick = () => this._runFpProbe({ testerId });
+
+    // Fetch coherence data for this profile -- gives us the per-test
+    // breakdown we use to highlight which checks are relevant for
+    // this specific tester.
+    let cohData = null;
+    try {
+      cohData = await api(
+        `/api/profiles/${encodeURIComponent(this.currentProfile)}/fingerprint/coherence`);
+    } catch (e) {
+      cohData = { empty: true, message: "Could not fetch coherence data" };
+    }
+
+    body.innerHTML = this._renderTesterModalBody(t, cohData);
+  },
+
+  _renderTesterModalBody(t, cohData) {
+    const checksHtml = `
+      <div style="margin-top: 12px;">
+        <div class="card-title" style="font-size: 12px; margin-bottom: 6px;">
+          Signals this tester measures
+        </div>
+        <div style="display:flex; flex-wrap: wrap; gap: 6px;">
+          ${t.checks.map(c =>
+            `<span class="profile-tag-chip" style="font-size:11px;">${escapeHtml(c)}</span>`
+          ).join("")}
+        </div>
+      </div>`;
+
+    let cohHtml = "";
+    if (cohData && cohData.empty) {
+      cohHtml = `<div class="form-hint" style="margin-top: 14px;">
+        ${escapeHtml(cohData.message ||
+          "No coherence data yet. Launch the profile once to score the fingerprint.")}
+      </div>`;
+    } else if (cohData && cohData.results) {
+      // Filter results to categories this tester actually cares about
+      const relevant = cohData.results.filter(r =>
+        t.relevant.some(rel =>
+          (r.category || "").toLowerCase().includes(rel.toLowerCase())));
+      const passed = relevant.filter(r => r.status === "pass").length;
+      const total  = relevant.length;
+      const score  = cohData.score != null ? `${cohData.score}/100` : "n/a";
+      const grade  = cohData.grade || "—";
+
+      const colors = {
+        excellent: "var(--healthy, #22c55e)",
+        good:      "var(--healthy, #22c55e)",
+        warning:   "var(--warning, #f59e0b)",
+        critical:  "var(--critical, #ef4444)",
+      };
+      const gradeColor = colors[grade] || "var(--text-muted)";
+
+      cohHtml = `
+        <div style="display:flex; gap: 14px; align-items: center;
+                    margin-top: 14px; padding: 10px;
+                    border: 1px solid var(--border,#2a3142);
+                    border-radius: 8px;">
+          <div>
+            <div class="muted" style="font-size: 10px; text-transform: uppercase;">
+              Internal coherence score
+            </div>
+            <div style="font-size: 22px; font-weight: 600; color: ${gradeColor};">
+              ${score} <span style="font-size:12px; opacity:.7;">${escapeHtml(grade)}</span>
+            </div>
+          </div>
+          <div style="flex: 1;">
+            <div class="muted" style="font-size: 10px; text-transform: uppercase;">
+              Relevant checks for this tester
+            </div>
+            <div style="font-size: 16px; font-weight: 500;">
+              ${passed} / ${total} passing
+            </div>
+          </div>
+        </div>`;
+
+      if (relevant.length) {
+        cohHtml += `
+          <div style="margin-top: 12px;">
+            <div class="card-title" style="font-size: 12px; margin-bottom: 6px;">
+              Per-check breakdown (validator's view)
+            </div>
+            <div style="display: grid; grid-template-columns: 1fr 1fr;
+                        gap: 6px;">
+              ${relevant.map(r => {
+                const ico = r.status === "pass" ? "✓"
+                          : r.status === "warn" ? "⚠"
+                          : r.status === "fail" ? "✗" : "·";
+                const cl  = r.status === "pass" ? "pass"
+                          : r.status === "fail" ? "fail" : "warn";
+                return `<div class="selfcheck-item ${cl}"
+                             title="${escapeHtml(r.detail || '')}">
+                  <span class="icon">${ico}</span>
+                  <span>${escapeHtml(r.name)}</span>
+                </div>`;
+              }).join("")}
+            </div>
+          </div>`;
+      } else {
+        cohHtml += `<div class="form-hint" style="margin-top: 8px;">
+          No internal validator checks map directly to this tester's signals --
+          run the probe to see this tester's own verdict.
+        </div>`;
+      }
+    }
+
+    return `
+      <div>${escapeHtml(t.description)}</div>
+      ${checksHtml}
+      ${cohHtml}
+      <div class="form-hint" style="margin-top: 14px; padding: 8px;
+           background: var(--surface-2, rgba(99,102,241,0.06));
+           border-radius: 6px;">
+        <strong>Note:</strong> external testers run JS in the browser they're
+        visiting. To get THIS profile's verdict, click <em>Probe in profile</em>
+        below -- a probe run will open ${escapeHtml(t.label)} in the profile's
+        actual Chrome session and you'll see the on-page score there. Opening
+        the link in a new tab uses your dashboard browser, NOT this profile.
+      </div>`;
+  },
+
+  async _runFpProbe(opts = {}) {
+    // Two callsites:
+    //   1. The big "Probe in profile" button at the bottom of the
+    //      Self-Check card — visits all 6 testers (opts.testerId
+    //      is undefined).
+    //   2. The "Probe in profile" button INSIDE each tester modal —
+    //      visits just that one tester (opts.testerId is set).
     const btn    = document.getElementById("fp-probe-btn");
     const status = document.getElementById("fp-probe-status");
     if (!this.currentProfile) {
       toast("No profile selected", true);
       return;
     }
+    const single = !!opts.testerId;
+    const t      = single ? (this.FP_TESTERS || {})[opts.testerId] : null;
+    const label  = single && t ? t.label : "all 6 testers";
+    const dur    = single ? "~30-60s" : "~3-4 minutes";
+
     const ok = await confirmDialog({
       title:        "Run fingerprint probe pass?",
-      message:      `This will launch ${this.currentProfile} and visit 6 ` +
-                    `external fingerprint testers (CreepJS, BotD, etc.). ` +
-                    `Takes ~3-4 minutes. Watch the Logs page for progress; ` +
+      message:      `This will launch ${this.currentProfile} and visit ` +
+                    `${label}. Takes ${dur}. Watch the Logs page for progress; ` +
                     `tester scores will be visible in the Chrome window ` +
                     `that opens.`,
       confirmText:  "Start probe",
       confirmStyle: "primary",
     });
     if (!ok) return;
-    btn.disabled = true;
-    const orig = btn.textContent;
-    btn.textContent = "⏳ Spawning…";
+
+    if (btn) {
+      btn.disabled = true;
+      btn.dataset._origText = btn.textContent;
+      btn.textContent = "⏳ Spawning…";
+    }
     if (status) status.textContent = "";
     try {
+      const body = single ? { tester_id: opts.testerId } : {};
       const r = await api(
         `/api/profiles/${encodeURIComponent(this.currentProfile)}/fingerprint/probe`,
-        { method: "POST" },
+        { method: "POST", body: JSON.stringify(body) },
       );
       if (r.ok === false) {
         toast(`Probe failed: ${r.error || "unknown"}`, true);
@@ -241,16 +594,24 @@ const ProfileDetail = {
         toast(`✓ Probe run #${r.run_id} started — open Logs to watch`);
         if (status) {
           status.textContent =
-            `Run #${r.run_id} started — visiting ${r.tester_count} testers`;
+            `Run #${r.run_id} started — visiting ${r.tester_count} tester(s)`;
           status.style.color = "#6ee7b7";
+        }
+        // Auto-close the per-tester modal so user sees the toast +
+        // Logs page suggestion uncluttered.
+        if (single) {
+          const m = document.getElementById("fp-tester-modal");
+          if (m) m.style.display = "none";
         }
       }
     } catch (e) {
       toast(`Probe failed: ${e.message || e}`, true);
       if (status) status.textContent = `✗ ${e.message || e}`;
     } finally {
-      btn.disabled = false;
-      btn.textContent = orig || "🚀 Probe in profile";
+      if (btn) {
+        btn.disabled = false;
+        btn.textContent = btn.dataset._origText || "🚀 Probe in profile";
+      }
     }
   },
 

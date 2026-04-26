@@ -700,6 +700,51 @@ class DB:
     def __init__(self, path: str = None):
         self.path = path or DB_PATH
         self._init_schema()
+        # One-shot self-heal migrations. Each is idempotent; running
+        # them on every boot is cheap (an UPDATE that touches zero
+        # rows when nothing needs migrating). They exist to fix data
+        # left in inconsistent shape by older versions of the app
+        # without forcing the user to re-do their setup.
+        self._heal_use_script_on_launch_flag()
+
+    def _heal_use_script_on_launch_flag(self):
+        """Auto-fix profiles where Apply-to-profile (or older versions
+        of script_assign_to_profile) set script_id but left the new
+        opt-in flag use_script_on_launch=0. Without the flag, the
+        runtime falls through to the legacy loop -- ads are detected
+        but never clicked. The user thinks "I applied the script,
+        why no clicks?". This migration flips the flag to 1 for any
+        profile that already has a script_id, which matches what the
+        new script_assign_to_profile does for all NEW assignments.
+
+        Idempotent: rows already at use_script_on_launch=1 are
+        untouched. Safe to run on every boot.
+        """
+        try:
+            conn = self._get_conn()
+            with conn:
+                cur = conn.execute(
+                    "UPDATE profiles SET use_script_on_launch = 1 "
+                    "WHERE script_id IS NOT NULL "
+                    "AND (use_script_on_launch = 0 "
+                    "     OR use_script_on_launch IS NULL)"
+                )
+                if cur.rowcount > 0:
+                    import logging as _logging
+                    _logging.info(
+                        f"[db-heal] Flipped use_script_on_launch=1 for "
+                        f"{cur.rowcount} profile(s) that had script_id "
+                        f"set but the opt-in flag off. These profiles "
+                        f"will now actually run their bound script "
+                        f"on launch."
+                    )
+        except Exception as e:
+            # Migration failures must NEVER block startup. Schema
+            # could be missing the column on a really old DB, in which
+            # case the column-add path is the right fix and this
+            # heal is a no-op.
+            import logging as _logging
+            _logging.debug(f"[db-heal] use_script_on_launch heal skipped: {e}")
 
     def _get_conn(self) -> sqlite3.Connection:
         """Per-thread SQLite connection. WAL mode + busy_timeout together
@@ -1278,19 +1323,45 @@ class DB:
 
     def script_assign_to_profile(self, profile_name: str,
                                  script_id: int | None) -> bool:
-        """Assign a script to a profile (None = clear, use default)."""
+        """Assign a script to a profile (None = clear, use default).
+
+        When script_id is non-None, ALSO sets use_script_on_launch=1
+        in the same transaction. The flag was originally a separate
+        opt-in toggle, but in practice 100% of users who clicked
+        "Apply to profile" expected the script to run on next launch
+        (otherwise why apply). Splitting it into two clicks created a
+        silent failure mode where the profile had script_id set but
+        the runtime fell through to the legacy loop -- ads were
+        detected but never clicked. We fold the toggle into the
+        assign call so "Apply to profile" does what users mean.
+
+        Clearing (script_id=None) leaves use_script_on_launch alone
+        -- if you nuked the assignment, you may still want
+        opt-in=true for the global default script.
+        """
         conn = self._get_conn()
         with conn:
-            cur = conn.execute(
-                "UPDATE profiles SET script_id = ?, "
-                "updated_at = datetime('now') WHERE name = ?",
-                (script_id, profile_name),
-            )
+            if script_id is not None:
+                cur = conn.execute(
+                    "UPDATE profiles SET script_id = ?, "
+                    "use_script_on_launch = 1, "
+                    "updated_at = datetime('now') WHERE name = ?",
+                    (script_id, profile_name),
+                )
+            else:
+                cur = conn.execute(
+                    "UPDATE profiles SET script_id = NULL, "
+                    "updated_at = datetime('now') WHERE name = ?",
+                    (profile_name,),
+                )
             if cur.rowcount == 0:
-                # Profile doesn't have a row yet — insert minimal
+                # Profile doesn't have a row yet — insert minimal.
+                # Same opt-in rule applies: insert with launch=1 if
+                # we're assigning a script.
                 conn.execute(
-                    "INSERT INTO profiles (name, script_id) VALUES (?, ?)",
-                    (profile_name, script_id),
+                    "INSERT INTO profiles (name, script_id, "
+                    "use_script_on_launch) VALUES (?, ?, ?)",
+                    (profile_name, script_id, 1 if script_id else 0),
                 )
         return True
 

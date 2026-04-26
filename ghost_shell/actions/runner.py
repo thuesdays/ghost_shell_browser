@@ -780,6 +780,226 @@ def _act_open_url(driver, action: dict, ctx: dict):
     _random_sleep(wait_sec, wait_sec + 0.8)
 
 
+def _close_extra_tabs(driver, anchor_handle: str | None = None) -> int:
+    """Close every tab EXCEPT the anchor (or the first surviving tab
+    if anchor is gone). Returns count of tabs closed.
+
+    Designed for cleanup after multi-step actions like
+    commercial_inflate where Google's organic results / popups can
+    spawn target=_blank tabs that the user never wanted. Without
+    this, every pre-query potentially leaks 1-3 background tabs;
+    after a 30-iteration run the browser drowns in 60+ tabs and
+    eventually crashes on RAM.
+
+    Safe to call even when only one tab exists (no-op).
+    """
+    closed = 0
+    try:
+        all_handles = list(driver.window_handles)
+    except Exception:
+        return 0
+    if len(all_handles) <= 1:
+        return 0
+    keep = anchor_handle if anchor_handle in all_handles else all_handles[0]
+    for h in all_handles:
+        if h == keep:
+            continue
+        try:
+            driver.switch_to.window(h)
+            driver.close()
+            closed += 1
+        except Exception:
+            pass
+    # Restore focus to the kept tab
+    try:
+        if keep in driver.window_handles:
+            driver.switch_to.window(keep)
+        elif driver.window_handles:
+            driver.switch_to.window(driver.window_handles[0])
+    except Exception:
+        pass
+    return closed
+
+
+def _act_commercial_inflate(driver, action: dict, ctx: dict):
+    """Pre-warm Google's commercial-intent context for the next brand
+    search. Visits N short generic commercial queries (no brand
+    reference) WITHIN THE SAME BROWSER SESSION so the subsequent
+    brand SERP comes back denser with ads.
+
+    Why this works: Google's ad ranker reads "recent commercial-intent
+    queries on this session" as one of the strongest expected-CTR
+    signals. A brand-only query right after 2-3 commercial searches
+    in the same vertical gets 2-5x more ads served than a brand query
+    on a cold session.
+
+    Action params:
+      brand        : str (required) -- the brand the inflater should
+                     warm up for. Drives category detection.
+      n            : int (default 2) -- how many pre-queries to fire.
+      dwell_min    : float (default 8) seconds to dwell on each SERP
+      dwell_max    : float (default 15)
+      locale       : "UA" | "RU" | "EN" | combos (default "UA")
+      click_organic: bool (default False) -- click first organic
+                     result on each pre-SERP for extra signal.
+
+    Variable substitution applies to brand so {ad.domain} or {item}
+    work for use inside foreach_ad/loop steps. Non-fatal: a failed
+    pre-query never aborts the parent flow.
+
+    TAB HYGIENE: this action only navigates the CURRENT tab via
+    driver.get(...) but Google's organic results often have
+    target="_blank" attributes -- when click_organic=true, the click
+    can spawn a new tab that survives back-navigation. Plus some pre-
+    query SERPs themselves cause popups. We snapshot the anchor tab
+    at start and call _close_extra_tabs() between iterations + at the
+    end, so the parent flow gets back exactly the same tab it gave
+    us, no leftovers.
+    """
+    brand = _subst(str(action.get("brand", "")), ctx).strip()
+    if not brand:
+        # Try to infer from the loop's current item
+        loop_item = ctx.get("vars", {}).get("item") or ""
+        brand = str(loop_item).strip()
+    if not brand:
+        log.warning("    commercial_inflate: no brand provided + no loop item -- skip")
+        return
+
+    n         = int(action.get("n", 2))
+    dwell_min = float(action.get("dwell_min", 8))
+    dwell_max = float(action.get("dwell_max", 15))
+    locale    = str(action.get("locale", "UA"))
+    click_org = bool(action.get("click_organic", False))
+
+    try:
+        from ghost_shell.actions.query_expander import (
+            commercial_inflate_queries, detect_category,
+        )
+    except Exception as e:
+        log.warning(f"    commercial_inflate: importer failed: {e}")
+        return
+
+    cat = detect_category(brand) or "(uncategorised)"
+    queries = commercial_inflate_queries(brand, n_pre=n, locale=locale)
+    log.info(
+        f"    🔥 commercial_inflate for {brand!r} (category={cat}): "
+        f"{n} pre-queries"
+    )
+
+    # Snapshot the anchor tab. Everything we open beyond this gets
+    # closed at the end so the parent flow (search_query, foreach_ad,
+    # etc.) finds the browser in exactly the same shape we received
+    # it -- single tab, focused on whatever was last navigated.
+    try:
+        anchor = driver.current_window_handle
+    except Exception:
+        anchor = None
+
+    import urllib.parse as _up
+    for i, q in enumerate(queries, 1):
+        try:
+            url = "https://www.google.com/search?q=" + _up.quote(q)
+            log.info(f"      [{i}/{n}] inflate query: {q!r}")
+            driver.get(url)
+            _random_sleep(dwell_min, dwell_max)
+            # Soft-scroll a bit so Google sees engagement on the SERP
+            try:
+                driver.execute_script(
+                    "window.scrollBy({top: 400, left: 0, behavior: 'smooth'});"
+                )
+                _random_sleep(0.5, 1.2)
+                driver.execute_script(
+                    "window.scrollBy({top: 300, left: 0, behavior: 'smooth'});"
+                )
+                _random_sleep(0.4, 1.0)
+            except Exception:
+                pass
+            # Optional: click first organic result. We use simple
+            # heuristic -- first <a> inside a <div.g> or [data-hveid]
+            # block whose href is not google.com. Modern Google often
+            # sets target="_blank" on these so the click spawns a new
+            # tab; we tear it down right after dwell.
+            if click_org:
+                try:
+                    pre_handles = set(driver.window_handles)
+                    js = r"""
+                    const links = document.querySelectorAll(
+                        'div.g a[href^="http"], div[data-hveid] a[href^="http"]');
+                    for (const a of links) {
+                        if (a.href && !a.href.includes('google.com') &&
+                            !a.href.includes('googleadservices') &&
+                            !a.href.includes('youtube.com/watch')) {
+                            a.scrollIntoView({block: 'center'});
+                            a.click();
+                            return a.href;
+                        }
+                    }
+                    return null;
+                    """
+                    clicked = driver.execute_script(js)
+                    if clicked:
+                        log.info(f"        ↳ clicked organic: {clicked[:80]}")
+                        # If a new tab opened, switch + dwell + close.
+                        # Otherwise we're still on the SERP / same tab
+                        # and just need to navigate back.
+                        post_handles = set(driver.window_handles)
+                        new_tabs = post_handles - pre_handles
+                        if new_tabs:
+                            try:
+                                driver.switch_to.window(next(iter(new_tabs)))
+                            except Exception:
+                                pass
+                            _random_sleep(4, 8)
+                            try:
+                                driver.execute_script(
+                                    "window.scrollBy({top: 600, left: 0, behavior: 'smooth'});"
+                                )
+                                _random_sleep(1, 3)
+                            except Exception:
+                                pass
+                            try:
+                                driver.close()
+                            except Exception:
+                                pass
+                            # Return to the anchor explicitly
+                            if anchor and anchor in driver.window_handles:
+                                driver.switch_to.window(anchor)
+                            elif driver.window_handles:
+                                driver.switch_to.window(driver.window_handles[0])
+                        else:
+                            _random_sleep(4, 8)
+                            try: driver.back()
+                            except Exception: pass
+                            _random_sleep(1, 2)
+                except Exception as e:
+                    log.debug(f"        organic click skipped: {e}")
+
+            # Per-iteration tab cleanup: any rogue popups / target=
+            # _blank ads/affiliate overlays that spawned during the
+            # dwell get nuked here. Very common on shopping sites and
+            # ad-heavy pre-query SERPs.
+            try:
+                killed = _close_extra_tabs(driver, anchor)
+                if killed:
+                    log.debug(f"        cleaned {killed} stray tab(s)")
+            except Exception:
+                pass
+
+        except Exception as e:
+            log.warning(f"    commercial_inflate query {i} failed: {e}")
+
+    # Final sweep at the end so the main search_query that follows
+    # gets a clean single-tab session.
+    try:
+        killed = _close_extra_tabs(driver, anchor)
+        if killed:
+            log.info(f"    cleaned up {killed} extra tab(s) before continuing")
+    except Exception:
+        pass
+
+    log.info(f"    ✓ commercial_inflate complete -- main query should see denser ads")
+
+
 def _act_fill_form(driver, action: dict, ctx: dict):
     """Type into one or more form fields. Accepts either:
       {selector: "...", value: "..."}  — single field
@@ -1078,6 +1298,10 @@ ACTION_HANDLERS: dict[str, Callable] = {
     "screenshot":         _act_screenshot,
     "wait_for_url":       _act_wait_for_url,
 
+    # Ad-density inflater: pre-warm Google's commercial-intent
+    # context before a brand search to boost ad serving rate.
+    "commercial_inflate": _act_commercial_inflate,
+
     # Mobile-specific (CDP touch emulation)
     "touch_click":        _act_touch_click,
     "swipe":              _act_swipe,
@@ -1224,6 +1448,28 @@ def _loop_refresh(browser, step, loop_ctx):
         driver.set_page_load_timeout(15)
     except Exception:
         pass
+
+    # Sanity guard: refresh only makes sense if the current tab is on
+    # a Google SERP. If we're on fingerprint.com (leftover from a
+    # previous probe run), about:blank, or some other non-SERP, the
+    # refresh just spins and the user wastes 3 attempts on the wrong
+    # page. Bail loudly so they see the issue.
+    try:
+        cur_url = (driver.current_url or "").lower()
+    except Exception:
+        cur_url = ""
+    if not cur_url or not (
+        "google." in cur_url and (
+            "/search" in cur_url or "google." in cur_url[:20]
+        )
+    ):
+        log.warning(
+            f"  → refresh: SKIP -- current URL is {cur_url[:80]!r}, "
+            f"not a Google SERP. The previous step likely failed to "
+            f"navigate (empty query? dead browser?). Refreshing this "
+            f"page would loop on the wrong content."
+        )
+        return
 
     for attempt in range(1, max_attempts + 1):
         wait = random.uniform(lo, hi)
@@ -1879,6 +2125,49 @@ def _action_catalog_raw() -> list[dict]:
             ],
         },
         {
+            "type":        "commercial_inflate",
+            "label":       "🔥 Commercial inflate (boost ad density)",
+            "category":    "navigation",
+            "scope":       "any",
+            "description": (
+                "Pre-warm Google's commercial-intent context BEFORE the "
+                "next brand search. Visits N short generic commercial "
+                "queries (no brand reference) in the same browser session "
+                "so the next brand SERP comes back denser with ads "
+                "(typically 2-5x more). Auto-detects the brand category "
+                "(medical / beauty / tech / auto) for relevant pre-queries. "
+                "Place ABOVE search_query inside a foreach/loop iteration."
+            ),
+            "params": [
+                {"name": "brand", "type": "text",
+                 "default": "{item}",
+                 "label": "Brand (drives category)",
+                 "placeholder": "{item}",
+                 "hint": "Template string. Inside a foreach over brand "
+                         "queries this is usually {item}. Used to detect "
+                         "the product category (e.g. 'medika' → medical) "
+                         "and choose appropriate pre-queries."},
+                {"name": "n", "type": "number", "default": 2,
+                 "label": "Pre-query count",
+                 "hint": "How many commercial pre-queries to fire (2-3 is "
+                         "the sweet spot — more = slower run, less = "
+                         "weaker signal)."},
+                {"name": "dwell_min", "type": "number", "default": 8,
+                 "label": "Dwell min (s)"},
+                {"name": "dwell_max", "type": "number", "default": 15,
+                 "label": "Dwell max (s)"},
+                {"name": "locale", "type": "text", "default": "UA",
+                 "label": "Locale",
+                 "hint": "UA, RU, EN, or combinations like 'UA+RU'. "
+                         "Determines which suffix pool the commercial "
+                         "queries are drawn from."},
+                {"name": "click_organic", "type": "bool", "default": False,
+                 "label": "Click first organic result on each pre-SERP",
+                 "hint": "Stronger signal but adds 5-10s per pre-query. "
+                         "Use when boosting a particularly cold profile."},
+            ],
+        },
+        {
             "type":        "fill_form",
             "label":       "Fill form field(s)",
             "category":    "input",
@@ -2203,10 +2492,28 @@ class RunContext:
 _VAR_PATTERN = re.compile(r"\{([a-zA-Z_][a-zA-Z0-9_.]*)\}")
 
 
+# Keys whose values hold NESTED STEPS (executed by container handlers
+# like loop/foreach/foreach_ad/if). These nested steps must NOT be
+# pre-interpolated when their parent step is interpolated -- the
+# container's per-iteration scope (with `item`, `ad`, etc set) is the
+# correct context to interpolate them in. If we recursed into these
+# keys at the outer level, "{item}" in an inner step would resolve to
+# "" because the outer ctx has item=None, then the foreach handler
+# would see the already-blanked template and we'd lose the placeholder.
+# This was the actual production bug behind the "[search_query] empty
+# query, skipping" report after binding Smart Search & Click to a
+# fresh profile.
+_NESTED_STEPS_KEYS = {"steps", "then_steps", "else_steps"}
+
+
 def _interpolate(value, ctx: RunContext):
     """Recursively replace {path} references in strings inside a value.
     Plain numbers / bools / None pass through unchanged. Dicts and lists
-    are walked so params like {"url": "{ad.clean_url}"} work."""
+    are walked so params like {"url": "{ad.clean_url}"} work.
+
+    Container nested-steps are SKIPPED (preserved raw): see
+    _NESTED_STEPS_KEYS comment above.
+    """
     if isinstance(value, str):
         def _sub(m):
             path = m.group(1)
@@ -2216,7 +2523,10 @@ def _interpolate(value, ctx: RunContext):
             return str(resolved)
         return _VAR_PATTERN.sub(_sub, value)
     if isinstance(value, dict):
-        return {k: _interpolate(v, ctx) for k, v in value.items()}
+        return {
+            k: (v if k in _NESTED_STEPS_KEYS else _interpolate(v, ctx))
+            for k, v in value.items()
+        }
     if isinstance(value, list):
         return [_interpolate(v, ctx) for v in value]
     return value
@@ -2610,11 +2920,50 @@ def _flow_search_query(step: dict, ctx: RunContext):
     (which does Google navigation + parse) and stores results in
     ctx.ads. Previously this also ran the per-ad pipeline automatically
     — in the new model, the user chains a `foreach_ad` step themselves
-    to make that explicit."""
-    q = (step.get("query") or "").strip()
+    to make that explicit.
+
+    Defensive resolution (April 2026): if the step's query template
+    interpolates to an empty string -- typical cause: the script writes
+    `query: "{item}"` but the surrounding loop variable is shadowed or
+    the loop's item_var is not "item" -- we fall back to ctx.item or
+    ctx.query before giving up. Without this, an empty query made the
+    runtime silently skip the navigation + then refresh whatever stale
+    page Chrome was on (fingerprint.com from the previous probe run,
+    a blank tab, etc), which looked like Google was returning 0 ads
+    when in reality we never visited Google.
+    """
+    raw_q = step.get("query") or ""
+    q = raw_q.strip() if isinstance(raw_q, str) else str(raw_q).strip()
+
+    # Fallback ladder when interpolation gave us nothing useful
     if not q:
-        log.warning("  [search_query] empty query, skipping")
+        # Maybe the template used a var name that doesn't exist
+        # (typo / wrong item_var). ctx.item is set by foreach.
+        if ctx.item:
+            q = str(ctx.item).strip()
+            log.warning(
+                f"  [search_query] template query was empty after "
+                f"interpolation -- falling back to ctx.item={q!r}. "
+                f"Check your script: query field should be \"{{item}}\" "
+                f"or \"{{var.<your_item_var>}}\""
+            )
+        elif ctx.query:
+            q = str(ctx.query).strip()
+            log.warning(
+                f"  [search_query] empty query, reusing previous "
+                f"ctx.query={q!r}"
+            )
+
+    if not q:
+        # Genuinely nothing to search. Log MORE than the old terse
+        # "empty query, skipping" line so the user can debug.
+        log.warning(
+            f"  [search_query] empty query, skipping. "
+            f"raw template={raw_q!r}, ctx.item={ctx.item!r}, "
+            f"ctx.vars keys={list(ctx.vars.keys())[:8]}"
+        )
         return
+
     search_fn = ctx.loop_ctx.get("search_query")
     if not search_fn:
         log.warning("  [search_query] no runner in loop_ctx")

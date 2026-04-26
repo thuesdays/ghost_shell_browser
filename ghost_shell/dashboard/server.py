@@ -375,6 +375,36 @@ class _LegacyRunnerShim:
 RUNNER = _LegacyRunnerShim()
 
 
+def _bulk_mark_ancient_runs_dead() -> int:
+    """Fast pre-pass: any 'unfinished' run started more than 1 hour ago
+    is by definition dead -- a healthy run lasts 2-5 minutes, a wedged
+    one tops out around the watchdog limit (~3 min). Mark all of them
+    finished in ONE SQL UPDATE without spending a psutil call per row.
+
+    This is the difference between a 15-25s startup (psutil checking
+    100 dead PIDs one at a time) and a sub-second startup (one bulk
+    UPDATE that touches the same rows in 50ms). Returns affected
+    count for logging.
+    """
+    try:
+        from datetime import datetime, timedelta as _td
+        cutoff = (datetime.now() - _td(hours=1)).isoformat(timespec="seconds")
+        conn = get_db()._get_conn()
+        with conn:
+            cur = conn.execute("""
+                UPDATE runs
+                   SET finished_at = datetime('now'),
+                       exit_code   = -99,
+                       error       = COALESCE(error, 'startup: marked dead (>1h unfinished)')
+                 WHERE finished_at IS NULL
+                   AND started_at < ?
+            """, (cutoff,))
+            return cur.rowcount or 0
+    except Exception as e:
+        logging.warning(f"[startup] bulk-mark-ancient skipped: {e}")
+        return 0
+
+
 def cleanup_stale_runs():
     """
     Resolve inconsistent DB/process state left by previous dashboard
@@ -385,22 +415,52 @@ def cleanup_stale_runs():
       * live process with fresh heartbeat → leave alone (dashboard was
         restarted but scheduler or manual run is still healthily going)
 
-    Before this function existed, we only flipped the DB flag — Chrome
-    subprocesses from the old dashboard kept running and collided with
-    fresh spawns on user-data-dir locks. Now we genuinely clean up.
+    Two-phase to keep startup fast even with a backlog of unfinished
+    rows from prior crashes:
+
+      Phase A (sync, fast):   bulk-mark anything older than 1 hour as
+                              dead via single UPDATE -- no psutil cost
+      Phase B (background):   recent unfinished runs go through psutil
+                              checks in a daemon thread so Flask starts
+                              immediately
+
+    Before the bulk-mark optimisation, this could take 15-25s for users
+    with 50-100 unfinished rows (each psutil.Process(pid).cmdline() on
+    Windows runs ~100-200ms).
     """
+    # Phase A: synchronous bulk-mark
     try:
-        from ghost_shell.core.process_reaper import reap_stale_runs
-        db = get_db()
-        stats = reap_stale_runs(db, reason_prefix="dashboard-restart")
-        if any(stats.values()):
+        old_marked = _bulk_mark_ancient_runs_dead()
+        if old_marked:
             logging.info(
-                f"[startup] Stale-run reap: "
-                f"killed={stats['killed']}, marked={stats['marked_finished']}, "
-                f"still alive={stats['alive_left_alone']}"
+                f"[startup] bulk-marked {old_marked} ancient unfinished "
+                f"run(s) as dead (no psutil check needed)"
             )
     except Exception as e:
-        logging.error(f"[startup] Stale cleanup failed: {e}", exc_info=True)
+        logging.warning(f"[startup] bulk pre-pass failed: {e}")
+
+    # Phase B: psutil-backed reap of recent unfinished runs in background.
+    # Daemon thread so it doesn't block exit. Flask starts immediately
+    # while this completes silently for the few rows that survived
+    # phase A.
+    def _reap_recent():
+        try:
+            from ghost_shell.core.process_reaper import reap_stale_runs
+            db = get_db()
+            stats = reap_stale_runs(db, reason_prefix="dashboard-restart")
+            if any(stats.values()):
+                logging.info(
+                    f"[startup-bg] Stale-run reap (recent): "
+                    f"killed={stats['killed']}, "
+                    f"marked={stats['marked_finished']}, "
+                    f"still alive={stats['alive_left_alone']}"
+                )
+        except Exception as e:
+            logging.error(f"[startup-bg] Stale cleanup failed: {e}",
+                          exc_info=True)
+    import threading as _th
+    _th.Thread(target=_reap_recent, daemon=True,
+               name="startup-stale-reap").start()
 
 
 # ──────────────────────────────────────────────────────────────
@@ -766,9 +826,24 @@ def api_profiles():
 
 @app.route("/api/profiles/<name>/selfcheck", methods=["GET"])
 def api_profile_selfcheck(name: str):
+    """Return the latest selfcheck snapshot for a profile.
+
+    Used to be: 404 when no snapshot exists. That made the browser
+    DevTools console scream every time a freshly-created profile's
+    page loaded -- "GET /selfcheck 404 (NOT FOUND)" -- even though
+    the UI handled it correctly with an empty-state. Returning 200
+    with `{empty: true}` keeps the network tab clean while letting
+    the frontend render the same "Run a monitor pass first" hint.
+    """
     sc = get_db().selfcheck_latest(name)
     if not sc:
-        return jsonify({"error": "No selfcheck data yet. Run a monitor pass first."}), 404
+        return jsonify({
+            "empty":   True,
+            "message": "No selfcheck data yet. Run a monitor pass first.",
+            "passed":  0,
+            "total":   0,
+            "tests":   {},
+        })
     return jsonify(sc)
 
 
@@ -874,6 +949,71 @@ def api_profiles_quality_batch():
         return jsonify({"error": str(e)}), 500
 
 
+@app.route("/api/profiles/<name>/fingerprint/coherence", methods=["GET"])
+def api_profile_fp_coherence(name: str):
+    """Return the validator's per-test breakdown for this profile.
+
+    Drives the External Tester modal and the Self-Check empty-state
+    enrichment: we have the full coherence_report stored from the
+    last `runtime.py` save, just expose it in a clean shape so the
+    UI can render category badges, per-test rows, and per-tester
+    relevance scores without parsing the raw JSON inline.
+
+    Returns:
+      {
+        "empty":   bool,
+        "score":   int|None,
+        "grade":   "excellent"|"good"|"warning"|"critical"|None,
+        "results": [{name, category, status, detail}, ...],
+        "by_category": {"critical": [...], "ua": [...], "gpu": [...], ...},
+        "timestamp": ISO|None
+      }
+    """
+    db = get_db()
+    fp = db.fingerprint_current(name) if hasattr(db, "fingerprint_current") else None
+    if not fp:
+        return jsonify({"empty": True, "message": "No fingerprint snapshot yet -- launch the profile once to generate one."})
+
+    score  = fp.get("coherence_score")
+    rep    = fp.get("coherence_report")
+    ts     = fp.get("timestamp")
+    if isinstance(rep, str):
+        try:
+            rep = json.loads(rep)
+        except Exception:
+            rep = None
+
+    if not rep:
+        # We have a fingerprint but no coherence-report (older row,
+        # before runtime started writing it). Compute on-demand via
+        # the validator so the UI gets fresh data.
+        try:
+            from ghost_shell.fingerprint.validator import validate
+            payload = fp.get("payload") or {}
+            if isinstance(payload, str):
+                payload = json.loads(payload)
+            rep = validate(payload, payload) or {}
+            score = rep.get("score") if score is None else score
+        except Exception as e:
+            logging.debug(f"[coherence] on-demand validate failed: {e}")
+            rep = {}
+
+    results = (rep or {}).get("results") or []
+    by_category = {}
+    for r in results:
+        cat = r.get("category") or "other"
+        by_category.setdefault(cat, []).append(r)
+
+    return jsonify({
+        "empty":       False,
+        "score":       score,
+        "grade":       (rep or {}).get("grade"),
+        "results":     results,
+        "by_category": by_category,
+        "timestamp":   ts,
+    })
+
+
 @app.route("/api/profiles/<name>/fingerprint/probe", methods=["POST"])
 def api_profile_fp_probe(name: str):
     """Spawn a probe-only run that visits external fingerprint testers
@@ -903,14 +1043,30 @@ def api_profile_fp_probe(name: str):
     # runtime understands (open_url + pause). 30s dwell because some
     # testers (CreepJS, AmIUnique) compute scores asynchronously and
     # the score isn't visible for ~10-20s after page load.
-    PROBE_TESTERS = [
-        ("CreepJS",       "https://abrahamjuliot.github.io/creepjs/"),
-        ("Sannysoft",     "https://bot.sannysoft.com/"),
-        ("Pixelscan",     "https://pixelscan.net/"),
-        ("AmIUnique",     "https://amiunique.org/fingerprint"),
-        ("BrowserLeaks",  "https://browserleaks.com/canvas"),
-        ("FP-com BotD",   "https://fingerprint.com/products/bot-detection/"),
-    ]
+    ALL_TESTERS = {
+        "creepjs":      ("CreepJS",       "https://abrahamjuliot.github.io/creepjs/"),
+        "sannysoft":    ("Sannysoft",     "https://bot.sannysoft.com/"),
+        "pixelscan":    ("Pixelscan",     "https://pixelscan.net/"),
+        "amiunique":    ("AmIUnique",     "https://amiunique.org/fingerprint"),
+        "browserleaks": ("BrowserLeaks",  "https://browserleaks.com/canvas"),
+        "fpcom":        ("FP-com BotD",   "https://fingerprint.com/products/bot-detection/"),
+    }
+    # Optional tester-id filter from POST body. The "Probe just
+    # this one" button on the per-tester modal sends a single id;
+    # the global Probe button sends nothing -> all 6 are visited.
+    body = request.get_json(silent=True) or {}
+    requested = body.get("testers") or body.get("tester_id")
+    if isinstance(requested, str):
+        requested = [requested]
+    if requested:
+        PROBE_TESTERS = [(ALL_TESTERS[t][0], ALL_TESTERS[t][1])
+                         for t in requested if t in ALL_TESTERS]
+        if not PROBE_TESTERS:
+            return jsonify({"ok": False,
+                            "error": f"unknown tester ids; valid: {list(ALL_TESTERS)}"}), 400
+    else:
+        PROBE_TESTERS = list(ALL_TESTERS.values())
+
     probe_flow = []
     for label, url in PROBE_TESTERS:
         probe_flow.append({
@@ -2694,6 +2850,14 @@ def api_logs_live():
     my_queue = RUNNER_POOL.subscribe()
 
     def generate():
+        # Send a heartbeat IMMEDIATELY so the browser's EventSource
+        # sees data within the first few hundred ms and doesn't tear
+        # down the connection while waiting on `onopen`. Without this
+        # priming line, slow first-tick log activity meant the
+        # browser would sometimes flag ERR_CONNECTION_RESET on a
+        # perfectly healthy server -- the response just sat empty
+        # past whatever proxy / werkzeug timeout existed in between.
+        yield ": ready\n\n"
         last_heartbeat = time.time()
         try:
             while True:
@@ -2702,8 +2866,12 @@ def api_logs_live():
                     yield f"data: {json.dumps(entry, ensure_ascii=False)}\n\n"
                     last_heartbeat = time.time()
                 except queue.Empty:
-                    # Heartbeat every 15s to keep connection alive
-                    if time.time() - last_heartbeat > 15:
+                    # Heartbeat every 10s to keep connection alive.
+                    # Lowered from 15s -- some intermediaries (dev
+                    # proxies, browser background-tab throttling) cut
+                    # idle SSE at 12-13s, which produced exactly the
+                    # ERR_CONNECTION_RESET the user reported.
+                    if time.time() - last_heartbeat > 10:
                         yield ": heartbeat\n\n"
                         last_heartbeat = time.time()
                     continue
@@ -2720,6 +2888,9 @@ def api_logs_live():
         "Cache-Control":      "no-cache",
         "X-Accel-Buffering":  "no",
         "Connection":         "keep-alive",
+        # Hint reverse proxies + browsers that this is a long-lived
+        # text stream and shouldn't be buffered or transformed.
+        "Content-Encoding":   "identity",
     })
 
 
@@ -5832,26 +6003,48 @@ def api_vault_item_totp(item_id):
 
 
 if __name__ == "__main__":
-    # Auto-migration from legacy files
-    get_db().migrate_from_files(verbose=True)
-    # Clean up stale runs left from previous crashes
+    # Per-phase timing so users can see (and report) which startup
+    # step is slow. Previously the dashboard could hang 15-25s on
+    # boot with no indication why. Each phase prints elapsed ms so
+    # any future regression is obvious in the first 30 lines of the
+    # log instead of being a silent stall.
+    import time as _t_boot
+    _boot_start = _t_boot.time()
+    def _phase(label: str):
+        elapsed = (_t_boot.time() - _boot_start) * 1000
+        print(f"[startup +{elapsed:6.0f}ms] {label}")
+
+    _phase("init  : opening DB + schema migrations")
+    _db_boot = get_db()
+    _phase("ok    : DB ready")
+
+    _phase("init  : migrate_from_files (legacy yaml/txt -> DB)")
+    _db_boot.migrate_from_files(verbose=True)
+    _phase("ok    : migrate_from_files done")
+
+    _phase("init  : cleanup_stale_runs (bulk + bg reap)")
     cleanup_stale_runs()
-    # One-shot fix for broken v1 import/export (see function docstring)
+    _phase("ok    : stale-run cleanup queued")
+
+    _phase("init  : cleanup_orphan_config_keys")
     cleanup_orphan_config_keys()
+    _phase("ok    : orphan keys cleaned")
+
     # Traffic-stats retention cleanup — deletes rows older than
     # traffic.retention_days (default 90). Runs once at startup; the
     # background traffic collectors don't need a periodic task beyond
     # this because writes are bounded (~50 rows/hour per profile).
+    _phase("init  : traffic_cleanup")
     try:
-        db = get_db()
-        retention = int(db.config_get("traffic.retention_days") or 90)
+        retention = int(_db_boot.config_get("traffic.retention_days") or 90)
         if retention > 0:
-            deleted = db.traffic_cleanup(retention_days=retention)
+            deleted = _db_boot.traffic_cleanup(retention_days=retention)
             if deleted > 0:
                 print(f"[startup] Cleaned up {deleted} traffic rows older than "
                       f"{retention} days")
     except Exception as e:
         print(f"[startup] traffic cleanup skipped: {e}")
+    _phase("ok    : traffic_cleanup done")
 
     port = int(os.environ.get("PORT", 5000))
     url  = f"http://127.0.0.1:{port}"

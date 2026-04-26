@@ -115,15 +115,12 @@
             </div>
           </div>
           <div class="session-warmup-row">
-            <div class="form-group" style="max-width: 180px;">
+            <div class="form-group" style="max-width: 180px; margin-bottom: 0;">
               <label class="form-label">Site count</label>
               <input type="number" class="input" id="session-warmup-sites"
                      min="2" max="15" value="7">
               <div class="form-hint">How many sites from the preset to visit.</div>
             </div>
-            <button class="btn btn-primary" id="session-warmup-run-btn">
-              ▶ Run warmup now
-            </button>
             <div id="session-warmup-live" class="session-warmup-live" style="display:none;">
               <div class="spinner-sm"></div>
               <div class="session-warmup-live-text">
@@ -131,6 +128,22 @@
                 <div id="session-warmup-live-sub" class="muted"></div>
               </div>
             </div>
+          </div>
+          <!-- Action row separated from the inputs above. Previously the
+               Run button shared a flex row with the Site-count input and
+               its label + hint, which made the button float at an odd
+               vertical position relative to the input column -- visually
+               misaligned. Putting the button on its own row keeps it
+               anchored to the bottom of the warmup form regardless of
+               how tall the inputs above grow. -->
+          <div class="session-warmup-actions"
+               style="display:flex; justify-content: flex-end;
+                      gap: 10px; margin-top: 14px;
+                      border-top: 1px solid var(--border, #2a3142);
+                      padding-top: 12px;">
+            <button class="btn btn-primary" id="session-warmup-run-btn">
+              ▶ Run warmup now
+            </button>
           </div>
         </div>
       </div>

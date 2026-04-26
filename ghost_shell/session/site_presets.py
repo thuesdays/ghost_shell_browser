@@ -258,11 +258,95 @@ MOBILE = [
 # ═══════════════════════════════════════════════════════════════
 # Registry — the dict API code consumes
 # ═══════════════════════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════════
+# Commerce UA — high-value commercial-intent warmup for UA profiles.
+# This is the preset to run when you want Google to think "this user
+# actively shops Ukrainian online stores", which is the strongest
+# signal for boosting ad density on commercial / brand queries.
+# ═══════════════════════════════════════════════════════════════
+COMMERCE_UA = [
+    # Major UA marketplaces
+    {"url": "https://rozetka.com.ua/",
+     "topic": "shop-ua-marketplace", "dwell_sec": (15, 30), "scroll": True,
+     "countries": ["UA"],
+     "notes": "Rozetka — biggest UA marketplace, heavy GTM/GA"},
+    {"url": "https://prom.ua/",
+     "topic": "shop-ua-marketplace", "dwell_sec": (15, 30), "scroll": True,
+     "countries": ["UA"],
+     "notes": "Prom.ua — second biggest UA marketplace"},
+    # Electronics retailers
+    {"url": "https://allo.ua/",
+     "topic": "shop-ua-electronics", "dwell_sec": (12, 25), "scroll": True,
+     "countries": ["UA"],
+     "notes": "Allo — UA electronics chain"},
+    {"url": "https://comfy.ua/",
+     "topic": "shop-ua-electronics", "dwell_sec": (12, 25), "scroll": True,
+     "countries": ["UA"],
+     "notes": "Comfy — appliances + electronics"},
+    {"url": "https://www.foxtrot.com.ua/",
+     "topic": "shop-ua-electronics", "dwell_sec": (10, 20), "scroll": True,
+     "countries": ["UA"],
+     "notes": "Foxtrot — appliances retailer"},
+    {"url": "https://www.eldorado.com.ua/",
+     "topic": "shop-ua-electronics", "dwell_sec": (10, 20), "scroll": True,
+     "countries": ["UA"],
+     "notes": "Eldorado — appliances retailer"},
+    {"url": "https://www.moyo.ua/",
+     "topic": "shop-ua-electronics", "dwell_sec": (10, 20), "scroll": True,
+     "countries": ["UA"],
+     "notes": "MOYO — electronics chain"},
+    {"url": "https://citrus.ua/",
+     "topic": "shop-ua-tech", "dwell_sec": (10, 20), "scroll": True,
+     "countries": ["UA"],
+     "notes": "Citrus — tech retailer"},
+    # Pharmacy / health (relevant when monitoring medical brands)
+    {"url": "https://apteka.com.ua/",
+     "topic": "shop-ua-pharmacy", "dwell_sec": (10, 18), "scroll": True,
+     "countries": ["UA"],
+     "notes": "Apteka.com.ua — UA pharmacy directory"},
+    {"url": "https://liki24.com/",
+     "topic": "shop-ua-pharmacy", "dwell_sec": (10, 18), "scroll": True,
+     "countries": ["UA"],
+     "notes": "Liki24 — UA medicine delivery"},
+    # Beauty / cosmetics
+    {"url": "https://makeup.com.ua/",
+     "topic": "shop-ua-beauty", "dwell_sec": (10, 18), "scroll": True,
+     "countries": ["UA"],
+     "notes": "Makeup.com.ua — UA beauty retailer"},
+    {"url": "https://eva.ua/",
+     "topic": "shop-ua-beauty", "dwell_sec": (10, 18), "scroll": True,
+     "countries": ["UA"],
+     "notes": "Eva.ua — UA drugstore + beauty"},
+    # Fashion / apparel
+    {"url": "https://shafa.ua/",
+     "topic": "shop-ua-fashion", "dwell_sec": (10, 18), "scroll": True,
+     "countries": ["UA"],
+     "notes": "Shafa — UA fashion marketplace"},
+    {"url": "https://kasta.ua/",
+     "topic": "shop-ua-fashion", "dwell_sec": (10, 18), "scroll": True,
+     "countries": ["UA"],
+     "notes": "Kasta — fashion retailer"},
+    # Universal commercial-intent signal: Google Shopping
+    {"url": "https://www.google.com/shopping",
+     "topic": "shop-google", "dwell_sec": (10, 18), "scroll": True,
+     "countries": ["*"],
+     "notes": "Google Shopping landing — directly tells Google we're shopping"},
+]
+
+
 PRESETS = {
     "general": {
         "label":       "General",
         "description": "Balanced mix — search, video, reference, social, utility.",
         "sites":       GENERAL,
+    },
+    "commerce_ua": {
+        "label":       "Commerce UA  (★ ad-density booster)",
+        "description": "Visits major UA online stores (Rozetka, Prom, Allo, Comfy, "
+                       "Apteka, Makeup, etc). Runs the strongest commercial-intent "
+                       "signal Google has for UA profiles -- pumps ad density on "
+                       "subsequent monitor runs by 2-5x.",
+        "sites":       COMMERCE_UA,
     },
     "medical": {
         "label":       "Medical / Health",

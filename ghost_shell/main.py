@@ -527,16 +527,39 @@ def _try_recover_browser(browser, reason: str = "") -> bool:
 # ──────────────────────────────────────────────────────────────
 
 def extract_real_url(href: str) -> str:
-    """Parse adurl/url/q parameter from Google redirect URL"""
+    """Parse adurl/url/q/dest_url/... parameter from Google redirect URL.
+
+    Modern Google ad-click URLs use different parameter names depending
+    on the format:
+      - text ads:        adurl, url, q
+      - shopping_carousel: dest_url, ducr, dadu, durl
+      - PLA grid:        adurl, dest_url
+    Some also embed the destination twice (in two different params,
+    sometimes with one truncated). We try every known key in priority
+    order and pick the first one that yields a clean http URL.
+    """
     if not href:
         return ""
     try:
         parsed = urlparse(href)
         qs = parse_qs(parsed.query)
-        for key in ("adurl", "url", "q"):
+        # Try each candidate key in priority order. Order matters: for
+        # shopping ads, dest_url is the canonical destination while
+        # adurl is sometimes the merchant feed URL (less useful).
+        for key in (
+            "adurl", "dest_url", "ducr", "dadu", "durl",
+            "url", "q", "target", "redirect_url", "u",
+        ):
             if key in qs:
-                real = unquote(qs[key][0])
+                real = unquote(qs[key][0] or "")
+                # Recursively unwrap if the destination is itself a
+                # google redirect (happens with shopping carousels:
+                # aclk?dest_url=...&adurl=https://www.google.com/url?...)
                 if real.startswith("http"):
+                    if "google.com/url?" in real or "google.com/aclk?" in real:
+                        unwrapped = extract_real_url(real)
+                        if unwrapped and unwrapped != real:
+                            return unwrapped
                     return real
     except Exception:
         pass
@@ -601,37 +624,232 @@ def parse_ads(driver, query: str) -> list[dict]:
 
     /** Pull title / displayUrl / hrefs from a block + its best anchor. */
     function extractFromBlock(block, format) {
+        // ── SHORT-CIRCUIT for shopping cards ────────────────────
+        // Verified against live Google Shopping carousels (April 2026):
+        //   .mnr-c.pla-unit cards carry a `data-dtld` attribute with
+        //   the bare destination host (e.g. "sich.ua",
+        //   "vektormed.com.ua", "ravita.shop"). This is the cleanest
+        //   signal Google gives -- no aclk parsing, no display-text
+        //   regex. Use it FIRST before falling through to the generic
+        //   extractor below.
+        const dtld = block.getAttribute && block.getAttribute('data-dtld');
+        if (dtld && dtld.includes('.') && !dtld.includes('google.com')) {
+            const link = block.querySelector('a[href*="aclk"], a[href^="http"]');
+            if (link) {
+                const anchorId = stampAnchor(link);
+                // Title from heading inside the card. Fallback to the
+                // visible link text (usually product name + price).
+                let title = '';
+                const heading = block.querySelector(
+                    '[role="heading"], h3, h4, .LC20lb, .pla-unit-title-link, .pymv4e'
+                );
+                if (heading) title = heading.textContent.trim();
+                if (!title) {
+                    const linkText = (link.innerText || '').trim();
+                    title = linkText.split('\n')[0].slice(0, 100);
+                }
+                return {
+                    anchorId:        anchorId,
+                    title:           title,
+                    displayUrl:      dtld,
+                    googleClickUrl:  link.href || '',
+                    cleanFromDataRw: 'https://' + dtld,
+                    format:          format,
+                    anchorHref:      link.href || '',
+                    debugAttrs:      {'data-dtld': dtld,
+                                      'merchant-id': block.getAttribute('data-merchant-id') || '',
+                                      'offer-id':    block.getAttribute('data-offer-id') || ''},
+                };
+            }
+        }
+
         let title = '';
         const heading = block.querySelector('[role="heading"], h3, h4, .LC20lb');
         if (heading) title = heading.textContent.trim();
 
+        // displayUrl: green domain text shown on the card. Modern
+        // (April 2026) Google SERPs often have empty <cite> elements
+        // and put the displayed host inside a plain <span> nested
+        // alongside <h3>. Cast a wide net + verify the result looks
+        // like a hostname before trusting it.
         let displayUrl = '';
         const cite = block.querySelector(
-            'cite, span.VuuXrf, span.x2VHCd, span[role="text"], .x3G5ab'
+            'cite, span.VuuXrf, span.x2VHCd, span[role="text"], .x3G5ab, ' +
+            // Shopping-specific: merchant name spans
+            '.LbUacb, .E5ocAb, .aULzUe, .mr4j5, [data-merchant], ' +
+            'div[data-merchant-id], span.zPEcBd'
         );
         if (cite) displayUrl = cite.textContent.trim();
+        // Modern fallback: scan all spans in the card for one that
+        // looks like a bare hostname (e.g. "goodmedika.com.ua" with
+        // no spaces / slashes / weird chars).
+        if (!displayUrl) {
+            const HOST_RE = /^[a-z0-9-]+(?:\.[a-z0-9-]+)+$/i;
+            for (const sp of block.querySelectorAll('span, div')) {
+                const t = (sp.textContent || '').trim();
+                if (t && t.length < 60 && HOST_RE.test(t) &&
+                    !t.includes('google.com')) {
+                    displayUrl = t;
+                    break;
+                }
+            }
+        }
+
+        // Shopping cards sometimes have a dedicated merchant attr
+        if (!displayUrl) {
+            const mEl = block.querySelector('[data-merchant], [data-merchant-id], [data-domain]');
+            if (mEl) {
+                displayUrl = mEl.getAttribute('data-merchant')
+                          || mEl.getAttribute('data-merchant-id')
+                          || mEl.getAttribute('data-domain') || '';
+            }
+        }
 
         let googleClickUrl = '';
         let cleanUrl       = '';
         let primaryAnchor  = null;
+        const collectedAttrs = {};   // for debug logging when no_domain drops
+
+        // Attribute priority -- ORDER MATTERS.
+        //
+        // Verified against a live `гудмедіка` SERP (April 2026, UA
+        // locale, Chrome 147):
+        //   data-pcu     -> the actual destination URL (e.g. goodmedika.com.ua/).
+        //                   Present on the FIRST link of each ad card,
+        //                   sometimes missing on subsidiary links.
+        //   data-rw      -> a verbatim COPY of the aclk URL itself
+        //                   (e.g. https://www.google.com/aclk?...). It
+        //                   passes the `startsWith("http")` check so the
+        //                   old code grabbed THIS as the "clean URL"
+        //                   and then Python dropped it as google_internal.
+        //                   Result: we threw away every ad on every SERP
+        //                   that didn't have data-pcu on the picked anchor.
+        //   data-rh      -> usually a normalised destination host (no
+        //                   path), useful as a fallback for displayUrl.
+        //   data-agdh    -> Google ad-group debug header (not a URL).
+        //
+        // So: try data-pcu FIRST. Only fall back to data-rw if nothing
+        // else is found AND we explicitly strip the google.com prefix
+        // before treating it as a destination.
+        const PRIMARY_URL_ATTRS = [
+            'data-pcu',          // canonical destination URL
+            'data-pla-url',      // shopping PLA destination
+            'data-href',
+            'data-url',
+            'data-target-url',
+        ];
+        const FALLBACK_URL_ATTRS = [
+            'data-rh',           // host only (no path)
+            'data-pcuw', 'data-pcuwe',
+        ];
+        // We collect (but do NOT auto-pick) data-rw because it's
+        // typically a redirect URL pointing back to google.
+        const REDIRECT_URL_ATTRS = ['data-rw'];
 
         const allLinks = block.querySelectorAll('a[href]');
         for (const link of allLinks) {
             const href = link.href || '';
             if (!href.startsWith('http')) continue;
-            if (href.includes('/aclk?') ||
-                href.includes('googleadservices.com') ||
-                href.includes('googlesyndication.com')) {
+            const isAclk = href.includes('/aclk?') ||
+                           href.includes('googleadservices.com') ||
+                           href.includes('googlesyndication.com');
+            if (isAclk) {
                 if (!googleClickUrl) {
                     googleClickUrl = href;
                     primaryAnchor = link;
                 }
-                for (const attr of ['data-rw', 'data-pcu', 'data-rh', 'data-agdh']) {
+                // Try primary attrs first
+                for (const attr of PRIMARY_URL_ATTRS) {
                     const val = link.getAttribute(attr);
-                    if (val && val.startsWith('http') && !cleanUrl) {
-                        cleanUrl = val;
+                    if (val) {
+                        collectedAttrs[attr] = val.slice(0, 200);
+                        if (val.startsWith('http') &&
+                            !val.includes('google.com/aclk') &&
+                            !val.includes('googleadservices.com') &&
+                            !cleanUrl) {
+                            cleanUrl = val;
+                        }
                     }
                 }
+                // Fallback attrs: bare host -> synthesise https://
+                for (const attr of FALLBACK_URL_ATTRS) {
+                    const val = link.getAttribute(attr);
+                    if (val) {
+                        collectedAttrs[attr] = val.slice(0, 200);
+                        if (!cleanUrl && val && val.includes('.') &&
+                            !val.startsWith('http') &&
+                            !val.includes(' ')) {
+                            cleanUrl = 'https://' + val;
+                        }
+                    }
+                }
+                // Redirect attrs collected for debug only
+                for (const attr of REDIRECT_URL_ATTRS) {
+                    const v = link.getAttribute(attr);
+                    if (v) collectedAttrs[attr] = v.slice(0, 200);
+                }
+            }
+        }
+
+        // Visible-text fallback (the most reliable signal on modern
+        // Google SERPs). Each ad anchor renders the destination domain
+        // visually right under the title -- "купити медичне обладнання
+        // | Гудмедіка \n goodmedika.com.ua \n https://...". Scan the
+        // anchor's innerText for a line that looks like a hostname.
+        if (!cleanUrl && primaryAnchor) {
+            const txt = (primaryAnchor.innerText || '').slice(0, 1500);
+            const lines = txt.split('\n').map(s => s.trim()).filter(Boolean);
+            const HOST_RE = /^[a-z0-9-]+(?:\.[a-z0-9-]+)+(?:\/[^\s]*)?$/i;
+            for (const line of lines) {
+                // Drop the ad-card prefix like "https://" or "Реклама"
+                let candidate = line.replace(/^https?:\/\//i, '');
+                // Cut anything after first space (description text)
+                candidate = candidate.split(/\s/)[0];
+                if (HOST_RE.test(candidate) && !candidate.includes('google.com')) {
+                    // Looks like host[/path] -- normalise to bare host
+                    const host = candidate.split('/')[0].toLowerCase();
+                    if (host && host.includes('.') && host.length < 100) {
+                        cleanUrl = 'https://' + host;
+                        collectedAttrs['_from_visible_text'] = host;
+                        break;
+                    }
+                }
+            }
+        }
+
+        // Also scan the BLOCK itself + its children for data-* attrs
+        // that contain non-google http URLs OR a bare hostname
+        // (last-resort). Includes data-dtld which Shopping cards
+        // carry on the OUTER container (we already short-circuit
+        // for top-level shopping cards, but nested cards inside
+        // commercial-unit containers may not be covered above).
+        if (!cleanUrl) {
+            const all = [block, ...block.querySelectorAll('*')];
+            const HOST_RE = /^[a-z0-9-]+(?:\.[a-z0-9-]+)+$/i;
+            for (const el of all) {
+                if (!el.attributes) continue;
+                for (const attr of el.attributes) {
+                    const n = attr.name;
+                    const v = attr.value || '';
+                    if (!n.startsWith('data-')) continue;
+                    // Full http URL not on google?
+                    if (v.startsWith('http') &&
+                        !v.includes('google.com') && !v.includes('gstatic.com') &&
+                        !v.includes('googleadservices') &&
+                        !v.includes('googlesyndication')) {
+                        cleanUrl = v;
+                        collectedAttrs['_block_' + n] = v.slice(0, 200);
+                        break;
+                    }
+                    // Bare hostname? data-dtld and similar.
+                    if (v && v.length < 80 && HOST_RE.test(v) &&
+                        !v.includes('google.com')) {
+                        cleanUrl = 'https://' + v;
+                        collectedAttrs['_block_' + n + '_host'] = v;
+                        break;
+                    }
+                }
+                if (cleanUrl) break;
             }
         }
         // Fallback: first http link in block
@@ -657,6 +875,11 @@ def parse_ads(driver, query: str) -> list[dict]:
             cleanFromDataRw:  cleanUrl,
             format:           format,   // 'text' | 'shopping_carousel' | 'pla_grid' | 'other'
             anchorHref:       primaryAnchor.href || '',
+            // Debug: only populated when extraction is interesting --
+            // shipped through to Python where no_domain drops are
+            // logged WITH this dict so we can see what attrs Google
+            // actually had on the element.
+            debugAttrs:       collectedAttrs,
         };
     }
 
@@ -752,32 +975,33 @@ def parse_ads(driver, query: str) -> list[dict]:
         logging.warning(f"  JS parse error: {e}")
         return []
 
-    # ── DIAGNOSTIC: per-scan summary ──────────────────────────
-    # Why this matters: the previous behaviour was a silent black box —
-    # the retry loop logs "no ads after 4 attempts" without saying
-    # whether (a) the JS scan returned zero candidates, (b) candidates
-    # were found but all dropped as own-domain, or (c) something between.
-    # Users could not tell whether they were being soft-blocked, whether
-    # the parser was broken, or whether their queries genuinely had no
-    # competitors. Now we show the funnel: raw -> rejected -> kept.
+    # ── DIAGNOSTIC: per-scan summary (rate-limited) ───────────
+    # The polling loop in search_query() calls parse_ads() ~10 times
+    # per refresh-attempt (300ms intervals across a 3s window). Each
+    # call previously emitted full INFO funnel + diagnostic, producing
+    # 30-40 identical lines per query. We dedupe via a per-process
+    # signature cache: a scan is logged at INFO only when its result
+    # CHANGES (new candidate, different drop counts, different
+    # diagnostic verdict). Identical repeated scans go to DEBUG so
+    # users still get the data when troubleshooting with a verbose
+    # log level, but routine runs stay readable.
     fmt_counts = {"text": 0, "shopping_carousel": 0, "pla_grid": 0, "other": 0}
     for r in raw_ads:
         f = r.get("format", "other")
         fmt_counts[f] = fmt_counts.get(f, 0) + 1
+
     if raw_ads:
-        # Compact one-liner -- if the parser is finding stuff, this is
-        # a green check; if not, the per-format counts hint at which
-        # parser arm broke.
         bits = []
         for f in ("text", "shopping_carousel", "pla_grid"):
             if fmt_counts.get(f):
                 bits.append(f"{fmt_counts[f]} {f}")
-        logging.info(f"  parser: {len(raw_ads)} raw candidate(s) — " + ", ".join(bits or ["no breakdown"]))
+        msg = f"  parser: {len(raw_ads)} raw candidate(s) — " + ", ".join(bits or ["no breakdown"])
+        sig = ("raw", len(raw_ads), tuple(sorted(fmt_counts.items())))
+        if _parse_ads_should_log(sig):
+            logging.info(msg)
+        else:
+            logging.debug(msg)
     else:
-        # Zero raw candidates is the most ambiguous outcome -- could be
-        # genuine no-ads, could be a soft-block. Show diagnostics so the
-        # user can tell which: SERP heading count, "did you mean" banner,
-        # captcha-iframe presence, page title.
         try:
             diag = driver.execute_script(r"""
                 const out = {};
@@ -794,11 +1018,21 @@ def parse_ads(driver, query: str) -> list[dict]:
                     (document.body.innerText || '').includes(m)).join(',') || 'none';
                 return out;
             """) or {}
-            logging.info(
+            msg = (
                 f"  parser: 0 candidates — organic={diag.get('organic')} "
                 f"didyoumean={diag.get('didyoumean')} no_results={diag.get('results0')} "
                 f"recaptcha={diag.get('recaptcha')} sponsored_text={diag.get('spons_text')}"
             )
+            sig = ("zero", diag.get("organic"), bool(diag.get("didyoumean")),
+                   bool(diag.get("results0")), bool(diag.get("recaptcha")),
+                   diag.get("spons_text") or "")
+            if _parse_ads_should_log(sig):
+                logging.info(msg)
+            else:
+                logging.debug(msg)
+            # Recaptcha is rare and important enough that we always
+            # warn -- even if it's the third identical detection in a
+            # row, the user wants to see it loudly.
             if diag.get('recaptcha'):
                 logging.warning("  parser: ⚠ recaptcha iframe present on SERP — IP likely flagged")
         except Exception as e:
@@ -851,11 +1085,51 @@ def parse_ads(driver, query: str) -> list[dict]:
                 if d and "google" not in d:
                     clean_url = anchor_href
 
+            # Try harder for Shopping/PLA: parse display_url as merchant
+            # name. Google formats these as "rozetka.ua", "АЛЛО",
+            # "Comfy.ua · Магазин електроніки" etc. If display_url
+            # looks like a host (contains a dot, no spaces, common TLD)
+            # synthesise a domain from it.
+            if not clean_url and display_url and ad_format in (
+                "shopping_carousel", "pla_grid",
+            ):
+                # Strip everything after first space / · / › / |
+                first_token = display_url.split()[0] if display_url else ""
+                first_token = first_token.split("·")[0].split("›")[0].split("|")[0].strip()
+                # Heuristic: looks like a hostname
+                if (first_token and "." in first_token and
+                    " " not in first_token and len(first_token) < 60 and
+                    any(first_token.lower().endswith(tld) for tld in (
+                        ".ua", ".com", ".org", ".net", ".biz", ".info",
+                        ".com.ua", ".kiev.ua", ".io", ".store", ".shop",
+                        ".pl", ".de", ".ru", ".uk", ".eu",
+                    ))):
+                    clean_url = "https://" + first_token.lower()
+                    logging.debug(
+                        f"  parser: synthesised URL from merchant text "
+                        f"{first_token!r} for {ad_format}"
+                    )
+
             domain = extract_domain(clean_url) or extract_domain(display_url)
             if not domain:
                 no_domain_count += 1
-                logging.debug(f"  parser: candidate dropped — no domain extractable "
-                              f"(format={ad_format}, click_url={(google_click_url or '')[:80]!r})")
+                # Debug dump that actually helps. Includes the raw
+                # data-* attrs the JS side scraped from the DOM, so we
+                # can see exactly what Google handed us. Bump first 5
+                # to INFO so the user sees the diagnostic in normal
+                # logs without enabling DEBUG -- gives us a feedback
+                # loop for finding new attribute names Google added.
+                debug_attrs = raw.get("debugAttrs") or {}
+                msg = (
+                    f"  parser: dropped {ad_format} no-domain — "
+                    f"display_url={display_url[:60]!r} "
+                    f"aclk={(google_click_url or '')[:120]!r} "
+                    f"attrs={debug_attrs}"
+                )
+                if no_domain_count <= 5:
+                    logging.info(msg)
+                else:
+                    logging.debug(msg)
                 continue
 
             # Filter Google internal domains
@@ -905,21 +1179,65 @@ def parse_ads(driver, query: str) -> list[dict]:
         except Exception as e:
             logging.debug(f"  block processing error: {e}")
 
-    # ── Funnel summary ────────────────────────────────────────
-    # Always emit when parser dropped at least one candidate -- the
-    # most informative line in the whole ad-detection pipeline. Lets
-    # the user see at a glance whether "0 ads kept" means "Google
-    # showed nothing" vs "everything was ours" vs "something
-    # unparseable".
+    # ── Funnel summary (rate-limited like the per-scan logs above) ─
     drops = own_filtered_count + google_internal_count + no_domain_count + dup_count
     if raw_ads or drops:
-        logging.info(
+        msg = (
             f"  parser: kept {len(ads)} of {len(raw_ads)} candidates "
             f"(dropped: own={own_filtered_count} google_internal={google_internal_count} "
             f"no_domain={no_domain_count} dup={dup_count})"
         )
+        sig = ("funnel", len(ads), len(raw_ads),
+               own_filtered_count, google_internal_count,
+               no_domain_count, dup_count)
+        if _parse_ads_should_log(sig):
+            logging.info(msg)
+        else:
+            logging.debug(msg)
 
     return ads
+
+
+# ── Per-scan log dedupe ──────────────────────────────────────
+# parse_ads() is called from a 300ms polling loop -- without rate
+# limiting we get 30-40 identical lines per query. Cache the most
+# recent log signature so we suppress reruns of the same outcome.
+# Cache cleared at the start of each search_query() (see
+# search_query()'s top: _parse_ads_log_reset()) so a NEW query
+# always re-emits its first scan at INFO regardless of what the
+# previous query saw.
+_LAST_PARSER_SIG: tuple | None = None
+_PARSER_SIG_REPEAT_COUNT = 0
+
+
+def _parse_ads_should_log(sig: tuple) -> bool:
+    """Return True iff this scan's outcome differs from the previous
+    one (or it's the first scan after a reset). Keeps INFO-level
+    output proportional to *change*, not to poll frequency."""
+    global _LAST_PARSER_SIG, _PARSER_SIG_REPEAT_COUNT
+    if sig == _LAST_PARSER_SIG:
+        _PARSER_SIG_REPEAT_COUNT += 1
+        return False
+    _LAST_PARSER_SIG = sig
+    _PARSER_SIG_REPEAT_COUNT = 0
+    return True
+
+
+def _parse_ads_log_reset():
+    """Forget the last-seen parser signature. Call this at the top
+    of each search_query() iteration so a new query/refresh emits
+    its first scan at INFO even if it happens to match the prior
+    query's last scan."""
+    global _LAST_PARSER_SIG, _PARSER_SIG_REPEAT_COUNT
+    if _PARSER_SIG_REPEAT_COUNT > 0:
+        # Tail summary on reset so users know identical scans were
+        # silently happening -- without this, dedupe would hide the
+        # fact that we were actively polling.
+        logging.info(
+            f"  parser: (above scan repeated {_PARSER_SIG_REPEAT_COUNT}x silently)"
+        )
+    _LAST_PARSER_SIG = None
+    _PARSER_SIG_REPEAT_COUNT = 0
 
 
 # ──────────────────────────────────────────────────────────────
@@ -1062,6 +1380,12 @@ def search_query(browser, query: str, sqm: SessionQualityMonitor,
     captcha_rotations_used = 0
 
     for attempt in range(1, REFRESH_MAX_ATTEMPTS + 1):
+        # Reset the parser-log dedupe cache at the top of every
+        # attempt so the first scan of a fresh SERP load always emits
+        # at INFO. Without this, identical SERPs across attempts would
+        # be silenced -- but each refresh IS a new event the user
+        # wants to see logged once.
+        _parse_ads_log_reset()
         if is_offline_page(driver):
             logging.error("  ✗ offline page — proxy broken")
             return []
@@ -1983,6 +2307,26 @@ def run_monitor():
             }
 
             skip_legacy_loop = False
+
+            # ── Loud warning if neither path is wired ─────────────
+            # Users repeatedly hit the surprise where their profile
+            # "found 5 ads" but never clicked a single one. The
+            # silent fallback to the bottom for-loop (which only
+            # parses + saves, never clicks) was the cause. Make this
+            # visible at run-start so the misconfiguration shows up
+            # in the log next to the run banner instead of being
+            # invisible until they audit a 200-line log later.
+            if not unified_flow and not main_script:
+                logging.warning(
+                    "[main] ⚠ NO SCRIPT BOUND for profile %r -- ads "
+                    "will be DETECTED + SAVED but NEVER CLICKED. "
+                    "Fix: Scripts page -> 'Apply to profile' on "
+                    "Smart Search & Click (or any script with a "
+                    "click_ad step). Or open this profile -> "
+                    "Active script -> bind a script + enable "
+                    "'Use script on launch'.",
+                    PROFILE_NAME,
+                )
 
             if unified_flow:
                 # ── UNIFIED FLOW PATH ──────────────────────────

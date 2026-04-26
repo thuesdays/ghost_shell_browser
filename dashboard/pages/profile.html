@@ -371,51 +371,42 @@
         below to do that automatically.
       </div>
 
-      <div class="fp-tester-grid"
+      <div class="fp-tester-grid" id="fp-tester-grid"
            style="display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
                   gap: 8px; margin-bottom: 14px;">
-        <a class="fp-tester-card" href="https://abrahamjuliot.github.io/creepjs/"
-           target="_blank" rel="noopener noreferrer"
-           style="display:block; padding: 10px 12px; border:1px solid var(--border,#2a3142);
-                  border-radius: 8px; text-decoration: none; color: inherit; transition: border-color .15s;">
-          <div style="font-weight:600;">🕵 CreepJS</div>
-          <div class="muted" style="font-size:11px;">Trust score 0–100, exposes lies in UA/canvas/font fingerprints. The strictest grader.</div>
-        </a>
-        <a class="fp-tester-card" href="https://bot.sannysoft.com/"
-           target="_blank" rel="noopener noreferrer"
-           style="display:block; padding: 10px 12px; border:1px solid var(--border,#2a3142);
-                  border-radius: 8px; text-decoration: none; color: inherit;">
-          <div style="font-weight:600;">🤖 Sannysoft Bot Test</div>
-          <div class="muted" style="font-size:11px;">Webdriver, plugins, languages, iframe — the classic Selenium leak panel.</div>
-        </a>
-        <a class="fp-tester-card" href="https://pixelscan.net/"
-           target="_blank" rel="noopener noreferrer"
-           style="display:block; padding: 10px 12px; border:1px solid var(--border,#2a3142);
-                  border-radius: 8px; text-decoration: none; color: inherit;">
-          <div style="font-weight:600;">🎨 Pixelscan</div>
-          <div class="muted" style="font-size:11px;">Canvas/WebGL hash uniqueness, geo/IP correlation, timezone match.</div>
-        </a>
-        <a class="fp-tester-card" href="https://amiunique.org/fingerprint"
-           target="_blank" rel="noopener noreferrer"
-           style="display:block; padding: 10px 12px; border:1px solid var(--border,#2a3142);
-                  border-radius: 8px; text-decoration: none; color: inherit;">
-          <div style="font-weight:600;">🔍 AmIUnique</div>
-          <div class="muted" style="font-size:11px;">Compares your fingerprint to a public DB — flags rare combinations.</div>
-        </a>
-        <a class="fp-tester-card" href="https://browserleaks.com/"
-           target="_blank" rel="noopener noreferrer"
-           style="display:block; padding: 10px 12px; border:1px solid var(--border,#2a3142);
-                  border-radius: 8px; text-decoration: none; color: inherit;">
-          <div style="font-weight:600;">💧 BrowserLeaks</div>
-          <div class="muted" style="font-size:11px;">Per-API breakdown: WebRTC, fonts, canvas, geo, audio context. Gold standard for leak hunting.</div>
-        </a>
-        <a class="fp-tester-card" href="https://fingerprint.com/products/bot-detection/"
-           target="_blank" rel="noopener noreferrer"
-           style="display:block; padding: 10px 12px; border:1px solid var(--border,#2a3142);
-                  border-radius: 8px; text-decoration: none; color: inherit;">
-          <div style="font-weight:600;">🛡 Fingerprint.com BotD</div>
-          <div class="muted" style="font-size:11px;">Commercial bot-detect demo — same engine many sites license. The realest test.</div>
-        </a>
+        <!-- Tester cards rendered dynamically by profile-detail.js
+             from FP_TESTERS constant. Click opens a modal showing
+             what signals the tester checks, the profile's current
+             coherence-validator results for those signals, and a
+             one-click "Probe just this one" button. -->
+      </div>
+
+      <!-- Modal for tester details. Hidden by default; shown by
+           Profile.openTesterModal(testerId). Reuses the existing
+           .profile-modal pattern from elsewhere in the dashboard
+           so styles, close-on-backdrop, and ESC behaviour are
+           consistent with other modals. -->
+      <div class="profile-modal" id="fp-tester-modal" style="display:none;">
+        <div class="profile-modal-backdrop" data-close="fp-tester-modal"></div>
+        <div class="profile-modal-content" style="width: 640px; max-width: 92vw;">
+          <div class="profile-modal-header">
+            <div class="profile-modal-title" id="fp-tester-modal-title">Tester</div>
+            <button class="profile-modal-close" data-close="fp-tester-modal">×</button>
+          </div>
+          <div class="profile-modal-body" id="fp-tester-modal-body">
+            Loading…
+          </div>
+          <div class="profile-modal-footer" id="fp-tester-modal-footer">
+            <button class="btn btn-secondary" data-close="fp-tester-modal">Close</button>
+            <button class="btn btn-primary" id="fp-tester-modal-probe-btn">
+              🚀 Probe in profile
+            </button>
+            <a class="btn btn-secondary" id="fp-tester-modal-open-link"
+               href="#" target="_blank" rel="noopener noreferrer">
+              ↗ Open in new tab
+            </a>
+          </div>
+        </div>
       </div>
 
       <div style="display:flex; gap:10px; align-items:center; flex-wrap: wrap;">
