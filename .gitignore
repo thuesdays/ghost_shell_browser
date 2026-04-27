@@ -31,3 +31,4 @@ dist/
 # download GhostShellAntySetup.exe from GitHub Releases.
 installer/
 data/extensions_pool/
+chromedriver.log

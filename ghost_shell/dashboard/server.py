@@ -36,7 +36,7 @@ except (AttributeError, Exception):
     pass
 
 try:
-    from flask import Flask, request, jsonify, send_file, Response
+    from flask import make_response, Flask, request, jsonify, send_file, Response
     from flask_cors import CORS
 except ImportError:
     print("pip install flask flask-cors")
@@ -1125,6 +1125,447 @@ def api_profile_clear_session_quality(name: str):
         return jsonify({"ok": True})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/profiles/<name>/health", methods=["GET"])
+def api_profile_health(name: str):
+    """Return the recent canary timeline for the profile.
+
+    Sprint 4 (Health monitor). Drives the per-profile sparkline +
+    "trust drift" detection on the Overview page.
+
+    Query params:
+      days: how many days back (default 30, 0 = no time filter)
+      site: filter to one site_id (sannysoft|creepjs|pixelscan)
+      limit: max rows (default 200)
+
+    Response: {
+        "ok":       true,
+        "rows":     [{checked_at, site, score, raw_score, passed,
+                      total, error}, ...],
+        "summary":  {latest, trend, n_total},   # 7d window
+    }
+    """
+    try:
+        days  = int(request.args.get("days", 30))
+        limit = int(request.args.get("limit", 200))
+    except ValueError:
+        days, limit = 30, 200
+    site = request.args.get("site") or None
+    db = get_db()
+    try:
+        rows = db.profile_health_recent(name, days=days, site=site, limit=limit)
+        summary = db.profile_health_summary(name, days=7)
+        return jsonify({"ok": True, "rows": rows, "summary": summary})
+    except Exception as e:
+        logging.exception("[health] history fetch failed")
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@app.route("/api/profiles/<name>/backup", methods=["POST"])
+def api_profile_backup(name: str):
+    """Encrypted-bundle backup of a profile.
+
+    Sprint 7. Body JSON: {master_password}. Returns the bundle as a
+    binary download (Content-Type: application/octet-stream).
+
+    The master password is required EVERY TIME — we don't cache it.
+    Vault items in the bundle are already Fernet-encrypted with the
+    same password, so on restore the destination just needs the same
+    master to unlock them.
+
+    Bundle filename: ghost_shell_<profile_name>_<ISO-date>.ghs-bundle"""
+    body = request.get_json(silent=True) or {}
+    master = body.get("master_password") or ""
+    if not master:
+        return jsonify({"ok": False, "error": "master_password required"}), 400
+    try:
+        from ghost_shell.profile.backup import create_bundle
+        blob = create_bundle(name, master_password=master)
+    except ValueError as e:
+        return jsonify({"ok": False, "error": str(e)}), 404
+    except Exception as e:
+        logging.exception("[backup] create failed")
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+    from datetime import datetime as _dt
+    ts = _dt.now().strftime("%Y%m%d-%H%M%S")
+    fname = f"ghost_shell_{name}_{ts}.ghs-bundle"
+    response = make_response(blob)
+    response.headers["Content-Type"] = "application/octet-stream"
+    response.headers["Content-Disposition"] = f'attachment; filename="{fname}"'
+    response.headers["Content-Length"] = str(len(blob))
+    return response
+
+
+@app.route("/api/backup/inspect", methods=["POST"])
+def api_backup_inspect():
+    """Read the unencrypted header of an uploaded bundle.
+
+    Lets the restore UI show 'this is a v1 bundle, ~12 MB encrypted'
+    BEFORE asking the user for the master password. No password
+    required for inspection."""
+    if "file" not in request.files:
+        return jsonify({"ok": False, "error": "no file uploaded"}), 400
+    blob = request.files["file"].read()
+    try:
+        from ghost_shell.profile.backup import inspect_bundle
+        info = inspect_bundle(blob)
+        return jsonify({"ok": True, "info": info})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 400
+
+
+@app.route("/api/backup/restore", methods=["POST"])
+def api_backup_restore():
+    """Restore an uploaded encrypted bundle.
+
+    multipart/form-data:
+      file:                the .ghs-bundle binary
+      master_password:     password used at backup-create time
+      target_profile_name: optional rename on restore (avoids name
+                           collision with an existing profile)
+      overwrite:           "true" to replace existing target
+
+    Returns the restoration summary from restore_bundle()."""
+    if "file" not in request.files:
+        return jsonify({"ok": False, "error": "no file uploaded"}), 400
+    master = request.form.get("master_password") or ""
+    if not master:
+        return jsonify({"ok": False, "error": "master_password required"}), 400
+    target = request.form.get("target_profile_name") or None
+    overwrite = (request.form.get("overwrite") or "").lower() in ("1", "true", "yes")
+    blob = request.files["file"].read()
+    try:
+        from ghost_shell.profile.backup import (
+            restore_bundle, BundleAuthError, BundleFormatError,
+        )
+        summary = restore_bundle(
+            blob,
+            master_password=master,
+            target_profile_name=target,
+            overwrite=overwrite,
+        )
+        return jsonify(summary)
+    except BundleAuthError as e:
+        return jsonify({"ok": False, "error": str(e),
+                        "category": "auth"}), 401
+    except BundleFormatError as e:
+        return jsonify({"ok": False, "error": str(e),
+                        "category": "format"}), 400
+    except ValueError as e:
+        return jsonify({"ok": False, "error": str(e),
+                        "category": "conflict"}), 409
+    except Exception as e:
+        logging.exception("[backup] restore failed")
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+# ─── Sprint 8: cloud sync endpoints ─────────────────────────────────
+# Wraps backup_sync.target_from_config() with an HTTP surface so the
+# dashboard can push/pull/list/test without writing the SDK glue
+# itself. Each endpoint loads the configured target on-demand —
+# config changes apply on the next call without a server restart.
+# Auth: the master_password is forwarded straight through to
+# backup.create_bundle on push and to restore_bundle on pull, never
+# stored or logged. SyncConfigError → 400 (misconfigured),
+# SyncTransportError → 502 (upstream / network), other → 500.
+
+def _load_sync_target():
+    """Helper: load configured target or raise a consistent shape."""
+    from ghost_shell.profile.backup_sync import (
+        target_from_config, SyncConfigError,
+    )
+    try:
+        t = target_from_config(get_db())
+    except SyncConfigError as e:
+        return None, (jsonify({"ok": False, "error": str(e),
+                               "category": "config"}), 400)
+    if t is None:
+        return None, (jsonify({
+            "ok": False,
+            "error": "sync disabled — set backup.sync.enabled = true",
+            "category": "disabled",
+        }), 400)
+    return t, None
+
+
+@app.route("/api/backup/sync/test", methods=["POST"])
+def api_backup_sync_test():
+    """Light connectivity / auth check for the configured target.
+
+    Calls ``target.ping()`` which on most adapters does a cheap list
+    against an empty prefix. Returns the SDK's own error string on
+    failure so the user can debug without dashboard logs."""
+    target, err = _load_sync_target()
+    if err:
+        return err
+    try:
+        info = target.ping()
+        return jsonify({"ok": bool(info.get("ok")), "info": info,
+                        "provider": target.name})
+    except Exception as e:
+        logging.exception("[backup_sync] ping failed")
+        return jsonify({"ok": False, "error": str(e)}), 502
+
+
+@app.route("/api/backup/sync/list", methods=["GET"])
+def api_backup_sync_list():
+    """List remote bundles. Optional query params filter by host /
+    profile_name. Used by the restore-from-cloud picker UI."""
+    from ghost_shell.profile.backup_sync import (
+        list_remote_bundles, SyncTransportError,
+    )
+    target, err = _load_sync_target()
+    if err:
+        return err
+    src_host = request.args.get("host") or None
+    prof = request.args.get("profile_name") or None
+    try:
+        items = list_remote_bundles(target, source_host=src_host,
+                                    profile_name=prof)
+        return jsonify({"ok": True, "items": items,
+                        "provider": target.name})
+    except SyncTransportError as e:
+        return jsonify({"ok": False, "error": str(e),
+                        "category": "transport"}), 502
+    except Exception as e:
+        logging.exception("[backup_sync] list failed")
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@app.route("/api/profiles/<name>/backup/sync/push", methods=["POST"])
+def api_backup_sync_push(name: str):
+    """Create a fresh bundle for ``name`` and push to the configured
+    target. Body JSON: ``{master_password, keep_last?}``. The
+    keep_last override falls back to the global config key
+    ``backup.sync.keep_last`` if not supplied."""
+    from ghost_shell.profile.backup_sync import (
+        push_profile, SyncConfigError, SyncTransportError,
+    )
+    body = request.get_json(silent=True) or {}
+    master = body.get("master_password") or ""
+    if not master:
+        return jsonify({"ok": False, "error": "master_password required"}), 400
+    keep_last = body.get("keep_last")
+    try:
+        if keep_last is not None:
+            keep_last = int(keep_last)
+    except (TypeError, ValueError):
+        keep_last = None
+    try:
+        info = push_profile(name, master_password=master, db=get_db(),
+                            keep_last=keep_last)
+        return jsonify(info)
+    except ValueError as e:
+        # create_bundle raises this for missing profile or empty pw
+        return jsonify({"ok": False, "error": str(e),
+                        "category": "input"}), 400
+    except SyncConfigError as e:
+        return jsonify({"ok": False, "error": str(e),
+                        "category": "config"}), 400
+    except SyncTransportError as e:
+        logging.exception("[backup_sync] push transport failed")
+        return jsonify({"ok": False, "error": str(e),
+                        "category": "transport"}), 502
+    except Exception as e:
+        logging.exception("[backup_sync] push failed")
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@app.route("/api/backup/sync/pull", methods=["POST"])
+def api_backup_sync_pull():
+    """Fetch a bundle from the target and stream it back as a binary
+    download. The dashboard then chains into ``/api/backup/inspect``
+    + ``/api/backup/restore`` exactly like a local-file restore.
+
+    Body JSON: ``{key}`` (full key) OR ``{host, profile_name, stamp?}``
+    (resolved via ``pull_profile``). The latter is more ergonomic for
+    the dashboard picker UI."""
+    from ghost_shell.profile.backup_sync import (
+        pull_profile, SyncTransportError,
+    )
+    body = request.get_json(silent=True) or {}
+    target, err = _load_sync_target()
+    if err:
+        return err
+    key   = body.get("key")
+    host  = body.get("host")
+    prof  = body.get("profile_name")
+    stamp = body.get("stamp")
+    try:
+        if key:
+            blob = target.pull(key)
+        elif host and prof:
+            blob = pull_profile(target, source_host=host,
+                                profile_name=prof, stamp=stamp)
+        else:
+            return jsonify({"ok": False,
+                            "error": "supply either key or "
+                            "(host + profile_name [+ stamp])",
+                            "category": "input"}), 400
+    except SyncTransportError as e:
+        return jsonify({"ok": False, "error": str(e),
+                        "category": "transport"}), 502
+    except Exception as e:
+        logging.exception("[backup_sync] pull failed")
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+    fname = (key or "").rsplit("/", 1)[-1] or "bundle.ghs-bundle"
+    response = make_response(blob)
+    response.headers["Content-Type"] = "application/octet-stream"
+    response.headers["Content-Disposition"] = f'attachment; filename="{fname}"'
+    response.headers["Content-Length"] = str(len(blob))
+    return response
+
+
+@app.route("/api/backup/sync/delete", methods=["POST"])
+def api_backup_sync_delete():
+    """Remove a remote bundle. Body JSON: ``{key}``."""
+    from ghost_shell.profile.backup_sync import SyncTransportError
+    target, err = _load_sync_target()
+    if err:
+        return err
+    body = request.get_json(silent=True) or {}
+    key = body.get("key")
+    if not key:
+        return jsonify({"ok": False, "error": "key required",
+                        "category": "input"}), 400
+    try:
+        target.delete(key)
+        return jsonify({"ok": True, "deleted": key})
+    except SyncTransportError as e:
+        return jsonify({"ok": False, "error": str(e),
+                        "category": "transport"}), 502
+    except Exception as e:
+        logging.exception("[backup_sync] delete failed")
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@app.route("/api/health/drift", methods=["GET"])
+def api_health_drift():
+    """Profiles whose health/captcha trends signal trouble.
+
+    Sprint 6 — drives the Overview drift-alert banner. Returns only
+    profiles that meet at least one drift criterion (canary score
+    drop OR high captcha rate). Empty list = all healthy.
+
+    Query params:
+      days: window in days (default 7, max 90)
+    """
+    try:
+        days = int(request.args.get("days", 7))
+        days = max(1, min(days, 90))
+    except ValueError:
+        days = 7
+    try:
+        profiles = get_db().health_drift_profiles(days=days)
+        # Severity rollup for banner
+        critical = sum(1 for p in profiles if p["severity"] == "critical")
+        warn     = sum(1 for p in profiles if p["severity"] == "warn")
+        return jsonify({
+            "ok":       True,
+            "profiles": profiles,
+            "summary":  {
+                "total":    len(profiles),
+                "critical": critical,
+                "warn":     warn,
+            },
+        })
+    except Exception as e:
+        logging.exception("[health drift] failed")
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@app.route("/api/profiles/<name>/captcha-history", methods=["GET"])
+def api_profile_captcha_history(name: str):
+    """Per-day captcha frequency for the profile.
+
+    Real-workload signal — aggregates over runs.captchas, no scraping.
+    Drives the captcha-rate sparkline alongside Health monitor.
+
+    Query params:
+      days: window size in days (default 30, max 365)
+
+    Response: {ok, history: [...], summary: {...}}
+    """
+    try:
+        days = int(request.args.get("days", 30))
+        days = max(1, min(days, 365))
+    except ValueError:
+        days = 30
+    db = get_db()
+    try:
+        history = db.runs_captcha_history(name, days=days)
+        summary = db.runs_captcha_summary(name, days=min(7, days))
+        return jsonify({"ok": True, "history": history, "summary": summary})
+    except Exception as e:
+        logging.exception("[captcha] history fetch failed")
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@app.route("/api/profiles/<name>/health/canary", methods=["POST"])
+def api_profile_health_canary_run(name: str):
+    """Trigger a one-shot canary run for this profile right now.
+
+    Body (optional JSON):
+      sites: list[str] (default ["sannysoft"])
+
+    Runs the canary action against the existing profile launch (if
+    one is alive in this dashboard's RUNNER_POOL). Without a live
+    run, returns 409 — the canary needs a Chromium driver. The
+    dashboard's UI exposes this as a "Run canary now" button on
+    the profile detail page.
+    """
+    body = request.get_json(silent=True) or {}
+    sites = body.get("sites") or ["sannysoft"]
+    if isinstance(sites, str):
+        sites = [s.strip() for s in sites.split(",") if s.strip()]
+
+    runner = RUNNER_POOL.get(name) if hasattr(RUNNER_POOL, "get") else None
+    if runner is None or not getattr(runner, "browser", None):
+        return jsonify({
+            "ok": False,
+            "error": ("No live browser for this profile. Start a run, "
+                      "then trigger the canary from the per-profile "
+                      "detail page while the run is active."),
+        }), 409
+
+    driver = getattr(runner.browser, "driver", None)
+    if driver is None:
+        return jsonify({"ok": False, "error": "browser.driver missing"}), 409
+
+    try:
+        from ghost_shell.profile.health_canary import run_canary
+        results = run_canary(driver, sites=sites)
+    except Exception as e:
+        logging.exception("[health] canary run crashed")
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+    db = get_db()
+    saved = 0
+    for r in results:
+        try:
+            db.profile_health_save(
+                profile_name=name,
+                site=r.get("site"),
+                run_id=getattr(runner, "run_id", None),
+                score=r.get("score"),
+                raw_score=r.get("raw_score"),
+                passed=r.get("passed"),
+                total=r.get("total"),
+                details=r.get("details"),
+                error=r.get("error"),
+            )
+            saved += 1
+        except Exception as e:
+            logging.debug(f"[health] save failed: {e}")
+
+    return jsonify({
+        "ok":      True,
+        "saved":   saved,
+        "results": results,
+    })
 
 
 @app.route("/api/profiles/<name>/meta", methods=["GET"])
@@ -2833,23 +3274,50 @@ def api_scheduler_start():
     'consecutive failures, pausing 1800s' branch and the user could
     never get out without a manual DB poke.
     """
+    # Sprint 10.1 (EP-02): atomic O_EXCL pidfile create instead of
+    # "_scheduler_pid_alive() check, then open(SCHEDULER_PID_FILE, 'w')".
+    # The legacy pattern had a race window where a double-click on
+    # Start could spawn two scheduler processes — both pass the
+    # "not running" check, both write to the file, both run. The
+    # O_EXCL flag makes the create atomic at the kernel level: the
+    # second contender gets FileExistsError and bails clean.
     if _scheduler_pid_alive():
         return jsonify({"error": "Scheduler is already running"}), 409
     try:
-        # Reset session marker BEFORE spawn. consecutive_failures()
-        # reads runs.started_at >= scheduler.started_at, so by setting
-        # this to "now" we guarantee zero historical failures count
-        # against this fresh session.
+        # Reset session marker BEFORE spawn so the new session sees
+        # zero historical failures.
         get_db().config_set(
             "scheduler.started_at",
             datetime.now().isoformat(timespec="seconds"))
-        proc = subprocess.Popen(
-            [sys.executable, "-u", "-m", "ghost_shell", "scheduler"],
-            cwd=PROJECT_ROOT,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            **_popen_no_console_flags(),
-        )
+        # Reserve the pidfile atomically. The placeholder ".pending"
+        # is overwritten with the real PID after subprocess.Popen.
+        try:
+            fd = os.open(
+                SCHEDULER_PID_FILE,
+                os.O_CREAT | os.O_EXCL | os.O_WRONLY,
+                0o644,
+            )
+            os.write(fd, b".pending")
+            os.close(fd)
+        except FileExistsError:
+            return jsonify({
+                "error": "Scheduler pidfile exists — another start "
+                         "is in flight or stale file not cleaned up"
+            }), 409
+        try:
+            proc = subprocess.Popen(
+                [sys.executable, "-u", "-m", "ghost_shell", "scheduler"],
+                cwd=PROJECT_ROOT,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                **_popen_no_console_flags(),
+            )
+        except Exception:
+            # Clean up the placeholder pidfile on Popen failure so
+            # the next Start attempt isn't blocked by the reservation.
+            try: os.remove(SCHEDULER_PID_FILE)
+            except OSError: pass
+            raise
         with open(SCHEDULER_PID_FILE, "w") as f:
             f.write(str(proc.pid))
         return jsonify({"ok": True, "pid": proc.pid})
@@ -3132,6 +3600,19 @@ def api_scheduler_status():
     else:
         health = "stopped"
 
+    # Sprint 10.1 (EP-04 / UI-01): in-flight runs count so the UI
+    # can differentiate "scheduler idle, waiting for next tick" from
+    # "scheduler is currently running profile_X". Without this the
+    # status card shows the same green dot whether we're spawning or
+    # idle, and the user can't tell at a glance.
+    try:
+        active_runs_row = db._get_conn().execute(
+            "SELECT COUNT(*) AS n FROM runs WHERE finished_at IS NULL"
+        ).fetchone()
+        active_runs_count = int(active_runs_row["n"] if active_runs_row else 0)
+    except Exception:
+        active_runs_count = 0
+
     return jsonify({
         "is_running":         bool(pid) and is_alive_heartbeat,
         "health":             health,
@@ -3142,6 +3623,7 @@ def api_scheduler_status():
         "next_run_at":        db.config_get("scheduler.next_run_at"),
         "last_run_profile":   db.config_get("scheduler.last_run_profile"),
         "runs_today":         runs_today,
+        "active_runs_count":  active_runs_count,
         "target_runs_per_day": db.config_get("scheduler.target_runs_per_day") or 30,
     })
 
@@ -4595,27 +5077,220 @@ def api_scripts_create():
             tags=tags,
         )
     except Exception as e:
-        # Likely UNIQUE constraint on name
-        return jsonify({"error": f"Could not create: {e}"}), 400
+        # Sprint 9 (RC-D): when create fails because the name is
+        # already taken, suggest the next available variant so the
+        # client can offer a 1-click retry instead of round-tripping
+        # the user. Other failure modes still return the raw error.
+        msg = str(e)
+        suggestion = None
+        if "UNIQUE" in msg.upper() or "already exists" in msg.lower():
+            try:
+                suggestion = db.script_suggest_available_name(name)
+            except Exception:
+                suggestion = None
+        body = {"error": f"Could not create: {e}"}
+        if suggestion:
+            body["category"] = "name_collision"
+            body["suggested_name"] = suggestion
+            return jsonify(body), 409
+        return jsonify(body), 400
     return jsonify({"ok": True, "id": script_id})
+
+
+@app.route("/api/scripts/<int:script_id>/pin/<path:profile_name>",
+           methods=["POST"])
+def api_scripts_pin_add(script_id, profile_name):
+    """Sprint 9 (RC-B): add ONE profile to the pinned set, idempotent.
+
+    Replaces the whole-list overwrite pattern from
+    ``/api/scripts/<id>/pin`` (PUT) which had a two-tab race where
+    the later writer clobbered the earlier writer's pin. This
+    endpoint is a strict additive operation — concurrent calls
+    converge to the union without loss.
+
+    Returns ``{"ok": true, "added": bool}`` — false when the profile
+    was already pinned (still 200, not 409, because the desired
+    end-state was reached)."""
+    db = get_db()
+    if not db.script_get(script_id):
+        return jsonify({"error": "script not found"}), 404
+    try:
+        added = db.script_pin_add(script_id, profile_name)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 400
+    return jsonify({"ok": True, "added": added})
+
+
+@app.route("/api/scripts/<int:script_id>/pin/<path:profile_name>",
+           methods=["DELETE"])
+def api_scripts_pin_remove(script_id, profile_name):
+    """Sprint 9 (RC-B): remove ONE profile from the pinned set,
+    idempotent. Companion to api_scripts_pin_add."""
+    db = get_db()
+    if not db.script_get(script_id):
+        return jsonify({"error": "script not found"}), 404
+    try:
+        removed = db.script_pin_remove(script_id, profile_name)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 400
+    return jsonify({"ok": True, "removed": removed})
+
+
+@app.route("/api/scripts/dry-run", methods=["POST"])
+def api_scripts_dry_run():
+    """Sprint 9 (UX-B): test an unsaved flow against a profile
+    without persisting the changes. Body:
+      { "profile": "profile_01", "flow": [...] }
+
+    Spawns a normal run (RunnerPool slot, one-run-per-profile guard,
+    max_parallel cap) using a synthetic in-memory script the runner
+    treats exactly like a saved script. The flow is NEVER written
+    to the scripts table — when the run finishes, the synthetic
+    record vanishes. Useful for "Try it" buttons in the editor.
+
+    The synthetic script is keyed by negative IDs so it can't
+    collide with real scripts. The runner's resolution path tolerates
+    a script_id_override that doesn't exist in the DB by using the
+    flow attached to the override.
+    """
+    body = request.get_json(silent=True) or {}
+    profile = (body.get("profile") or "").strip()
+    flow = body.get("flow")
+    if not profile:
+        return jsonify({"error": "profile is required",
+                        "category": "input"}), 400
+    if not isinstance(flow, list):
+        return jsonify({"error": "flow must be a list",
+                        "category": "input"}), 400
+
+    db = get_db()
+    if not db.profile_get(profile) if hasattr(db, "profile_get") else False:
+        # profile_get is the canonical helper; fall back to a SELECT
+        # check when it's missing on older DBs.
+        row = db._get_conn().execute(
+            "SELECT 1 FROM profiles WHERE name = ?", (profile,)
+        ).fetchone()
+        if not row:
+            return jsonify({"error": f"profile {profile!r} not found",
+                            "category": "input"}), 404
+
+    # Validate flow shape with the same recursion the saved-script
+    # endpoints use. If it would be rejected by PUT, reject it here
+    # too — keeps "Try it" honest.
+    def _validate(steps, path=""):
+        for i, step in enumerate(steps):
+            p = f"{path}[{i}]"
+            if not isinstance(step, dict) or "type" not in step:
+                return f"{p} missing 'type'"
+            for key in ("steps", "then_steps", "else_steps"):
+                if isinstance(step.get(key), list):
+                    err = _validate(step[key], f"{p}.{key}")
+                    if err: return err
+        return None
+    err = _validate(flow)
+    if err:
+        return jsonify({"error": err, "category": "validation"}), 400
+
+    try:
+        r = _spawn_run(profile, flow_override=flow)
+        return jsonify({
+            "ok":      True,
+            "run_id":  r.get("run_id"),
+            "dry_run": True,
+        })
+    except ValueError as e:
+        return jsonify({"error": str(e), "category": "spawn"}), 400
+    except TypeError:
+        # Older _spawn_run without flow_override support — surface
+        # a clear message rather than a confusing argument error.
+        return jsonify({
+            "error": "dry-run requires runner support for flow_override; "
+                     "upgrade ghost_shell.dashboard._spawn_run",
+            "category": "unsupported",
+        }), 501
+    except Exception as e:
+        logging.exception("[scripts] dry-run failed")
+        return jsonify({"error": str(e)}), 500
+
+
+def _script_etag(sc: dict) -> str:
+    """Sprint 9 (RN-02): ETag for optimistic-concurrency control on
+    script PUT. Two dashboard tabs editing the same script no longer
+    silently overwrite each other — the second PUT without a matching
+    If-Match returns 412 Precondition Failed.
+
+    Hash is over (updated_at, flow) so swapping `is_default` or
+    pinned-profiles doesn't bump the etag (those have their own
+    endpoints with their own race semantics — see RN-04 / RC-B)."""
+    import hashlib
+    h = hashlib.sha256()
+    h.update((sc.get("updated_at") or "").encode("utf-8"))
+    h.update(b"|")
+    flow = sc.get("flow")
+    if isinstance(flow, list):
+        import json as _json
+        h.update(_json.dumps(flow, sort_keys=True).encode("utf-8"))
+    elif isinstance(flow, str):
+        h.update(flow.encode("utf-8"))
+    return f'"{h.hexdigest()[:16]}"'
 
 
 @app.route("/api/scripts/<int:script_id>", methods=["GET"])
 def api_scripts_get(script_id):
-    """Fetch one script with its full flow JSON."""
+    """Fetch one script with its full flow JSON.
+
+    Sprint 9 additions:
+    - ``ETag`` response header for optimistic-concurrency PUT.
+    - ``active_runs`` count so the editor can warn when N profiles
+      are mid-run on this script (RC-A from sprint-9-scripts-audit).
+    """
     db = get_db()
     sc = db.script_get(script_id)
     if not sc:
         return jsonify({"error": "not found"}), 404
     sc["profiles"] = db.script_profiles(script_id)
-    return jsonify({"script": sc})
+    # RC-A: count in-flight runs that resolved to this script. We
+    # don't track script_id on runs directly, but we do track
+    # profile_name + heartbeat_at; the live runs are the ones with
+    # finished_at IS NULL whose profile currently resolves to this
+    # script_id. Cheap when the active set is small.
+    try:
+        sc["active_runs"] = db.runs_active_for_script(script_id)
+    except AttributeError:
+        # Older DB without the helper — degrade gracefully rather
+        # than 500 the editor.
+        sc["active_runs"] = 0
+    response = make_response(jsonify({"script": sc}))
+    response.headers["ETag"] = _script_etag(sc)
+    return response
 
 
 @app.route("/api/scripts/<int:script_id>", methods=["PUT", "PATCH"])
 def api_scripts_update(script_id):
-    """Partial update. Any of name/description/flow/is_default."""
+    """Partial update. Any of name/description/flow/is_default.
+
+    Sprint 9 (RN-02): when the request includes an ``If-Match``
+    header, we compare it against the current row's ETag. Mismatch
+    returns 412 Precondition Failed so the client can re-fetch and
+    merge instead of silently clobbering another tab's edits. Calls
+    without ``If-Match`` keep the old last-writer-wins behavior for
+    backward-compat with non-browser clients (CLI, scripts).
+    """
     data = request.get_json(silent=True) or {}
     db = get_db()
+    if_match = request.headers.get("If-Match", "").strip()
+    if if_match:
+        current = db.script_get(script_id)
+        if not current:
+            return jsonify({"error": "not found"}), 404
+        current_etag = _script_etag(current)
+        if if_match != current_etag:
+            return jsonify({
+                "error":          "etag mismatch — script changed in another tab",
+                "category":       "concurrency",
+                "current_etag":   current_etag,
+                "your_etag":      if_match,
+            }), 412
     if "flow" in data:
         # Same validation as create
         flow = data["flow"]
@@ -7061,113 +7736,4 @@ if __name__ == "__main__":
     _phase("ok    : orphan keys cleaned")
 
     # One-shot pool repair: walk every extension in data/extensions_pool/
-    # and apply _ensure_default_locale + _sanitize_match_patterns to its
-    # manifest. Fixes pool entries installed before those checks landed
-    # so the user doesn't have to re-install. Runs synchronously on
-    # startup; cheap (~10ms per extension).
-    _phase("init  : extension pool manifest repair")
-    try:
-        from ghost_shell.extensions.pool import (
-            parse_manifest, _ensure_default_locale,
-            _sanitize_match_patterns, _ensure_required_fields,
-        )
-        import json as _json_repair
-        rows = _db_boot.extension_list()
-        repaired = 0
-        for r in rows:
-            pp = r.get("pool_path")
-            if not pp or not os.path.isdir(pp):
-                continue
-            mf_path = os.path.join(pp, "manifest.json")
-            try:
-                manifest = parse_manifest(mf_path)
-                if not manifest:
-                    continue
-                before = _json_repair.dumps(manifest, sort_keys=True)
-                _ensure_default_locale(pp, manifest)
-                _ensure_required_fields(pp, manifest)
-                _sanitize_match_patterns(manifest)
-                after = _json_repair.dumps(manifest, sort_keys=True)
-                if before != after:
-                    with open(mf_path, "w", encoding="utf-8") as _f:
-                        _json_repair.dump(manifest, _f,
-                                          ensure_ascii=False, indent=2)
-                    repaired += 1
-                    print(f"[startup] repaired manifest for "
-                          f"{r.get('name') or r.get('id')}")
-            except Exception as _e:
-                print(f"[startup] repair skipped for {r.get('id')}: {_e}")
-        if repaired:
-            print(f"[startup] extension pool: repaired {repaired} manifest(s)")
-    except Exception as e:
-        print(f"[startup] pool repair pass skipped: {e}")
-    _phase("ok    : extension pool repair done")
-
-    # Traffic-stats retention cleanup — deletes rows older than
-    # traffic.retention_days (default 90). Runs once at startup; the
-    # background traffic collectors don't need a periodic task beyond
-    # this because writes are bounded (~50 rows/hour per profile).
-    _phase("init  : traffic_cleanup")
-    try:
-        retention = int(_db_boot.config_get("traffic.retention_days") or 90)
-        if retention > 0:
-            deleted = _db_boot.traffic_cleanup(retention_days=retention)
-            if deleted > 0:
-                print(f"[startup] Cleaned up {deleted} traffic rows older than "
-                      f"{retention} days")
-    except Exception as e:
-        print(f"[startup] traffic cleanup skipped: {e}")
-    _phase("ok    : traffic_cleanup done")
-
-    port = int(os.environ.get("PORT", 5000))
-    url  = f"http://127.0.0.1:{port}"
-    print("╔" + "═"*58 + "╗")
-    print("║  Ghost Shell Dashboard                                    ║")
-    print(f"║  → {url:<55}║")
-    print("║  Ctrl+C to stop                                           ║")
-    print("╚" + "═"*58 + "╝" + "\n")
-
-    # ────────────────────────────────────────────────────────────
-    # Runtime metadata for the installer / external supervisors.
-    #
-    # Writes %LOCALAPPDATA%\GhostShellAnty\runtime.json with our PID,
-    # bind port, and a one-shot shutdown token. The Inno Setup updater
-    # reads this file to (a) confirm the dashboard is running and (b)
-    # call POST /api/admin/shutdown gracefully before replacing files.
-    #
-    # The file is removed on graceful exit, but if we crash it sticks
-    # around — that's why is_pid_alive() is used on the installer side
-    # to disambiguate "stale file" from "really running".
-    # ────────────────────────────────────────────────────────────
-    try:
-        info = gs_runtime.write_runtime_info(
-            port=port,
-            install_dir=PROJECT_ROOT,
-        )
-        _SHUTDOWN_TOKEN = info["shutdown_token"]
-        print(f"[startup] runtime info → {gs_runtime.runtime_path('runtime.json')}")
-
-        import atexit as _atexit
-        _atexit.register(gs_runtime.clear_runtime_info)
-    except Exception as e:
-        # Non-fatal: dashboard still serves even if we can't write the
-        # runtime file. The installer will fall back to taskkill on PID
-        # discovery via process enumeration.
-        print(f"[startup] couldn't write runtime info: {e}")
-
-    # Auto-open the dashboard in the user's default browser.
-    # Disable via env: GHOST_SHELL_NO_BROWSER=1 (useful for headless hosts).
-    if os.environ.get("GHOST_SHELL_NO_BROWSER") != "1":
-        import webbrowser, threading, time as _t
-        def _open_after_ready():
-            # Wait briefly so Flask is actually listening before we hit it
-            _t.sleep(1.2)
-            try:
-                webbrowser.open(url)
-            except Exception as e:
-                print(f"[warn] couldn't auto-open browser: {e}")
-        threading.Thread(target=_open_after_ready, daemon=True).start()
-
-    # Final hand-off to Flask's dev server. Threaded so multiple HTTP
-    # clients (dashboard tabs + SSE streams) can be served concurrently.
-    app.run(host="127.0.0.1", port=port, debug=False, threaded=True)
+    # 

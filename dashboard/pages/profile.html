@@ -1,3 +1,8 @@
+<!--
+  pages/profile.html — Edit-profile detail page.
+  Loaded by router.js when location.hash starts with #profile.
+  All wiring lives in dashboard/js/pages/profile-detail.js.
+-->
 <section>
   <div class="page-header">
     <div class="page-header-left">
@@ -76,12 +81,6 @@
   </div>
 
   <!-- ─── ACTIVE SCRIPT ──────────────────────────────────────── -->
-  <!-- Phase 5.1: opt-in script-on-launch.
-       The toggle defaults to OFF on a fresh install. When OFF the
-       run skips any script binding entirely (legacy behaviour).
-       When ON the picked script runs at every profile launch UNLESS
-       a one-shot override comes through GHOST_SHELL_SCRIPT_ID
-       (set by /api/scripts/<id>/run from a Library card). -->
   <div class="card">
     <div class="card-title">
       🎬 Script on launch
@@ -124,9 +123,6 @@
   </div>
 
   <!-- ─── ACTIVE PROXY ───────────────────────────────────────── -->
-  <!-- Mirrors Active script above — picks one proxy from the library
-       for this profile. Shows live-cached status inline so users see
-       what proxy the profile will actually route through. -->
   <div class="card">
     <div class="card-title">
       🛰 Active proxy
@@ -163,10 +159,6 @@
   </div>
 
   <!-- ─── ACTIVE FINGERPRINT ─────────────────────────────────── -->
-  <!-- Mirror card to Active script / Active proxy above. Shows the
-       current fingerprint's coherence score + template, with direct
-       links into the full editor. The mini-badge colours follow the
-       same excellent/good/warning/critical mapping as the editor. -->
   <div class="card">
     <div class="card-title">
       🧬 Active fingerprint
@@ -174,7 +166,6 @@
     </div>
 
     <div class="profile-fp-card-row" id="profile-fp-row">
-      <!-- Score badge populated by profile-detail.js -->
       <div class="profile-fp-mini-badge fp-score-unknown" id="profile-fp-badge">
         <div class="fp-mini-score" id="profile-fp-score">—</div>
         <div class="fp-mini-grade" id="profile-fp-grade">no data</div>
@@ -196,21 +187,53 @@
         </button>
       </div>
     </div>
-
-    <!-- Per-domain breakdown — populated by _renderFingerprintCard
-         from coherence_report.by_domain. Hidden when there's no
-         report yet. Lets the user see at-a-glance which dimension
-         is weak (Identity / Hardware / Network / Automation) instead
-         of guessing from the aggregate score. -->
     <div class="profile-fp-domains" id="profile-fp-domains" style="display: none;"></div>
   </div>
 
-  <!-- ─── PROXY / NETWORK ─────────────────────────────────────
-       Per-profile network override. Empty proxy URL = inherit the
-       global setting from the Proxy page. The "rotating" toggle
-       reveals the rotation API config block — keeping it collapsed
-       by default avoids overwhelming users who just want a static
-       proxy. -->
+  <!-- ─── HEALTH MONITOR (Sprint 4) ──────────────────────────── -->
+  <div class="card profile-health-card" id="profile-health-card" style="display: none;">
+    <div class="card-title">
+      🩺 Health monitor
+      <span class="muted">— detection-site canary timeline</span>
+    </div>
+
+    <div class="profile-health-actions" style="margin-bottom: 12px;">
+      <button class="btn btn-secondary btn-small" id="profile-health-canary-btn"
+              title="Visit detection sites against the currently-running browser">
+        ▶ Run canary now
+      </button>
+      <span class="form-hint muted" id="profile-health-status" style="margin-left: 10px;"></span>
+    </div>
+
+    <div class="profile-health-sites" id="profile-health-sites"></div>
+
+    <details class="profile-health-details" id="profile-health-recent" style="margin-top: 10px;">
+      <summary class="muted" style="cursor: pointer; font-size: 12px;">
+        Recent canary runs
+      </summary>
+      <div class="profile-health-runs" id="profile-health-runs"></div>
+    </details>
+  </div>
+
+  <!-- ─── CAPTCHA-RATE SPARKLINE (Sprint 5) ──────────────────── -->
+  <div class="card profile-captcha-card" id="profile-captcha-card" style="display: none;">
+    <div class="card-title">
+      🛡 Captcha rate
+      <span class="muted">— real-workload detection signal</span>
+    </div>
+    <div class="profile-captcha-row" id="profile-captcha-row">
+      <div class="profile-captcha-summary" id="profile-captcha-summary">—</div>
+      <div class="profile-captcha-spark-wrap" id="profile-captcha-spark"></div>
+      <div class="profile-captcha-rate" id="profile-captcha-rate">—</div>
+      <div class="profile-captcha-trend" id="profile-captcha-trend">—</div>
+    </div>
+    <div class="form-hint muted" id="profile-captcha-empty" style="display: none; margin-top: 8px;">
+      No finished runs in this window — captcha rate appears once
+      monitor runs accumulate.
+    </div>
+  </div>
+
+  <!-- ─── PROXY / NETWORK ───────────────────────────────────── -->
   <div class="card profile-proxy-card">
     <div class="card-title">
       🌐 Proxy &amp; network override
@@ -255,12 +278,6 @@
                    placeholder="empty = inherit global"
                    autocomplete="off" spellcheck="false"
                    style="flex:1;">
-            <!-- Auto-discover button. Visible only when provider=asocks
-                 to keep the UI quiet for other providers. Clicking it
-                 fetches the user's asocks port list, matches the proxy
-                 URL's host:port to one of the entries, and fills this
-                 field with that port's pre-signed refresh_link. Saves
-                 a copy/paste round-trip from the asocks dashboard. -->
             <button type="button" class="btn btn-secondary btn-small"
                     id="pp-asocks-discover-btn"
                     title="Match the Proxy URL to your asocks port list and auto-fill rotation URL"
@@ -298,19 +315,13 @@
     </div>
   </div>
 
-  <!-- ─── SESSION & COOKIES (summary card) ───────────────────── -->
-  <!-- Everything that used to be on this page (Chrome import, live
-       cookies table, cookie import modal) moved to the dedicated
-       Session & cookies page. This card is a compact rollup + entry
-       point, same pattern as Active script / Active proxy / Active
-       fingerprint above. -->
+  <!-- ─── SESSION & COOKIES (summary card) ──────────────────── -->
   <div class="card">
     <div class="card-title">
       🍪 Session & cookies
       <span class="muted">— warmup robot, cookie pool, Chrome import</span>
     </div>
     <div class="profile-fp-card-row" id="profile-session-row">
-      <!-- Mini stats populated by profile-detail.js loadSessionSummary -->
       <div class="profile-fp-mini-badge" id="profile-session-badge">
         <div class="fp-mini-score" id="profile-session-count">—</div>
         <div class="fp-mini-grade">snapshots</div>
@@ -335,11 +346,6 @@
     </div>
   </div>
 
-  <!-- Cookie pool injection modal. Shows: auto-pick recommendation
-       (highest-priority match for this profile's country/category),
-       full filtered list, manual snapshot picker. Browserless --
-       writes to target profile's session_dir/cookies.json which the
-       next launch reads via existing CDP session-restore. -->
   <div class="profile-modal" id="cookie-pool-modal" style="display:none;">
     <div class="profile-modal-backdrop" data-close="cookie-pool-modal"></div>
     <div class="profile-modal-content" style="width: 720px; max-width: 92vw;">
@@ -359,11 +365,7 @@
     </div>
   </div>
 
-  <!-- ─── EXTENSIONS ─────────────────────────────────────────
-       Per-profile assignment from the shared Extensions pool. Chips
-       show what's currently assigned; "+ Add" opens a picker that
-       toggles assignments. Extension data (Local Storage / IndexedDB
-       / settings) lives in user-data-dir so wallets stay isolated. -->
+  <!-- ─── EXTENSIONS ─────────────────────────────────────────── -->
   <div class="card profile-ext-card">
     <div class="card-title">
       🧩 Extensions
@@ -386,8 +388,6 @@
     </div>
   </div>
 
-  <!-- Add-from-pool modal — picker grid of all enabled pool entries
-       with chips that toggle on click. Saves on each click immediately. -->
   <div class="profile-modal" id="profile-ext-modal" style="display:none;">
     <div class="profile-modal-backdrop" data-close="profile-ext-modal"></div>
     <div class="profile-modal-content" style="width: 720px; max-width: 92vw;">
@@ -404,12 +404,7 @@
     </div>
   </div>
 
-  <!-- ─── RUNTIME NETWORK SELF-CHECK ─────────────────────────────
-       Distinct from the Fingerprint coherence validator on the
-       Fingerprint page — this card shows results of the per-run
-       network probes: exit IP, country, timezone, WebRTC leak.
-       Fingerprint-side validation (config coherence + live stealth
-       probe) now lives under the Fingerprint editor. -->
+  <!-- ─── RUNTIME NETWORK SELF-CHECK ────────────────────────── -->
   <div class="card">
     <div class="card-title">
       🛰 Runtime self-check
@@ -428,16 +423,6 @@
     <div id="selfcheck-time" class="muted" style="margin-bottom: 12px;"></div>
     <div class="selfcheck-grid" id="selfcheck-grid"></div>
 
-    <!-- External fingerprint testers — proactive verification.
-         Self-check above is internal-only (network probes via Selenium
-         JS). To verify fingerprint quality against the same engines
-         that bot-detect services use, the user can hit these well-
-         known testers. Each link opens in a new tab; if the user has
-         the profile running they should paste these URLs into THAT
-         Chrome window's address bar (the dashboard browser would
-         test itself, not the profile). The "Probe in profile" button
-         spawns a probe-only run that visits these sites in the
-         profile's actual browser and captures their on-page scores. -->
     <div class="fp-testers-block" style="margin-top: 18px;
          border-top: 1px solid var(--border, #2a3142); padding-top: 14px;">
       <div class="card-title" style="font-size: 13px; margin-bottom: 8px;">
@@ -455,18 +440,8 @@
       <div class="fp-tester-grid" id="fp-tester-grid"
            style="display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
                   gap: 8px; margin-bottom: 14px;">
-        <!-- Tester cards rendered dynamically by profile-detail.js
-             from FP_TESTERS constant. Click opens a modal showing
-             what signals the tester checks, the profile's current
-             coherence-validator results for those signals, and a
-             one-click "Probe just this one" button. -->
       </div>
 
-      <!-- Modal for tester details. Hidden by default; shown by
-           Profile.openTesterModal(testerId). Reuses the existing
-           .profile-modal pattern from elsewhere in the dashboard
-           so styles, close-on-backdrop, and ESC behaviour are
-           consistent with other modals. -->
       <div class="profile-modal" id="fp-tester-modal" style="display:none;">
         <div class="profile-modal-backdrop" data-close="fp-tester-modal"></div>
         <div class="profile-modal-content" style="width: 640px; max-width: 92vw;">
@@ -519,12 +494,295 @@
     <pre class="json-view" id="fingerprint-view">Loading...</pre>
   </div>
 
-  <!-- ═══ DANGER ZONE ═══
-       Destructive profile-level operations. Pulled out of the
-       self-check header where they used to crowd an already-busy
-       title bar. Ordered by destructiveness so Delete is last.
-       IDs (#reset-health-btn, #clear-history-btn, #delete-profile-btn)
-       kept identical so profile-detail.js binds without changes. -->
+  <!-- ─── BACKUP & RESTORE (Sprint 8) ────────────────────────
+       Encrypted .ghs-bundle export / import. The bundle wraps DB
+       rows + user-data-dir + vault items in a Fernet-encrypted
+       payload (PBKDF2-HMAC-SHA256, 200k iters, 16-byte salt).
+       Master password is required EVERY time and is never cached.
+       Vault items inside the bundle stay encrypted with the same
+       master, so restoring on a different host re-uses the same
+       vault key — no plaintext creds ever leave the machine. -->
+  <div class="card profile-backup-card">
+    <div class="card-title">
+      💾 Backup &amp; restore
+      <span class="muted">— encrypted .ghs-bundle export / import</span>
+    </div>
+    <div class="form-hint" style="margin-bottom: 14px;">
+      Pack the entire profile (DB rows, user-data-dir, vault items,
+      cookie pool entries, fingerprint history, canary timeline) into
+      a single encrypted bundle. Restore on a different machine to
+      keep the same browser identity — same fingerprint, same
+      cookies, same logins. The master password is required to
+      encrypt and is never stored — lose the password, lose the bundle.
+    </div>
+    <div style="display: flex; gap: 10px; align-items: center; flex-wrap: wrap;">
+      <button class="btn btn-primary btn-small" id="profile-backup-btn"
+              title="Encrypt and download a .ghs-bundle for this profile">
+        ⬇ Download backup
+      </button>
+      <button class="btn btn-secondary btn-small" id="profile-restore-btn"
+              title="Pick a .ghs-bundle file and restore it as a new (or this) profile">
+        ⬆ Restore from .ghs-bundle…
+      </button>
+      <span class="muted" style="font-size: 12px;" id="profile-backup-status"></span>
+    </div>
+
+    <!-- Cloud sync row — Sprint 8.2. Hidden until /api/backup/sync/test
+         confirms there's a configured target (S3/Dropbox/SFTP). -->
+    <div class="profile-backup-cloud-row" id="profile-backup-cloud-row"
+         style="display: none; margin-top: 12px; padding-top: 12px;
+                border-top: 1px solid var(--border, #2a3142);
+                gap: 10px; align-items: center; flex-wrap: wrap;">
+      <span class="muted" style="font-size: 12px;">Cloud sync:</span>
+      <span class="badge" id="profile-backup-cloud-provider">—</span>
+      <button class="btn btn-secondary btn-small" id="profile-backup-cloud-push-btn"
+              title="Encrypt and push a fresh bundle to the configured remote target">
+        ☁ Push to cloud
+      </button>
+      <button class="btn btn-secondary btn-small" id="profile-backup-cloud-restore-btn"
+              title="List bundles in the cloud target and restore one of them">
+        ☁ Restore from cloud…
+      </button>
+      <span class="muted" style="font-size: 12px;"
+            id="profile-backup-cloud-status"></span>
+    </div>
+  </div>
+
+  <!-- Backup-download password modal -->
+  <div class="profile-modal" id="profile-backup-modal" style="display:none;">
+    <div class="profile-modal-backdrop" data-close="profile-backup-modal"></div>
+    <div class="profile-modal-content" style="width: 520px; max-width: 92vw;">
+      <div class="profile-modal-header">
+        <div class="profile-modal-title">⬇ Download encrypted backup</div>
+        <button class="profile-modal-close" data-close="profile-backup-modal">×</button>
+      </div>
+      <div class="profile-modal-body">
+        <div class="form-hint" style="margin-bottom: 14px;">
+          The bundle is encrypted with a master password using
+          PBKDF2-HMAC-SHA256 (200k iterations) + Fernet (AES-128-CBC
+          + HMAC-SHA256). Use the SAME password as your vault master —
+          that way vault items in the bundle stay decryptable on the
+          destination host. The password is never stored or
+          transmitted in plaintext to disk.
+        </div>
+        <div class="form-group">
+          <label class="form-label" for="profile-backup-password">Master password</label>
+          <input type="password" class="input" id="profile-backup-password"
+                 autocomplete="off" spellcheck="false"
+                 placeholder="vault master password">
+        </div>
+        <div class="muted" id="profile-backup-modal-status"
+             style="font-size: 12px; min-height: 16px;"></div>
+      </div>
+      <div class="profile-modal-footer">
+        <button class="btn btn-secondary" data-close="profile-backup-modal">Cancel</button>
+        <button class="btn btn-primary" id="profile-backup-submit">
+          🔐 Encrypt &amp; download
+        </button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Restore-from-file modal: two-step (pick → preview + password) -->
+  <div class="profile-modal" id="profile-restore-modal" style="display:none;">
+    <div class="profile-modal-backdrop" data-close="profile-restore-modal"></div>
+    <div class="profile-modal-content" style="width: 620px; max-width: 92vw;">
+      <div class="profile-modal-header">
+        <div class="profile-modal-title">⬆ Restore from .ghs-bundle</div>
+        <button class="profile-modal-close" data-close="profile-restore-modal">×</button>
+      </div>
+      <div class="profile-modal-body" id="profile-restore-modal-body">
+        <div id="profile-restore-step-pick">
+          <div class="form-hint" style="margin-bottom: 14px;">
+            Select an encrypted bundle file produced by Ghost Shell's
+            <strong>Download backup</strong> action. The file extension
+            should be <code>.ghs-bundle</code>; bundles produced by an
+            older Ghost Shell may use <code>.gsbk</code>. The header
+            preview below is unencrypted — no password is sent until
+            you click <strong>Restore</strong>.
+          </div>
+          <div class="form-group">
+            <label class="form-label" for="profile-restore-file">Bundle file</label>
+            <input type="file" class="input" id="profile-restore-file"
+                   accept=".ghs-bundle,.gsbk,.bin,application/octet-stream">
+          </div>
+          <div class="muted" id="profile-restore-pick-status"
+               style="font-size: 12px; min-height: 16px;"></div>
+        </div>
+
+        <div id="profile-restore-step-confirm" style="display: none;">
+          <div class="card" style="background: rgba(255,255,255,0.03);
+               padding: 12px; margin-bottom: 14px;">
+            <div style="font-weight: 600; margin-bottom: 6px;">
+              📦 Bundle preview
+            </div>
+            <div class="muted" style="font-size: 12px;" id="profile-restore-preview">
+              —
+            </div>
+          </div>
+          <div class="form-group">
+            <label class="form-label" for="profile-restore-target-name">
+              Restore as profile name
+            </label>
+            <input type="text" class="input" id="profile-restore-target-name"
+                   placeholder="leave empty to use bundle's original name"
+                   autocomplete="off" spellcheck="false">
+            <div class="form-hint">
+              Pick a different name to avoid colliding with an existing
+              profile. Leaving it empty uses the bundle's recorded
+              <code>profile_name</code>.
+            </div>
+          </div>
+          <div class="checkbox-row" style="margin: 12px 0;">
+            <input type="checkbox" id="profile-restore-overwrite">
+            <label for="profile-restore-overwrite">
+              Overwrite if a profile with that name already exists
+              <span class="muted">— wipes the existing target first</span>
+            </label>
+          </div>
+          <div class="form-group">
+            <label class="form-label" for="profile-restore-password">Master password</label>
+            <input type="password" class="input" id="profile-restore-password"
+                   autocomplete="off" spellcheck="false"
+                   placeholder="password used at backup-create time">
+            <div class="form-hint">
+              Wrong password is rejected with HTTP 401 — nothing is
+              written to disk on auth failure.
+            </div>
+          </div>
+          <div class="muted" id="profile-restore-confirm-status"
+               style="font-size: 12px; min-height: 16px;"></div>
+        </div>
+      </div>
+      <div class="profile-modal-footer">
+        <button class="btn btn-secondary" data-close="profile-restore-modal">Cancel</button>
+        <button class="btn btn-secondary" id="profile-restore-back-btn"
+                style="display: none;">← Back</button>
+        <button class="btn btn-primary" id="profile-restore-inspect-btn"
+                disabled>
+          🔍 Inspect bundle
+        </button>
+        <button class="btn btn-primary" id="profile-restore-submit-btn"
+                style="display: none;">
+          🔐 Decrypt &amp; restore
+        </button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Cloud-restore picker modal -->
+  <div class="profile-modal" id="profile-cloud-restore-modal" style="display:none;">
+    <div class="profile-modal-backdrop" data-close="profile-cloud-restore-modal"></div>
+    <div class="profile-modal-content" style="width: 720px; max-width: 92vw;">
+      <div class="profile-modal-header">
+        <div class="profile-modal-title">☁ Restore from cloud</div>
+        <button class="profile-modal-close" data-close="profile-cloud-restore-modal">×</button>
+      </div>
+      <div class="profile-modal-body" id="profile-cloud-restore-body">
+        Loading…
+      </div>
+      <div class="profile-modal-footer">
+        <button class="btn btn-secondary" data-close="profile-cloud-restore-modal">Cancel</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- ═══ DANGER ZONE ═══ -->
+  <div class="card card-danger profile-danger-zone">
+    <div class="card-title">
+      ⚠ Danger zone
+      <span class="muted">— destructive operations scoped to this profile</span>
+    </div>
+    <div class="danger-banner">
+      These operations affect only the currently-selected profile. They do
+      not touch the proxy library, scripts, or global config. Delete cannot
+      be undone — the user-data-dir is wiped from disk.
+    </div>
+
+    <div class="danger-op-row">
+      <div class="danger-op-body">
+        <div class="danger-op-title">Reset consecutive-blocks counter</div>
+        <div class="danger-op-desc">
+          Clears the "N runs in a row hit a captcha/block" counter. Use after
+          you've rotated the proxy or edited the fingerprint and want a clean
+          slate — the health-based pause-on-block logic will stop flagging this
+          profile. No historical data is lost.
+        </div>
+      </div>
+      <button class="btn btn-secondary" id="reset-health-btn">Reset blocks</button>
+    </div>
+
+    <div class="danger-op-row">
+      <div class="danger-op-body">
+        <div class="danger-op-title">Clear session-quality history</div>
+        <div class="danger-op-desc">
+          Wipes the per-run quality log (ad counts, captcha hits, durations) for
+          this profile. Run records themselves stay in the
+          <a href="#" data-nav="runs" class="inline-link">Runs</a> page — only
+          the session-quality rollup is cleared. Cannot be undone.
+        </div>
+      </div>
+      <button class="btn btn-secondary btn-danger" id="clear-history-btn">Clear history</button>
+    </div>
+
+    <div class="danger-op-row danger-op-row-critical">
+      <div class="danger-op-body">
+        <div class="danger-op-title">Delete profile</div>
+        <div class="danger-op-desc">
+          Removes the profile from the database and deletes its entire
+          user-data-dir from disk — cookies, session, history, fingerprints,
+          all gone. Proxy assignments to this profile are released. Cannot be
+          undone. Any running job for this profile is stopped first.
+        </div>
+      </div>
+      <button class="btn btn-danger" id="delete-profile-btn">Delete profile</button>
+    </div>
+  </div>
+</section>
+p-create time">
+            <div class="form-hint">
+              Wrong password is rejected with HTTP 401 — nothing is
+              written to disk on auth failure.
+            </div>
+          </div>
+          <div class="muted" id="profile-restore-confirm-status"
+               style="font-size: 12px; min-height: 16px;"></div>
+        </div>
+      </div>
+      <div class="profile-modal-footer">
+        <button class="btn btn-secondary" data-close="profile-restore-modal">Cancel</button>
+        <button class="btn btn-secondary" id="profile-restore-back-btn"
+                style="display: none;">← Back</button>
+        <button class="btn btn-primary" id="profile-restore-inspect-btn"
+                disabled>
+          🔍 Inspect bundle
+        </button>
+        <button class="btn btn-primary" id="profile-restore-submit-btn"
+                style="display: none;">
+          🔐 Decrypt &amp; restore
+        </button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Cloud-restore picker modal -->
+  <div class="profile-modal" id="profile-cloud-restore-modal" style="display:none;">
+    <div class="profile-modal-backdrop" data-close="profile-cloud-restore-modal"></div>
+    <div class="profile-modal-content" style="width: 720px; max-width: 92vw;">
+      <div class="profile-modal-header">
+        <div class="profile-modal-title">☁ Restore from cloud</div>
+        <button class="profile-modal-close" data-close="profile-cloud-restore-modal">×</button>
+      </div>
+      <div class="profile-modal-body" id="profile-cloud-restore-body">
+        Loading…
+      </div>
+      <div class="profile-modal-footer">
+        <button class="btn btn-secondary" data-close="profile-cloud-restore-modal">Cancel</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- ═══ DANGER ZONE ═══ -->
   <div class="card card-danger profile-danger-zone">
     <div class="card-title">
       ⚠ Danger zone

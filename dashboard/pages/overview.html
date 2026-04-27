@@ -42,6 +42,23 @@
     </button>
   </div>
 
+  <!-- Sprint 6: drift alert — N profiles trending down on canary score
+       OR high captcha rate. Shown alongside (not instead of) the
+       version banner. Hidden when /api/health/drift returns 0
+       profiles. Click profile name → navigate to detail. -->
+  <div id="ov-drift-banner" class="health-banner" style="display: none;"
+       role="alert" aria-live="polite">
+    <div class="health-banner-icon" id="ov-drift-icon">📉</div>
+    <div class="health-banner-body">
+      <div class="health-banner-title" id="ov-drift-title">—</div>
+      <div class="health-banner-detail" id="ov-drift-detail">—</div>
+    </div>
+    <button type="button" class="btn btn-secondary btn-sm"
+            id="ov-drift-recheck" title="Force re-scan">
+      Re-scan
+    </button>
+  </div>
+
   <!-- ═══ Operational status hero (5 colour-coded tiles) ══════ -->
   <div class="ov-hero">
     <a href="#" data-nav="accounts" class="ov-tile ov-tile-vault">

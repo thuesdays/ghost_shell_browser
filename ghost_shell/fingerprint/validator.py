@@ -327,6 +327,53 @@ def check_vendor_chrome(fp, template):
                     f"'Google Inc.' for Chrome")
 
 
+def check_ja3_matches_chrome(fp, template):
+    """Sprint 3.2 — TLS fingerprint match against EXPECTED_JA3_BY_MAJOR.
+
+    Reads fp.ja3 (populated by selftest's probe_ja3 step) and verdicts
+    against the expected hash for the template's Chrome major. Returns:
+      * pass — JA3 matches one of the known-good hashes
+      * fail — JA3 differs (real fingerprint drift; CloudFlare et al
+              will detect non-Chrome browser)
+      * None (skip) — no probe data, OR no baseline recorded for this
+              Chrome major version
+
+    The skip case is intentional: in offline environments or against
+    an endpoint that's blocked, we don't want to dock the score for
+    "couldn't probe" — the dashboard's existing UI surfaces probe
+    failures separately."""
+    ja3_data = _get(fp, "ja3")
+    if not ja3_data or not isinstance(ja3_data, dict):
+        return None  # no probe → skip
+    # Pick a reasonable Chrome major from the template. Use the lower
+    # bound — it's the floor at which the template is valid; higher
+    # actual versions still emit similar JA3 most of the time, so
+    # we tolerate skew within ±1 major via the EXPECTED list.
+    chrome_major = template.get("min_chrome_version") or 149
+    try:
+        from ghost_shell.fingerprint.ja3_check import verdict_for
+        v = verdict_for(ja3_data, expected_chrome_major=int(chrome_major))
+    except Exception as e:
+        return ("warn", f"JA3 verdict crashed: {type(e).__name__}: {e}")
+    level = v.get("level")
+    actual = (v.get("actual_ja3") or "")[:8]
+    if level == "ok":
+        return ("pass", f"JA3 {actual}… matches Chrome {chrome_major} baseline")
+    if level == "warn":
+        return None  # no baseline / no probe — skip rather than penalise
+    # critical
+    expected = (v.get("expected_ja3") or [])
+    expected_short = expected[0][:8] + "…" if expected else "?"
+    return (
+        "fail",
+        f"JA3 mismatch: observed {actual}…, expected {expected_short} "
+        f"for Chrome {chrome_major}. Patched TLS stack is drifting from "
+        f"stock Chrome — detection sites will fingerprint this as "
+        f"non-Chrome and rate-limit / captcha. "
+        f"Re-validate the EXPECTED_JA3_BY_MAJOR table after each rebase."
+    )
+
+
 def check_audio_sample_rate(fp, template):
     """AudioContext sampleRate commonly 48000 on desktop."""
     rate = _get(fp, "audio", "sampleRate") or _get(fp, "audio_sample_rate")
@@ -392,6 +439,7 @@ CHECKS = [
     ("Timezone plausibility",       "warning",   "network",     3,  1, check_timezone_plausibility),
     ("Language plausibility",       "warning",   "identity",    3,  1, check_language_plausibility),
     ("Audio sample rate",           "warning",   "hardware",    4,  1, check_audio_sample_rate),
+    ("TLS / JA3 fingerprint",       "critical",  "network",    25,  5, check_ja3_matches_chrome),
 ]
 
 

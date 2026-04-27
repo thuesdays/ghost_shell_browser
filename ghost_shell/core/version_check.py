@@ -176,13 +176,116 @@ def _cached_probe(path: str, args: list[str]) -> Optional[str]:
     return version
 
 
+def _chrome_version_from_dir(chrome_path: str) -> Optional[str]:
+    """Fallback path: when ``chrome.exe --product-version`` doesn't
+    print anything we can parse (which happens with some patched
+    Chromium builds — flag stripping, GUI-only --version, console
+    suppressed for stealth), the version is still discoverable from
+    the deployment layout. Chromium ALWAYS ships its DLLs and
+    resources inside a sibling directory named after the four-part
+    version (e.g. ``chrome_win64/149.0.7805.0/``).
+
+    We just scan ``chrome_path``'s parent for the first directory
+    whose name matches the version regex. Cheap, no subprocess
+    needed, and works even if the binary refuses to print anything.
+    """
+    if not chrome_path:
+        return None
+    base = os.path.dirname(chrome_path)
+    if not base or not os.path.isdir(base):
+        return None
+    # Sort by name desc so a deploy with multiple version dirs
+    # (rare — only happens when an upgrade left old DLLs around)
+    # picks the newest first.
+    try:
+        entries = sorted(os.listdir(base), reverse=True)
+    except OSError:
+        return None
+    for entry in entries:
+        full = os.path.join(base, entry)
+        if not os.path.isdir(full):
+            continue
+        v = _parse_version_string(entry)
+        if v:
+            return v
+    return None
+
+
+def _chrome_version_from_pe(chrome_path: str) -> Optional[str]:
+    """Last-ditch on Windows: read the ProductVersion field out of the
+    PE resource. Powershell ships with every modern Windows install,
+    so we don't need pywin32 as a dep. If the call fails for any
+    reason (locked-down machine, ExecutionPolicy block) we just
+    return None and let the caller fall through.
+    """
+    if not chrome_path:
+        return None
+    if not os.path.exists(chrome_path) or not chrome_path.lower().endswith(".exe"):
+        return None
+    try:
+        flags = popen_flags_no_console()
+        # Path is single-quoted to survive spaces in folder names; we
+        # double up any internal single quotes per PowerShell rules.
+        ps_path = chrome_path.replace("'", "''")
+        cmd = (
+            f"(Get-Item '{ps_path}').VersionInfo.ProductVersion"
+        )
+        result = subprocess.run(
+            ["powershell", "-NoProfile", "-NonInteractive",
+             "-ExecutionPolicy", "Bypass", "-Command", cmd],
+            capture_output=True, text=True, timeout=5.0, check=False,
+            **flags,
+        )
+        for stream in (result.stdout, result.stderr):
+            v = _parse_version_string(stream or "")
+            if v:
+                return v
+    except Exception as e:
+        logging.debug(f"[version_check] PE-read fallback failed for "
+                      f"{chrome_path}: {e}")
+    return None
+
+
 def get_chrome_version(path: Optional[str] = None) -> Optional[str]:
     """Return the four-part version of the Chrome/Chromium binary at
     ``path`` (e.g. '149.0.7805.0'), or None if unresolvable. If path
-    is None, falls back to ``find_chrome_binary()``."""
+    is None, falls back to ``find_chrome_binary()``.
+
+    Multi-step fallback for patched Chromium builds that don't honor
+    every CLI flag uniformly:
+
+    1. ``chrome.exe --product-version`` — documented, fastest.
+    2. ``chrome.exe --version``         — older / quirky builds.
+    3. Sibling-dir scan                 — Chromium always ships a
+       directory named after the version next to the binary.
+    4. Windows PE ProductVersion        — last resort, doesn't
+       launch Chrome at all.
+    """
     if path is None:
         path = find_chrome_binary()
-    return _cached_probe(path, ["--product-version"])
+    if not path:
+        return None
+    # Step 1 + 2: flag-based probes (cached individually).
+    v = _cached_probe(path, ["--product-version"])
+    if v:
+        return v
+    v = _cached_probe(path, ["--version"])
+    if v:
+        return v
+    # Step 3: sibling directory layout (no subprocess at all).
+    v = _chrome_version_from_dir(path)
+    if v:
+        # Cache under a synthetic key so we don't retry the dir scan
+        # on every check_compatibility call.
+        try:
+            mtime = os.path.getmtime(path)
+        except OSError:
+            mtime = 0
+        with _CACHE_LOCK:
+            _CACHE[path + "::dirscan"] = (v, mtime, time.time())
+        return v
+    # Step 4: PE resource (Windows only).
+    return _chrome_version_from_pe(path)
 
 
 def get_chromedriver_version(path: Optional[str] = None) -> Optional[str]:

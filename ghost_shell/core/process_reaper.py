@@ -444,6 +444,75 @@ def pid_looks_like_ghost_shell(pid: int) -> bool:
 # Higher-level: reap stale runs listed in the DB
 # ──────────────────────────────────────────────────────────────
 
+def classify_run_liveness(row: dict, now=None,
+                            stale_heartbeat_sec: int = STALE_HEARTBEAT_SEC) -> tuple:
+    """Single source-of-truth liveness classification for a runs row.
+
+    Replaces the duplicated heartbeat-age + PID-check logic that used
+    to live in both ``reap_stale_runs`` and ``is_profile_actually_running``
+    (Sprint 3.1 refactor).
+
+    Returns ``(status, reason)`` where:
+      * ``status`` ∈ {"alive", "dead", "wedged"}
+        - alive  : heartbeat fresh OR (PID alive AND heartbeat absent)
+        - dead   : PID dead, OR PID recycled to non-ghost-shell, OR no
+                   PID and stale heartbeat
+        - wedged : PID alive AND ours AND heartbeat stale (hung run —
+                   ``reap_stale_runs`` will kill the tree)
+      * ``reason`` : human-readable explanation, suitable for logs
+                     and ``run_finish(error=...)``
+
+    Pure function — does not touch DB or kill anything. Callers
+    decide what to do based on the classification."""
+    if now is None:
+        now = datetime.now()
+
+    pid    = row.get("pid")
+    hb_str = row.get("heartbeat_at")
+
+    # Parse heartbeat age (None if no heartbeat or unparseable)
+    hb_age = None
+    if hb_str:
+        try:
+            hb_age = (now - datetime.fromisoformat(hb_str)).total_seconds()
+        except (ValueError, TypeError):
+            hb_age = None
+
+    hb_stale = (hb_age is None) or (hb_age > stale_heartbeat_sec)
+
+    # Case A: no PID recorded
+    if not pid:
+        if hb_stale:
+            return ("dead", "no pid, no recent heartbeat")
+        # Heartbeat fresh but no PID — DB row mid-creation, leave alone
+        return ("alive", f"no pid yet, heartbeat fresh ({hb_age:.0f}s ago)")
+
+    # Case B: psutil unavailable — fall back to heartbeat-only
+    if not HAVE_PSUTIL:
+        if hb_stale:
+            age_str = f"{hb_age:.0f}s" if hb_age is not None else "?"
+            return ("dead", f"heartbeat stale ({age_str}) and psutil missing")
+        return ("alive", f"heartbeat fresh ({hb_age:.0f}s); psutil unavailable for pid check")
+
+    # Case C: PID dead per OS
+    try:
+        alive = psutil.pid_exists(pid)
+    except Exception:
+        alive = False
+    if not alive:
+        return ("dead", f"pid={pid} no longer exists")
+
+    # Case D: PID alive but recycled to unrelated process
+    if not pid_looks_like_ghost_shell(pid):
+        return ("dead", f"pid={pid} recycled to non-ghost-shell process")
+
+    # Case E: PID alive + ours. Heartbeat freshness is the tiebreaker.
+    if hb_stale:
+        age_str = f"{hb_age:.0f}s" if hb_age is not None else "absent"
+        return ("wedged", f"pid={pid} alive but heartbeat {age_str} (>{stale_heartbeat_sec}s)")
+    return ("alive", f"pid={pid}, heartbeat fresh ({hb_age:.0f}s ago)")
+
+
 def reap_stale_runs(db, reason_prefix: str = "startup") -> dict:
     """Walk runs table for entries that have no finished_at and decide
     what to do with each:
@@ -466,70 +535,37 @@ def reap_stale_runs(db, reason_prefix: str = "startup") -> dict:
 
     now = datetime.now()
 
+    def _mark_dead(run_id: int, why: str):
+        try:
+            db.run_finish(run_id, exit_code=-99, error=f"{reason_prefix}: {why}")
+            stats["marked_finished"] += 1
+        except Exception as e:
+            logging.warning(
+                f"[ProcessReaper] mark run={run_id} finished failed: {e}"
+            )
+
     for row in rows:
         run_id = row["id"]
-        pid    = row.get("pid")
-        hb_str = row.get("heartbeat_at")
+        status, reason = classify_run_liveness(row, now=now)
 
-        # Parse heartbeat age
-        hb_age = None
-        if hb_str:
-            try:
-                hb_age = (now - datetime.fromisoformat(hb_str)).total_seconds()
-            except Exception:
-                hb_age = None
-
-        def _mark_dead(why: str):
-            try:
-                db.run_finish(run_id, exit_code=-99, error=f"{reason_prefix}: {why}")
-                stats["marked_finished"] += 1
-            except Exception as e:
-                logging.warning(
-                    f"[ProcessReaper] mark run={run_id} finished failed: {e}"
-                )
-
-        # No PID recorded — best we can do is mark it finished if heartbeat
-        # is also stale (otherwise leave alone: this might be a run whose
-        # dashboard_server just restarted mid-spawn, DB already has the row
-        # but PID assignment hasn't happened yet).
-        if not pid:
-            if hb_age is None or hb_age > STALE_HEARTBEAT_SEC:
-                _mark_dead("no pid, no recent heartbeat")
-            else:
-                stats["alive_left_alone"] += 1
-            continue
-
-        # Is the PID actually alive and ours?
-        if not HAVE_PSUTIL:
-            # Fall back to "trust the DB" — if heartbeat stale, mark dead.
-            if hb_age is None or hb_age > STALE_HEARTBEAT_SEC:
-                _mark_dead(f"heartbeat stale ({hb_age}s) and psutil missing")
-            else:
-                stats["alive_left_alone"] += 1
-            continue
-
-        if not psutil.pid_exists(pid):
-            _mark_dead(f"pid={pid} no longer exists")
-            continue
-
-        if not pid_looks_like_ghost_shell(pid):
-            # PID recycled by OS. Don't touch the other process, just
-            # stop pretending the run is alive.
-            _mark_dead(f"pid={pid} recycled to unrelated process")
-            continue
-
-        # PID is alive and ours. Is the run wedged?
-        if hb_age is None or hb_age > STALE_HEARTBEAT_SEC:
-            logging.warning(
-                f"[ProcessReaper] Run {run_id} (pid={pid}, profile="
-                f"{row.get('profile_name')}) has stale heartbeat "
-                f"({hb_age}s). Killing."
-            )
-            kill_process_tree(pid, reason=f"heartbeat stale ({hb_age}s)")
-            _mark_dead(f"killed (heartbeat stale {hb_age}s)")
-            stats["killed"] += 1
-        else:
+        if status == "alive":
             stats["alive_left_alone"] += 1
+            continue
+
+        if status == "dead":
+            _mark_dead(run_id, reason)
+            continue
+
+        # status == "wedged" — PID alive but heartbeat stale → kill + mark
+        pid = row.get("pid")
+        logging.warning(
+            f"[ProcessReaper] Run {run_id} (pid={pid}, profile="
+            f"{row.get('profile_name')}) wedged: {reason}. Killing."
+        )
+        if pid:
+            kill_process_tree(pid, reason=f"wedged: {reason}")
+        _mark_dead(run_id, f"killed ({reason})")
+        stats["killed"] += 1
 
     return stats
 
@@ -569,31 +605,15 @@ def is_profile_actually_running(db, profile_name: str) -> bool:
 
     now = datetime.now()
     for row in live_rows:
-        # Heartbeat-fresh runs are definitively alive
-        hb_str = row.get("heartbeat_at")
-        if hb_str:
-            try:
-                hb_age = (now - datetime.fromisoformat(hb_str)).total_seconds()
-                if hb_age < STALE_HEARTBEAT_SEC:
-                    return True
-            except (ValueError, TypeError):
-                pass
-        # Heartbeat is stale or missing — fall back to PID check
-        pid = row.get("pid")
-        if pid and HAVE_PSUTIL:
-            try:
-                if psutil.pid_exists(pid) and pid_looks_like_ghost_shell(pid):
-                    return True
-            except Exception:
-                pass
-        # Else: run is dead per heartbeat staleness AND PID check;
-        # this row should be reaped, but we don't reap during a
-        # liveness check. Caller can call reap_stale_runs() if the
-        # check returned False but they want belt-and-braces.
+        status, _reason = classify_run_liveness(row, now=now)
+        if status in ("alive", "wedged"):
+            # "wedged" still counts as running for delete-protection
+            # purposes (we don't want to nuke a profile while a hung
+            # monitor still has its dir open). reap_stale_runs() is
+            # the caller that escalates wedged → dead.
+            return True
 
-    # All live rows are actually stale → caller can proceed with
-    # destructive op. The stale rows will be cleaned up by the next
-    # reap_stale_runs() pass.
+    # All live_rows classified as "dead" — caller can proceed.
     return False
 
 

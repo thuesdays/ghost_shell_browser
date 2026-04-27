@@ -26,6 +26,7 @@ const Overview = {
       this.loadFingerprintHealth(),
       this.loadAdDensity(),
       this.loadHealthBanner(),
+      this.loadDriftBanner(),
     ]);
     // Wire the refresh button on the density panel (idempotent)
     const refreshBtn = document.getElementById("ov-density-refresh");
@@ -38,6 +39,12 @@ const Overview = {
     if (recheckBtn && recheckBtn.dataset._wired !== "1") {
       recheckBtn.dataset._wired = "1";
       recheckBtn.addEventListener("click", () => this.loadHealthBanner({force: true}));
+    }
+    // Wire the Re-scan button on the drift banner (idempotent)
+    const driftRescan = document.getElementById("ov-drift-recheck");
+    if (driftRescan && driftRescan.dataset._wired !== "1") {
+      driftRescan.dataset._wired = "1";
+      driftRescan.addEventListener("click", () => this.loadDriftBanner());
     }
 
     // Auto-refresh — quick polls, only the cheap stuff
@@ -678,5 +685,64 @@ const Overview = {
       const tbody = $("#overview-fp-tbody");
       if (tbody) tbody.innerHTML = `<tr><td colspan="5" class="dense-empty-cell">Failed: ${escapeHtml(e.message)}</td></tr>`;
     }
+  },
+
+  async loadDriftBanner() {
+    const banner = document.getElementById("ov-drift-banner");
+    const titleEl = document.getElementById("ov-drift-title");
+    const detail  = document.getElementById("ov-drift-detail");
+    const icon    = document.getElementById("ov-drift-icon");
+    if (!banner || !titleEl || !detail) return;
+
+    let resp;
+    try {
+      resp = await api("/api/health/drift?days=7");
+    } catch (e) {
+      banner.style.display = "none";
+      return;
+    }
+    if (!resp || !resp.ok) {
+      banner.style.display = "none";
+      return;
+    }
+    const profiles = resp.profiles || [];
+    const summary  = resp.summary  || {total: 0, critical: 0, warn: 0};
+
+    if (profiles.length === 0) {
+      banner.style.display = "none";
+      return;
+    }
+
+    banner.classList.remove("is-critical", "is-warn");
+    const sev = summary.critical > 0 ? "critical" : "warn";
+    banner.classList.add(sev === "critical" ? "is-critical" : "is-warn");
+    if (icon) icon.textContent = sev === "critical" ? "🚨" : "📉";
+
+    const headline = sev === "critical"
+      ? `${summary.critical} profile(s) in critical drift, ${summary.warn} warning`
+      : `${summary.warn} profile(s) trending down`;
+    titleEl.textContent = headline;
+
+    const top = profiles.slice(0, 5);
+    const lines = top.map(p => {
+      const reason = (p.reasons && p.reasons[0]) || "drift detected";
+      const safeName = escapeHtml(p.profile_name);
+      const safeReason = escapeHtml(reason);
+      return `<a href="#" class="drift-profile-link" data-profile="${safeName}">${safeName}</a>: ${safeReason}`;
+    });
+    const more = profiles.length > 5 ? ` (+${profiles.length - 5} more)` : "";
+    detail.innerHTML = lines.join(" · ") + more;
+
+    // Wire profile-link clicks → navigate to detail
+    detail.querySelectorAll(".drift-profile-link").forEach(a => {
+      a.addEventListener("click", (ev) => {
+        ev.preventDefault();
+        const name = a.dataset.profile;
+        if (!name) return;
+        location.hash = `#profile?profile=${encodeURIComponent(name)}`;
+        if (typeof navigate === "function") navigate("profile");
+      });
+    });
+    banner.style.display = "";
   },
 };

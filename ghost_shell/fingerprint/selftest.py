@@ -294,6 +294,32 @@ def run_selftest(profile_name: str, configured_fp: dict,
 
         result["observed"] = observed
 
+        # ── JA3 TLS fingerprint probe (Sprint 3.2)
+        # Hits the JA3 reporting endpoint THROUGH our Chromium so the
+        # observed hash reflects the patched TLS stack + the active
+        # proxy. Best-effort: network failure / endpoint down → empty
+        # dict, the validator's check skips. Stuffed into observed.ja3
+        # so the validator's check_ja3_matches_chrome sees it without
+        # a separate plumbing path.
+        try:
+            from ghost_shell.fingerprint.ja3_check import probe_ja3
+            ja3_data = probe_ja3(browser.driver, timeout=10.0)
+            if ja3_data:
+                if not isinstance(observed, dict):
+                    observed = {}
+                observed["ja3"] = ja3_data
+                result["observed"] = observed
+                logging.info(
+                    f"[selftest] JA3 probe: {ja3_data.get('ja3','')[:8]}… "
+                    f"via exit IP {ja3_data.get('ip','?')}"
+                )
+            else:
+                logging.debug("[selftest] JA3 probe returned no data — "
+                              "endpoint unreachable through current proxy "
+                              "or check.ja3.zone is down")
+        except Exception as _e:
+            logging.debug(f"[selftest] JA3 probe skipped: {_e}")
+
         # ── Coherence validation: does the observed fingerprint
         # make sense as a whole? (regardless of what we configured)
         template_id = configured_fp.get("template_id")

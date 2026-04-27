@@ -10068,3 +10068,161 @@ textarea.inline-param-input {
   font-size: 11.5px;
   color: var(--text-dim);
 }
+
+
+/* ─── HEALTH MONITOR (Sprint 4) ───
+   Per-profile detection-site canary card on the profile detail page.
+   Inline SVG sparklines per site (no chart.js dep) — minimal weight,
+   instant render. Score-band colour matches the FP coherence grade
+   colours so the user has a consistent visual lexicon. */
+
+.profile-health-card { padding: 16px; }
+.profile-health-actions { display: flex; align-items: center; gap: 8px; }
+
+.profile-health-sites {
+  display: flex; flex-direction: column;
+  gap: 8px;
+}
+
+.profile-health-row {
+  display: grid;
+  grid-template-columns: 110px 1fr 80px 70px;
+  gap: 12px;
+  align-items: center;
+  padding: 8px 12px;
+  border: 1px solid var(--border-color, #2a2a2a);
+  border-radius: 6px;
+  background: var(--bg-secondary, #1f1f1f);
+}
+.profile-health-row.is-degrading { border-color: #d4a83a; background: rgba(212, 168, 58, 0.06); }
+.profile-health-row.is-critical  { border-color: #d74848; background: rgba(215, 72, 72, 0.08); }
+
+.profile-health-site {
+  display: flex; align-items: center; gap: 6px;
+  font-weight: 500;
+  text-transform: capitalize;
+}
+.profile-health-site-icon { font-size: 14px; }
+
+.profile-health-spark {
+  width: 100%;
+  height: 28px;
+  display: block;
+}
+.profile-health-spark .spark-line { fill: none; stroke-width: 1.5; }
+.profile-health-spark .spark-area { opacity: 0.18; }
+.profile-health-spark.fp-score-excellent .spark-line,
+.profile-health-spark.fp-score-excellent .spark-area { stroke: #4caf72; fill: #4caf72; }
+.profile-health-spark.fp-score-good      .spark-line,
+.profile-health-spark.fp-score-good      .spark-area { stroke: #8ab86a; fill: #8ab86a; }
+.profile-health-spark.fp-score-warning   .spark-line,
+.profile-health-spark.fp-score-warning   .spark-area { stroke: #d4a83a; fill: #d4a83a; }
+.profile-health-spark.fp-score-critical  .spark-line,
+.profile-health-spark.fp-score-critical  .spark-area { stroke: #d74848; fill: #d74848; }
+.profile-health-spark.fp-score-unknown   .spark-line,
+.profile-health-spark.fp-score-unknown   .spark-area { stroke: #777; fill: #777; }
+
+.profile-health-score {
+  text-align: right;
+  font-family: ui-monospace, monospace;
+  font-weight: 600;
+  font-size: 14px;
+}
+
+.profile-health-trend {
+  text-align: right;
+  font-size: 11px;
+  color: var(--text-muted);
+}
+.profile-health-trend.is-improving { color: #8ab86a; }
+.profile-health-trend.is-degrading { color: #d4a83a; }
+.profile-health-trend.is-critical  { color: #d74848; }
+
+.profile-health-empty {
+  padding: 14px;
+  text-align: center;
+  color: var(--text-muted);
+  font-size: 13px;
+  border: 1px dashed var(--border-color, #2a2a2a);
+  border-radius: 6px;
+}
+
+.profile-health-runs {
+  margin-top: 10px;
+  max-height: 240px;
+  overflow-y: auto;
+}
+.profile-health-run-row {
+  display: grid;
+  grid-template-columns: 130px 100px 70px 1fr;
+  gap: 10px;
+  padding: 4px 8px;
+  font-size: 11px;
+  font-family: ui-monospace, monospace;
+  color: var(--text-muted);
+  border-bottom: 1px solid rgba(255,255,255,0.04);
+}
+.profile-health-run-row:last-child { border-bottom: none; }
+.profile-health-run-row.is-error { color: #ff9595; }
+
+
+/* ─── CAPTCHA-RATE SPARKLINE (Sprint 5) ───
+   Real-workload signal alongside Health monitor canary. Single
+   sparkline (not per-site) since captchas aren't site-attributable.
+   Reuses .fp-score-{grade} colour classes via inverted band:
+   low rate = excellent, high rate = critical. */
+
+.profile-captcha-card { padding: 16px; }
+
+.profile-captcha-row {
+  display: grid;
+  grid-template-columns: 200px 1fr 80px 90px;
+  gap: 12px;
+  align-items: center;
+  padding: 10px 12px;
+  border: 1px solid var(--border-color, #2a2a2a);
+  border-radius: 6px;
+  background: var(--bg-secondary, #1f1f1f);
+}
+
+.profile-captcha-summary {
+  font-size: 12px;
+  color: var(--text-muted);
+  line-height: 1.4;
+}
+.profile-captcha-summary strong {
+  color: var(--text-primary, #f0f0f0);
+  font-family: ui-monospace, monospace;
+  font-size: 13px;
+}
+
+.profile-captcha-spark-wrap { width: 100%; }
+.profile-captcha-spark {
+  width: 100%; height: 32px; display: block;
+}
+.profile-captcha-spark .spark-line { fill: none; stroke-width: 1.5; }
+.profile-captcha-spark .spark-area { opacity: 0.18; }
+.profile-captcha-spark.fp-score-excellent .spark-line,
+.profile-captcha-spark.fp-score-excellent .spark-area { stroke: #4caf72; fill: #4caf72; }
+.profile-captcha-spark.fp-score-good      .spark-line,
+.profile-captcha-spark.fp-score-good      .spark-area { stroke: #8ab86a; fill: #8ab86a; }
+.profile-captcha-spark.fp-score-warning   .spark-line,
+.profile-captcha-spark.fp-score-warning   .spark-area { stroke: #d4a83a; fill: #d4a83a; }
+.profile-captcha-spark.fp-score-critical  .spark-line,
+.profile-captcha-spark.fp-score-critical  .spark-area { stroke: #d74848; fill: #d74848; }
+
+.profile-captcha-rate {
+  text-align: right;
+  font-family: ui-monospace, monospace;
+  font-size: 14px;
+  font-weight: 600;
+}
+
+.profile-captcha-trend {
+  text-align: right;
+  font-size: 11px;
+  color: var(--text-muted);
+}
+.profile-captcha-trend.is-improving { color: #8ab86a; }
+.profile-captcha-trend.is-degrading { color: #d4a83a; }
+.profile-captcha-trend.is-critical  { color: #d74848; }

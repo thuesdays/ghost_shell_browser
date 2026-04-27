@@ -39,6 +39,48 @@ const ProfileDetail = {
     $("#clear-history-btn").addEventListener("click", () => this.clearHistory());
     $("#delete-profile-btn").addEventListener("click", () => this.deleteProfile());
 
+    // ── Sprint 8: Backup / Restore wiring ──
+    // Two buttons on the profile-backup card open one of two modals.
+    // The modals are completely self-contained — open / inspect /
+    // submit / close cycle is driven by these handlers only. We never
+    // cache the master password in JS state — it's read straight off
+    // the input on submit, posted, then the input is cleared on close.
+    document.getElementById("profile-backup-btn")
+      ?.addEventListener("click", () => this._openBackupModal());
+    document.getElementById("profile-restore-btn")
+      ?.addEventListener("click", () => this._openRestoreModal());
+    document.getElementById("profile-backup-submit")
+      ?.addEventListener("click", () => this._submitBackup());
+    document.getElementById("profile-restore-file")
+      ?.addEventListener("change", (e) =>
+        this._onRestoreFilePicked(e.target.files[0]));
+    document.getElementById("profile-restore-inspect-btn")
+      ?.addEventListener("click", () => this._submitInspect());
+    document.getElementById("profile-restore-submit-btn")
+      ?.addEventListener("click", () => this._submitRestore());
+    document.getElementById("profile-restore-back-btn")
+      ?.addEventListener("click", () => this._restoreBackToPick());
+    // Close-on-backdrop / × button for backup modals
+    document.querySelectorAll(
+      '[data-close="profile-backup-modal"], [data-close="profile-restore-modal"], [data-close="profile-cloud-restore-modal"]'
+    ).forEach(el => {
+      el.addEventListener("click", () => {
+        const id = el.getAttribute("data-close");
+        const m = document.getElementById(id);
+        if (m) m.style.display = "none";
+        if (id === "profile-backup-modal") this._resetBackupModal();
+        if (id === "profile-restore-modal") this._resetRestoreModal();
+      });
+    });
+
+    // Sprint 8.2 — cloud sync. Buttons start hidden until the
+    // GET /api/backup/sync/test probe confirms a target is wired up.
+    document.getElementById("profile-backup-cloud-push-btn")
+      ?.addEventListener("click", () => this._submitCloudPush());
+    document.getElementById("profile-backup-cloud-restore-btn")
+      ?.addEventListener("click", () => this._openCloudRestoreModal());
+    this._probeCloudSync();
+
     // Active-script selector — load the scripts list + current assignment
     document.getElementById("profile-script-save-btn")
       ?.addEventListener("click", () => this.saveActiveScript());
@@ -110,6 +152,8 @@ const ProfileDetail = {
         this.loadCookies(this.currentProfile),
         this.loadActiveScript(this.currentProfile),
         this.loadActiveProxy(this.currentProfile),
+        this.loadProfileHealth(this.currentProfile),
+        this.loadCaptchaHistory(this.currentProfile),
         // Extensions card (Phase 3): list assigned chips + wire the
         // "+ Add from pool" picker. Stays a no-op for users who never
         // touched Extensions — chips just render as "(none assigned)".
@@ -904,6 +948,642 @@ const ProfileDetail = {
       toast("Error: " + e.message, true);
     }
   },
+
+  // ═══════════════════════════════════════════════════════════
+  // Sprint 8: Backup / Restore UI
+  // ═══════════════════════════════════════════════════════════
+  // Bundle format and crypto live in ghost_shell/profile/backup.py.
+  // This UI is a thin wrapper around the three backup endpoints:
+  //
+  //   POST /api/profiles/<name>/backup    → encrypted blob (binary)
+  //   POST /api/backup/inspect            → header preview (json)
+  //   POST /api/backup/restore            → multipart upload
+  //
+  // We never persist the master password — it's read from the DOM
+  // input on submit, posted, then the input is wiped on modal close.
+
+  /** Open the download-backup modal. Just shows the panel and
+   *  resets transient state — no network call yet. */
+  _openBackupModal() {
+    if (!this.currentProfile) {
+      toast("No profile selected", true);
+      return;
+    }
+    this._resetBackupModal();
+    const m = document.getElementById("profile-backup-modal");
+    if (m) m.style.display = "flex";
+    // Focus the password field so the user can type immediately.
+    setTimeout(() => {
+      document.getElementById("profile-backup-password")?.focus();
+    }, 50);
+  },
+
+  /** Wipe modal state — password input cleared, status reset. Called
+   *  on open and on close so a previous attempt's password doesn't
+   *  leak into the next session. */
+  _resetBackupModal() {
+    const pw = document.getElementById("profile-backup-password");
+    const st = document.getElementById("profile-backup-modal-status");
+    const sb = document.getElementById("profile-backup-submit");
+    if (pw) pw.value = "";
+    if (st) { st.textContent = ""; st.className = "muted"; }
+    if (sb) {
+      sb.disabled = false;
+      sb.textContent = "🔐 Encrypt & download";
+      // UX-03 (sprint-8-audit): _submitCloudPush swaps sb.onclick to
+      // _cloudPushFromModal. Clear that on every reset so the next
+      // open of this same modal goes through the default
+      // _submitBackup wired in init(), not the cloud-push handler.
+      sb.onclick = null;
+    }
+  },
+
+  /** Submit the backup-create flow.
+   *
+   *  We can't use the json-only `api()` helper because the response
+   *  is binary (Content-Type: application/octet-stream). Instead we
+   *  use raw fetch + Blob.
+   *
+   *  On success: trigger a hidden `<a download>` click so the
+   *  browser saves the file. On failure: show the server's error
+   *  message in the modal status line. */
+  async _submitBackup() {
+    const pw = document.getElementById("profile-backup-password");
+    const st = document.getElementById("profile-backup-modal-status");
+    const sb = document.getElementById("profile-backup-submit");
+    const password = (pw?.value || "").trim();
+    if (!password) {
+      if (st) {
+        st.textContent = "Master password is required.";
+        st.className = "muted profile-proxy-test-fail";
+      }
+      pw?.focus();
+      return;
+    }
+    if (st) {
+      st.textContent = "Encrypting…";
+      st.className = "muted";
+    }
+    if (sb) { sb.disabled = true; sb.textContent = "Encrypting…"; }
+
+    try {
+      const url = `/api/profiles/${encodeURIComponent(this.currentProfile)}/backup`;
+      const r = await fetch(url, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ master_password: password }),
+      });
+      // Server returns JSON on error, binary on success.
+      if (!r.ok) {
+        let msg = `HTTP ${r.status}`;
+        try {
+          const j = await r.json();
+          msg = j.error || msg;
+        } catch (_) {}
+        throw new Error(msg);
+      }
+      const blob = await r.blob();
+      // Try to honor Content-Disposition's filename. Fall back to
+      // `<profile>_<ts>.ghs-bundle` when the header is missing
+      // (some proxies strip Content-Disposition).
+      let fname = `${this.currentProfile}_${Date.now()}.ghs-bundle`;
+      const cd = r.headers.get("Content-Disposition") || "";
+      const m = cd.match(/filename="?([^"]+)"?/i);
+      if (m) fname = m[1];
+
+      const blobUrl = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = blobUrl;
+      a.download = fname;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      // Revoke the object URL after the browser has had time to
+      // pick up the blob — safari/firefox have raced on this.
+      setTimeout(() => URL.revokeObjectURL(blobUrl), 5000);
+
+      if (st) {
+        st.textContent = `✓ Saved ${fname} · ${(blob.size / 1024).toFixed(1)} KB`;
+        st.className = "muted profile-proxy-test-ok";
+      }
+      toast(`✓ Backup saved (${(blob.size / 1024).toFixed(1)} KB)`);
+      // Wipe the password and re-enable the button so the user can
+      // download again with a different password without reopening.
+      if (pw) pw.value = "";
+      if (sb) { sb.disabled = false; sb.textContent = "🔐 Encrypt & download"; }
+      // Footer sticky status — survives the modal close.
+      const fst = document.getElementById("profile-backup-status");
+      if (fst) fst.textContent = `Last backup: ${fname}`;
+    } catch (e) {
+      if (st) {
+        st.textContent = `✗ ${e.message}`;
+        st.className = "muted profile-proxy-test-fail";
+      }
+      if (sb) { sb.disabled = false; sb.textContent = "🔐 Encrypt & download"; }
+    }
+  },
+
+  /** Open the restore-from-file modal. Resets to step 1 (file
+   *  picker) — even if the modal was previously left on step 2 —
+   *  so the user always starts from a clean slate. */
+  _openRestoreModal() {
+    this._resetRestoreModal();
+    const m = document.getElementById("profile-restore-modal");
+    if (m) m.style.display = "flex";
+  },
+
+  /** Full reset of the restore modal — used on open and on close.
+   *  Wipes file selection, password, target name, overwrite flag,
+   *  and snaps the UI back to step 1. */
+  _resetRestoreModal() {
+    this._restoreInspected = null;
+    this._restoreFile      = null;
+    const fileInput = document.getElementById("profile-restore-file");
+    if (fileInput) fileInput.value = "";
+    const tn = document.getElementById("profile-restore-target-name");
+    if (tn) tn.value = "";
+    const ow = document.getElementById("profile-restore-overwrite");
+    if (ow) ow.checked = false;
+    const pw = document.getElementById("profile-restore-password");
+    if (pw) pw.value = "";
+    const ps = document.getElementById("profile-restore-pick-status");
+    if (ps) { ps.textContent = ""; ps.className = "muted"; }
+    const cs = document.getElementById("profile-restore-confirm-status");
+    if (cs) { cs.textContent = ""; cs.className = "muted"; }
+    this._restoreBackToPick();
+    const ib = document.getElementById("profile-restore-inspect-btn");
+    if (ib) ib.disabled = true;
+  },
+
+  /** Step navigation: pick (step 1) → confirm (step 2). */
+  _restoreShowConfirm() {
+    document.getElementById("profile-restore-step-pick").style.display = "none";
+    document.getElementById("profile-restore-step-confirm").style.display = "";
+    document.getElementById("profile-restore-inspect-btn").style.display = "none";
+    document.getElementById("profile-restore-submit-btn").style.display = "";
+    document.getElementById("profile-restore-back-btn").style.display = "";
+    setTimeout(() => {
+      document.getElementById("profile-restore-password")?.focus();
+    }, 50);
+  },
+
+  _restoreBackToPick() {
+    const a = document.getElementById("profile-restore-step-pick");
+    const b = document.getElementById("profile-restore-step-confirm");
+    const ib = document.getElementById("profile-restore-inspect-btn");
+    const sb = document.getElementById("profile-restore-submit-btn");
+    const back = document.getElementById("profile-restore-back-btn");
+    if (a) a.style.display = "";
+    if (b) b.style.display = "none";
+    if (ib) ib.style.display = "";
+    if (sb) sb.style.display = "none";
+    if (back) back.style.display = "none";
+  },
+
+  /** File picker change handler. Stashes the File object and
+   *  enables the inspect button. We don't read the file yet — the
+   *  inspect step does that to keep the size of the JS heap small
+   *  for huge bundles. */
+  _onRestoreFilePicked(file) {
+    const ib = document.getElementById("profile-restore-inspect-btn");
+    const ps = document.getElementById("profile-restore-pick-status");
+    if (!file) {
+      this._restoreFile = null;
+      if (ib) ib.disabled = true;
+      if (ps) { ps.textContent = ""; ps.className = "muted"; }
+      return;
+    }
+    this._restoreFile = file;
+    if (ib) ib.disabled = false;
+    if (ps) {
+      ps.textContent = `Selected ${file.name} · ${(file.size / 1024).toFixed(1)} KB`;
+      ps.className = "muted";
+    }
+  },
+
+  /** POST the file to /api/backup/inspect — header-only preview, no
+   *  password required. On success, render the metadata in step 2
+   *  and advance the modal. On failure (bad magic / version), stay
+   *  on step 1 with an error message. */
+  async _submitInspect() {
+    const file = this._restoreFile;
+    const ps = document.getElementById("profile-restore-pick-status");
+    if (!file) {
+      if (ps) {
+        ps.textContent = "Pick a file first.";
+        ps.className = "muted profile-proxy-test-fail";
+      }
+      return;
+    }
+    if (ps) { ps.textContent = "Reading header…"; ps.className = "muted"; }
+
+    try {
+      const fd = new FormData();
+      fd.append("file", file, file.name);
+      const r = await fetch("/api/backup/inspect", {
+        method: "POST",
+        body: fd,
+      });
+      const j = await r.json().catch(() => ({}));
+      if (!r.ok || !j.ok) {
+        throw new Error(j.error || `HTTP ${r.status}`);
+      }
+      this._restoreInspected = j.info;
+      this._renderRestorePreview(j.info, file);
+      this._restoreShowConfirm();
+    } catch (e) {
+      if (ps) {
+        ps.textContent = `✗ ${e.message}`;
+        ps.className = "muted profile-proxy-test-fail";
+      }
+    }
+  },
+
+  /** Format the inspect-bundle response into human-readable copy.
+   *  The server only exposes the unencrypted header here (magic,
+   *  version, salt, payload size, total size). We deliberately do
+   *  NOT show the salt — it's not secret, but it adds noise. */
+  _renderRestorePreview(info, file) {
+    const el = document.getElementById("profile-restore-preview");
+    if (!el) return;
+    const totalKb = (info.total_size_bytes / 1024).toFixed(1);
+    const payloadKb = (info.payload_size / 1024).toFixed(1);
+    el.innerHTML = `
+      <div><strong>${escapeHtml(file.name)}</strong></div>
+      <div>Magic: <code>${escapeHtml(info.magic)}</code> · Version: v${info.version}</div>
+      <div>Total size: ${totalKb} KB · Encrypted payload: ${payloadKb} KB</div>
+      <div style="margin-top: 6px; font-style: italic;">
+        The bundle's profile name and source host are inside the
+        encrypted payload — they show up after a successful decrypt.
+      </div>
+    `.trim();
+  },
+
+  /** Final step — POST the bundle, password, target name, and
+   *  overwrite flag to /api/backup/restore. The endpoint returns
+   *  401 on auth failure, 400 on format error, 409 on collision,
+   *  and 200 on success with a written-rows summary. */
+  async _submitRestore() {
+    const file = this._restoreFile;
+    const cs = document.getElementById("profile-restore-confirm-status");
+    const sb = document.getElementById("profile-restore-submit-btn");
+    if (!file) {
+      if (cs) {
+        cs.textContent = "No file selected — go back.";
+        cs.className = "muted profile-proxy-test-fail";
+      }
+      return;
+    }
+    const pw = (document.getElementById("profile-restore-password")?.value || "").trim();
+    if (!pw) {
+      if (cs) {
+        cs.textContent = "Master password is required.";
+        cs.className = "muted profile-proxy-test-fail";
+      }
+      return;
+    }
+    const target = (document.getElementById("profile-restore-target-name")?.value || "").trim();
+    const overwrite = !!document.getElementById("profile-restore-overwrite")?.checked;
+
+    if (cs) { cs.textContent = "Decrypting & restoring…"; cs.className = "muted"; }
+    if (sb) { sb.disabled = true; sb.textContent = "Restoring…"; }
+
+    try {
+      const fd = new FormData();
+      fd.append("file", file, file.name);
+      fd.append("master_password", pw);
+      if (target) fd.append("target_profile_name", target);
+      fd.append("overwrite", overwrite ? "true" : "false");
+      const r = await fetch("/api/backup/restore", {
+        method: "POST",
+        body: fd,
+      });
+      const j = await r.json().catch(() => ({}));
+      if (!r.ok || !j.ok) {
+        // Friendly mapping per server's category code
+        const cat = j.category || "";
+        const baseMsg = j.error || `HTTP ${r.status}`;
+        if (cat === "auth") {
+          throw new Error("Wrong master password — bundle could not be decrypted.");
+        }
+        if (cat === "format") {
+          throw new Error("Bundle format error — file is corrupt or from a future Ghost Shell.");
+        }
+        if (cat === "conflict") {
+          throw new Error(baseMsg + " (tick 'Overwrite' or pick a different name).");
+        }
+        throw new Error(baseMsg);
+      }
+
+      // Success path — show a summary and offer to navigate to the
+      // restored profile. We don't auto-navigate because the user
+      // may want to back-up the just-restored profile too.
+      const written = j.written || {};
+      const rows = Object.entries(written)
+        .map(([t, n]) => `${t}: ${n}`).join(", ");
+      const restoredName = j.target_name || "?";
+      const sourceHost   = j.source_host || "?";
+      const udExtracted  = j.user_data_extracted || 0;
+      const warnHtml = (j.warnings && j.warnings.length)
+        ? `<div style="margin-top:8px; color:#e2b860;">Warnings: ${j.warnings
+              .map(w => escapeHtml(w)).join("; ")}</div>`
+        : "";
+      if (cs) {
+        cs.innerHTML = `
+          ✓ Restored as <strong>${escapeHtml(restoredName)}</strong>
+          (from <code>${escapeHtml(sourceHost)}</code>) ·
+          ${rows} · ${udExtracted} user-data files extracted.
+          ${warnHtml}
+          <div style="margin-top:8px;">
+            <a href="#profile?name=${encodeURIComponent(restoredName)}"
+               class="inline-link"
+               data-nav="profile"
+               data-nav-arg="${escapeHtml(restoredName)}">
+              Open restored profile →
+            </a>
+          </div>
+        `.trim();
+        cs.className = "muted profile-proxy-test-ok";
+      }
+      toast(`✓ Restored "${restoredName}"`);
+      if (sb) { sb.disabled = false; sb.textContent = "🔐 Decrypt & restore"; }
+      // Wipe just the password so a second click is safe — leave
+      // file + target name + overwrite alone in case the user wants
+      // to re-run with a tweak.
+      const pwEl = document.getElementById("profile-restore-password");
+      if (pwEl) pwEl.value = "";
+      // If we restored the currently-open profile, refresh the
+      // page so the freshly-imported rows show up.
+      if (this.currentProfile && restoredName === this.currentProfile) {
+        setTimeout(() => location.reload(), 1500);
+      }
+    } catch (e) {
+      if (cs) {
+        cs.textContent = `✗ ${e.message}`;
+        cs.className = "muted profile-proxy-test-fail";
+      }
+      if (sb) { sb.disabled = false; sb.textContent = "🔐 Decrypt & restore"; }
+    }
+  },
+
+  // ═══════════════════════════════════════════════════════════
+  // Sprint 8.2: Cloud sync (push / restore-from-cloud)
+  // ═══════════════════════════════════════════════════════════
+  // The dashboard never sees provider credentials — it just calls
+  // the four /api/backup/sync/* endpoints which delegate to the
+  // backup_sync.py adapters. Master password is collected fresh
+  // for every push (we won't reuse it across calls).
+
+  /** Probe the configured target. Reveal the cloud row only on
+   *  ok=true — anything else stays hidden so unconfigured installs
+   *  don't see broken buttons. Errors are silent (debug log only). */
+  async _probeCloudSync() {
+    const row = document.getElementById("profile-backup-cloud-row");
+    if (!row) return;
+    try {
+      const r = await fetch("/api/backup/sync/test", { method: "POST" });
+      const j = await r.json().catch(() => ({}));
+      if (r.ok && j.ok) {
+        row.style.display = "";
+        const badge = document.getElementById("profile-backup-cloud-provider");
+        if (badge) badge.textContent = (j.provider || "?").toUpperCase();
+      }
+    } catch (_) {
+      // Silent — no cloud config = no UI.
+    }
+  },
+
+  /** Push a fresh bundle to the configured cloud target. Reuses the
+   *  master-password modal — same UX as local download but the
+   *  resulting bytes never touch the user's filesystem. */
+  async _submitCloudPush() {
+    if (!this.currentProfile) {
+      toast("No profile selected", true);
+      return;
+    }
+    // Open the existing backup-password modal but swap the submit
+    // handler so it pushes to cloud instead of triggering a download.
+    this._resetBackupModal();
+    const m = document.getElementById("profile-backup-modal");
+    if (m) m.style.display = "flex";
+    const sb = document.getElementById("profile-backup-submit");
+    if (sb) {
+      sb.textContent = "☁ Encrypt & push";
+      // Replace the click handler for this one open. We restore the
+      // download handler via _resetBackupModal on close.
+      sb.onclick = () => this._cloudPushFromModal();
+    }
+    setTimeout(() => {
+      document.getElementById("profile-backup-password")?.focus();
+    }, 50);
+  },
+
+  /** Inner submit handler for cloud-push when the password modal
+   *  is open in cloud-push mode. */
+  async _cloudPushFromModal() {
+    const pw = document.getElementById("profile-backup-password");
+    const st = document.getElementById("profile-backup-modal-status");
+    const sb = document.getElementById("profile-backup-submit");
+    const password = (pw?.value || "").trim();
+    if (!password) {
+      if (st) {
+        st.textContent = "Master password is required.";
+        st.className = "muted profile-proxy-test-fail";
+      }
+      pw?.focus();
+      return;
+    }
+    if (st) { st.textContent = "Encrypting & uploading…"; st.className = "muted"; }
+    if (sb) { sb.disabled = true; sb.textContent = "Uploading…"; }
+    try {
+      const r = await api(
+        `/api/profiles/${encodeURIComponent(this.currentProfile)}/backup/sync/push`,
+        { method: "POST", body: JSON.stringify({ master_password: password }) }
+      );
+      const sizeKb = ((r.size || 0) / 1024).toFixed(1);
+      const deletedN = (r.deleted || []).length;
+      const retentionMsg = deletedN
+        ? ` · retention: removed ${deletedN} older bundle${deletedN === 1 ? "" : "s"}`
+        : "";
+      if (st) {
+        st.innerHTML = `✓ Uploaded <code>${escapeHtml(r.key || "?")}</code>` +
+                       ` · ${sizeKb} KB${retentionMsg}`;
+        st.className = "muted profile-proxy-test-ok";
+      }
+      const fst = document.getElementById("profile-backup-cloud-status");
+      if (fst) fst.textContent = `Last push: ${sizeKb} KB${retentionMsg}`;
+      toast(`✓ Pushed to cloud (${sizeKb} KB)${retentionMsg}`);
+      if (pw) pw.value = "";
+      if (sb) {
+        sb.disabled = false;
+        sb.textContent = "☁ Encrypt & push";
+      }
+    } catch (e) {
+      if (st) {
+        st.textContent = `✗ ${e.message}`;
+        st.className = "muted profile-proxy-test-fail";
+      }
+      if (sb) {
+        sb.disabled = false;
+        sb.textContent = "☁ Encrypt & push";
+      }
+    }
+  },
+
+  /** Open the cloud-restore picker — fetches the bundle list and
+   *  renders one row per remote bundle. Click → download the bytes
+   *  and feed them into the existing local-restore flow (header
+   *  inspect → password input → restore). */
+  async _openCloudRestoreModal() {
+    const m = document.getElementById("profile-cloud-restore-modal");
+    const body = document.getElementById("profile-cloud-restore-body");
+    if (!m || !body) return;
+    m.style.display = "flex";
+    body.innerHTML = `<div class="muted" style="padding: 12px;">Loading remote bundles…</div>`;
+    try {
+      const r = await api("/api/backup/sync/list");
+      const items = r.items || [];
+      if (!items.length) {
+        body.innerHTML = `
+          <div class="dense-empty" style="padding: 30px 16px; text-align: center;">
+            <div style="font-size: 28px; opacity: 0.4; margin-bottom: 8px;">☁</div>
+            <div style="font-size: 13px; opacity: 0.75;">
+              No bundles in the cloud target yet. Push one first
+              with <strong>☁ Push to cloud</strong>.
+            </div>
+          </div>`;
+        return;
+      }
+      // Group by host then profile. Most-recent first within each
+      // group (the server already sorts ts desc).
+      const byHostProfile = {};
+      for (const it of items) {
+        const k = `${it.host || "?"}/${it.profile_name || "?"}`;
+        (byHostProfile[k] = byHostProfile[k] || []).push(it);
+      }
+      const groups = Object.keys(byHostProfile).sort();
+      const html = groups.map(g => {
+        const rows = byHostProfile[g];
+        const first = rows[0];
+        const inner = rows.map(it => {
+          const sizeKb = ((it.size || 0) / 1024).toFixed(1);
+          return `
+            <tr>
+              <td><code>${escapeHtml(it.stamp || it.key)}</code></td>
+              <td class="num">${sizeKb} KB</td>
+              <td>
+                <button class="btn btn-primary btn-small profile-cloud-fetch-btn"
+                        data-key="${escapeHtml(it.key)}">
+                  ⬇ Fetch &amp; restore
+                </button>
+                <button class="btn btn-secondary btn-small profile-cloud-delete-btn"
+                        data-key="${escapeHtml(it.key)}"
+                        title="Remove this bundle from the cloud target">
+                  🗑
+                </button>
+              </td>
+            </tr>`;
+        }).join("");
+        return `
+          <div style="margin-bottom: 14px;">
+            <div style="font-weight: 600; margin-bottom: 4px;">
+              ${escapeHtml(first.host)} / ${escapeHtml(first.profile_name)}
+              <span class="muted" style="font-weight: normal; font-size: 12px;">
+                — ${rows.length} bundle${rows.length === 1 ? "" : "s"}
+              </span>
+            </div>
+            <table class="dense-table" style="width: 100%;">
+              <thead>
+                <tr>
+                  <th>Timestamp</th>
+                  <th class="num">Size</th>
+                  <th style="width: 220px;">Actions</th>
+                </tr>
+              </thead>
+              <tbody>${inner}</tbody>
+            </table>
+          </div>`;
+      }).join("");
+      body.innerHTML = html;
+      body.querySelectorAll(".profile-cloud-fetch-btn").forEach(btn => {
+        btn.addEventListener("click", () =>
+          this._cloudFetchAndRestore(btn.dataset.key));
+      });
+      body.querySelectorAll(".profile-cloud-delete-btn").forEach(btn => {
+        btn.addEventListener("click", () =>
+          this._cloudDelete(btn.dataset.key));
+      });
+    } catch (e) {
+      body.innerHTML = `<div class="muted" style="color:#fca5a5; padding:12px;">
+        Load failed: ${escapeHtml(e.message)}
+      </div>`;
+    }
+  },
+
+  /** Pull the bytes for a remote key, hand them to the local
+   *  restore flow as if the user had picked a file. We craft a
+   *  pseudo-File object so _onRestoreFilePicked +_submitInspect work
+   *  unchanged — the rest of the flow has no idea the bytes came
+   *  from S3 / Dropbox / SFTP. */
+  async _cloudFetchAndRestore(key) {
+    if (!key) return;
+    toast(`Fetching ${key}…`);
+    try {
+      const r = await fetch("/api/backup/sync/pull", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ key }),
+      });
+      if (!r.ok) {
+        const j = await r.json().catch(() => ({}));
+        throw new Error(j.error || `HTTP ${r.status}`);
+      }
+      const blob = await r.blob();
+      // Flask streamed the bundle; wrap it in a File so the local
+      // flow doesn't need a special branch.
+      const fname = key.split("/").pop() || "remote.ghs-bundle";
+      const file = new File([blob], fname, {
+        type: "application/octet-stream",
+      });
+      // Close the cloud picker, open the local-restore modal pre-
+      // populated with the fetched bytes.
+      const cloudModal = document.getElementById("profile-cloud-restore-modal");
+      if (cloudModal) cloudModal.style.display = "none";
+      this._openRestoreModal();
+      this._onRestoreFilePicked(file);
+      // Auto-advance to the inspect step — no point making the user
+      // click "Inspect bundle" when they already chose this file.
+      this._submitInspect();
+    } catch (e) {
+      toast(`Fetch failed: ${e.message}`, true);
+    }
+  },
+
+  /** Hard-delete a remote bundle. Confirmation prompt because there's
+   *  no recycle bin on the cloud side. */
+  async _cloudDelete(key) {
+    if (!key) return;
+    if (!await confirmDialog({
+      title: "Delete remote bundle?",
+      message: `Permanently delete the cloud bundle:\n\n${key}\n\n` +
+               `This removes it from the configured remote target. ` +
+               `Local copies are untouched. Cannot be undone.`,
+      confirmText: "Delete",
+      confirmStyle: "danger",
+    })) return;
+    try {
+      await api("/api/backup/sync/delete", {
+        method: "POST",
+        body: JSON.stringify({ key }),
+      });
+      toast(`✓ Deleted ${key}`);
+      // Refresh the modal listing so the row disappears.
+      this._openCloudRestoreModal();
+    } catch (e) {
+      toast(`Delete failed: ${e.message}`, true);
+    }
+  },
+
 
   async regenerateFingerprint() {
     if (!this.currentProfile) {

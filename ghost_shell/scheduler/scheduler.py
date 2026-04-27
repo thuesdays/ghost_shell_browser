@@ -134,10 +134,18 @@ def mark_stopped():
 # ──────────────────────────────────────────────────────────────
 
 def runs_today() -> int:
+    """Sprint 10.1 (SC-06): tz-tolerant day boundary. Previously we
+    matched ``started_at LIKE 'YYYY-MM-DD%'`` against the local
+    ``today`` string — works only because ``started_at`` is written
+    in local-naive form. The strftime form normalises the row to
+    local-tz date and compares to local ``today``. We keep the LIKE
+    branch as a fallback so pre-migration rows still match."""
     today = datetime.now().strftime("%Y-%m-%d")
     row = get_db()._get_conn().execute(
-        "SELECT COUNT(*) AS n FROM runs WHERE started_at LIKE ?",
-        (f"{today}%",),
+        """SELECT COUNT(*) AS n FROM runs
+           WHERE strftime('%Y-%m-%d', started_at, 'localtime') = ?
+              OR substr(started_at, 1, 10) = ?""",
+        (today, today),
     ).fetchone()
     return row["n"] if row else 0
 
@@ -159,7 +167,7 @@ def consecutive_failures() -> int:
         "SELECT id, profile_name, exit_code, error, started_at, finished_at "
         "FROM runs WHERE finished_at IS NOT NULL "
         "AND started_at >= ? "
-        "ORDER BY id DESC LIMIT 20",
+        "ORDER BY id DESC LIMIT 200  -- Sprint 10.1 SC-11: was 20",
         (started_at,),
     ).fetchall()
     count = 0
@@ -187,6 +195,25 @@ def consecutive_failures() -> int:
 # ──────────────────────────────────────────────────────────────
 
 _round_robin_idx = 0
+
+
+def _load_rr_idx() -> int:
+    """Sprint 10.1 (SC-10): persist round-robin position across
+    Stop+Start cycles. Without this a mid-day restart rewinds to
+    profile #0 — a 'fair rotation' no longer rotates fairly."""
+    try:
+        v = get_db().config_get("scheduler.round_robin_idx")
+        return int(v) if v is not None else 0
+    except Exception:
+        return 0
+
+
+def _save_rr_idx(idx: int) -> None:
+    try:
+        get_db().config_set("scheduler.round_robin_idx", int(idx))
+    except Exception:
+        pass
+
 
 def pick_profile(cfg: dict) -> str:
     """Single-profile picker — kept for back-compat with any older code
@@ -224,8 +251,14 @@ def pick_batch(cfg: dict) -> list:
     if not pool:
         return [cfg["default_profile"]]
     if cfg["selection_mode"] == "round-robin":
+        # Sprint 10.1 (SC-10): index is persisted, restored on every
+        # call. Stop+Start mid-day no longer rewinds rotation to 0.
+        global _round_robin_idx
+        if _round_robin_idx == 0:
+            _round_robin_idx = _load_rr_idx()
         name = pool[_round_robin_idx % len(pool)]
         _round_robin_idx += 1
+        _save_rr_idx(_round_robin_idx)
         return [name]
     return [random.choice(pool)]
 
@@ -400,6 +433,19 @@ def _spawn_via_dashboard(profile_name: str) -> Optional[int]:
         with urllib.request.urlopen(req, timeout=5) as r:
             body = _json.loads(r.read().decode("utf-8"))
             return body.get("run_id")
+    except urllib.error.HTTPError as e:
+        if e.code == 409:
+            # Sprint 10.1 (RP-01): manual run already active for this
+            # profile. Return sentinel 0 so the caller treats it as
+            # skip-not-fail (vs None which falls through to direct
+            # Popen). Avoids spurious consecutive-failure counts.
+            logging.info(
+                f"[scheduler] dashboard rejected spawn (409) — "
+                f"manual run already active for {profile_name!r}, skipping"
+            )
+            return 0
+        logging.warning(f"[scheduler] dashboard spawn HTTP {e.code}: {e.reason}")
+        return None
     except urllib.error.URLError:
         return None   # dashboard offline
     except Exception as e:
@@ -409,13 +455,22 @@ def _spawn_via_dashboard(profile_name: str) -> Optional[int]:
 
 def _wait_for_run_via_dashboard(run_id: int, timeout: int = 30 * 60) -> tuple:
     """Poll /api/run/status until the run finishes or times out.
-    Returns (exit_code, duration_sec). Uses generous polling intervals
-    so we don't hammer the dashboard."""
+    Returns (exit_code, duration_sec).
+
+    Sprint 10.1 (SC-08): bound consecutive poll failures so a flaky
+    dashboard doesn't wedge us for a full 30min on a single run.
+
+    Sprint 10.1 (SC-07): after the timeout-triggered stop POST,
+    verify the run is actually dead via one final status check.
+    If still alive, escalate to /api/admin/reap-zombies (taskkill
+    /F /T) so the user-data-dir doesn't stay locked."""
     import json as _json
     import urllib.request
 
     started = time.time()
-    poll_interval = 5  # seconds
+    poll_interval = 5
+    consecutive_poll_fails = 0
+    POLL_FAIL_BUDGET = 12  # ~60s of failed polls before bailing
 
     while time.time() - started < timeout:
         if _shutdown:
@@ -426,15 +481,25 @@ def _wait_for_run_via_dashboard(run_id: int, timeout: int = 30 * 60) -> tuple:
                 timeout=5,
             ) as r:
                 status = _json.loads(r.read().decode("utf-8"))
+            consecutive_poll_fails = 0
             if not status.get("running"):
-                # exit_code is None for still-running runs; dashboard sets
-                # it to the subprocess returncode on completion.
                 return status.get("exit_code", 0) or 0, time.time() - started
         except Exception as e:
-            logging.debug(f"[scheduler] status poll error (non-fatal): {e}")
+            consecutive_poll_fails += 1
+            logging.debug(
+                f"[scheduler] status poll error "
+                f"({consecutive_poll_fails}/{POLL_FAIL_BUDGET}): {e}"
+            )
+            if consecutive_poll_fails >= POLL_FAIL_BUDGET:
+                logging.error(
+                    f"[scheduler] dashboard unreachable for run {run_id} "
+                    f"after {consecutive_poll_fails} polls — giving up; "
+                    f"run may still be alive"
+                )
+                return -2, time.time() - started
         time.sleep(poll_interval)
 
-    # Timeout — ask dashboard to kill the run, best-effort
+    # Timeout — ask dashboard to kill the run.
     try:
         urllib.request.urlopen(
             urllib.request.Request(
@@ -445,6 +510,42 @@ def _wait_for_run_via_dashboard(run_id: int, timeout: int = 30 * 60) -> tuple:
         )
     except Exception:
         pass
+
+    # Verify dead (SC-07)
+    final_running = True
+    for _ in range(3):  # ~6s grace
+        time.sleep(2)
+        try:
+            with urllib.request.urlopen(
+                f"{DASHBOARD_BASE_URL}/api/run/status?run_id={run_id}",
+                timeout=3,
+            ) as r:
+                final = _json.loads(r.read().decode("utf-8"))
+            if not final.get("running"):
+                final_running = False
+                break
+        except Exception:
+            continue
+    if final_running:
+        try:
+            urllib.request.urlopen(
+                urllib.request.Request(
+                    f"{DASHBOARD_BASE_URL}/api/admin/reap-zombies",
+                    data=b"{}",
+                    headers={"Content-Type": "application/json"},
+                    method="POST",
+                ),
+                timeout=10,
+            )
+            logging.warning(
+                f"[scheduler] run {run_id} survived stop POST — "
+                f"escalated to reap-zombies"
+            )
+        except Exception as e:
+            logging.error(
+                f"[scheduler] run {run_id} timed out AND reap-zombies "
+                f"failed: {e}"
+            )
     logging.error(f"[scheduler] run {run_id} timed out after {timeout}s")
     return -1, time.time() - started
 
@@ -457,6 +558,14 @@ def run_one_iteration(profile_name: str) -> tuple:
 
     # Try dashboard route first — gives us full SSE integration
     run_id = _spawn_via_dashboard(profile_name)
+    if run_id == 0:
+        # Sprint 10.1 (RP-01): dashboard returned 409. Skip cleanly,
+        # exit_code=0 so consecutive_failures() doesn't tick up.
+        logging.info(
+            f"  ⏭ skip iteration: manual run already in flight for "
+            f"{profile_name!r}"
+        )
+        return 0, time.time() - started
     if run_id is not None:
         logging.info(f"  → dashboard spawned run #{run_id} for {profile_name}")
         return _wait_for_run_via_dashboard(run_id)
@@ -512,6 +621,141 @@ def run_one_iteration(profile_name: str) -> tuple:
 
 
 # ──────────────────────────────────────────────────────────────
+# Sprint 10.1 (ARCH-01): scheduled_tasks dispatcher
+# ──────────────────────────────────────────────────────────────
+
+def _fire_scheduled_tasks():
+    """Walk enabled rows in ``scheduled_tasks``, dispatch any whose
+    ``next_run_at`` is in the past, then bump last_run_at +
+    next_run_at to the NEXT cron match.
+
+    Dispatch uses /api/scripts/<id>/run with assign=False (one-shot
+    override, NOT a permanent re-bind). If the dashboard is offline
+    we skip the row this tick — next_run_at is preserved across
+    restarts in the DB. Misfires are NOT replayed: cron matches are
+    wall-clock events, not jobs in a queue."""
+    import json as _json
+    import urllib.request
+    import urllib.error
+    from ghost_shell.scheduler.cron import next_fire as _cron_next
+
+    db = get_db()
+    try:
+        rows = db.scheduled_tasks_list()
+    except Exception as e:
+        logging.debug(f"[scheduled_tasks] list failed: {e}")
+        return
+    if not rows:
+        return
+
+    now = datetime.now()
+    fired = 0
+    for r in rows:
+        if not r.get("enabled"):
+            continue
+        cron = (r.get("cron_expr") or "").strip()
+        if not cron:
+            continue
+
+        next_run_at = r.get("next_run_at")
+        if not next_run_at:
+            try:
+                nxt = _cron_next(cron, now)
+                if nxt:
+                    db.scheduled_task_update(
+                        r["id"], next_run_at=nxt.isoformat(timespec="seconds")
+                    )
+            except Exception as e:
+                logging.warning(
+                    f"[scheduled_tasks] row {r['id']} bad cron "
+                    f"{cron!r}: {e}"
+                )
+            continue
+
+        try:
+            due_at = datetime.fromisoformat(next_run_at)
+        except ValueError:
+            try:
+                nxt = _cron_next(cron, now)
+                db.scheduled_task_update(
+                    r["id"],
+                    next_run_at=nxt.isoformat(timespec="seconds") if nxt else None,
+                )
+            except Exception:
+                pass
+            continue
+        if due_at > now:
+            continue
+
+        profiles = r.get("profiles") or []
+        if not profiles:
+            try:
+                nxt = _cron_next(cron, now)
+                if nxt:
+                    db.scheduled_task_update(
+                        r["id"], next_run_at=nxt.isoformat(timespec="seconds")
+                    )
+            except Exception:
+                pass
+            continue
+
+        logging.info(
+            f"[scheduled_tasks] firing row {r['id']} "
+            f"(script {r.get('script_id')}, {len(profiles)} profile(s))"
+        )
+
+        try:
+            req = urllib.request.Request(
+                f"{DASHBOARD_BASE_URL}/api/scripts/"
+                f"{int(r['script_id'])}/run",
+                data=_json.dumps({
+                    "profiles": list(profiles),
+                    "assign": False,
+                }).encode("utf-8"),
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                body = _json.loads(resp.read().decode("utf-8"))
+            started = body.get("started", 0)
+            total = body.get("total", len(profiles))
+            logging.info(
+                f"[scheduled_tasks] row {r['id']}: {started}/{total} started"
+            )
+            fired += 1
+        except urllib.error.HTTPError as e:
+            logging.warning(
+                f"[scheduled_tasks] row {r['id']} HTTP {e.code}: {e.reason}"
+            )
+        except urllib.error.URLError:
+            logging.warning(
+                f"[scheduled_tasks] row {r['id']}: dashboard offline"
+            )
+            continue
+        except Exception as e:
+            logging.warning(
+                f"[scheduled_tasks] row {r['id']} failed: {e}"
+            )
+
+        # Bump bookkeeping. We compute next_run_at from `now` rather
+        # than `due_at` so a long-stalled scheduler doesn't try to
+        # catch up by firing every missed match.
+        try:
+            nxt = _cron_next(cron, now)
+            db.scheduled_task_update(
+                r["id"],
+                last_run_at=now.isoformat(timespec="seconds"),
+                next_run_at=(nxt.isoformat(timespec="seconds") if nxt else None),
+            )
+        except Exception as e:
+            logging.warning(
+                f"[scheduled_tasks] row {r['id']}: bookkeeping failed: {e}"
+            )
+    if fired:
+        logging.info(f"[scheduled_tasks] tick fired {fired} task(s)")
+
+
+# ──────────────────────────────────────────────────────────────
 # Main loop
 # ──────────────────────────────────────────────────────────────
 
@@ -546,7 +790,12 @@ def main():
     # "crashed (stale state)" on the UI.
     import threading as _th
     def _hb_ticker():
+        # Sprint 10.1 (SC-04): re-check _shutdown BEFORE every write
+        # so a Stop click doesn't cause one final overwrite of the
+        # heartbeat AFTER mark_stopped() cleared it.
         while not _shutdown:
+            if _shutdown:
+                return
             try:
                 db2 = get_db()
                 db2.config_set(
@@ -555,7 +804,6 @@ def main():
                 )
             except Exception:
                 pass
-            # 15-sec sleep in small slices for responsive shutdown
             for _ in range(15):
                 if _shutdown:
                     return
@@ -600,6 +848,15 @@ def main():
                 f"hours={cfg['active_hours']}"
             )
 
+            # Sprint 10.1 (ARCH-01): fire any per-script scheduled_tasks
+            # whose next_run_at has elapsed. Previously the table was
+            # dead code — users created schedules via the UI that did
+            # nothing. Now it's wired up.
+            try:
+                _fire_scheduled_tasks()
+            except Exception as e:
+                logging.warning(f"[scheduler] scheduled_tasks tick failed: {e}")
+
             if not is_active_day(cfg["active_days"]):
                 sleep_sec = time_until_next_active_day(cfg["active_days"])
                 wake_at = datetime.now() + timedelta(seconds=sleep_sec)
@@ -635,7 +892,21 @@ def main():
 
             done_today = runs_today()
             if done_today >= cfg["target_runs"]:
-                sleep_sec = time_until_next_window(cfg["active_hours"])
+                # Sprint 10.1 (SC-05): for 24/7 setup (active_hours=[0,24]),
+                # time_until_next_window returns ~60s because h_start=0
+                # and "now is past h_start" is always true. That made
+                # the scheduler busy-poll once a minute when quota was
+                # met. Sleep till local midnight (when runs_today rolls
+                # over) instead.
+                h_start, h_end = cfg["active_hours"]
+                if h_start == 0 and h_end >= 24:
+                    now_dt = datetime.now()
+                    tomorrow = (now_dt + timedelta(days=1)).replace(
+                        hour=0, minute=0, second=1, microsecond=0
+                    )
+                    sleep_sec = max(60.0, (tomorrow - now_dt).total_seconds())
+                else:
+                    sleep_sec = time_until_next_window(cfg["active_hours"])
                 wake_at = datetime.now() + timedelta(seconds=sleep_sec)
                 logging.info(
                     f"✅ Quota met ({done_today}/{cfg['target_runs']}) — "
@@ -723,6 +994,11 @@ def main():
                         if _shutdown:
                             break
                         rid = _spawn_via_dashboard(name)
+                        if rid == 0:
+                            logging.info(
+                                f"  ⏭ skip {name} (manual run active)"
+                            )
+                            continue
                         if rid is not None:
                             run_ids.append((name, rid, "dashboard"))
                             logging.info(f"  ▶ spawned {name} (run #{rid}) via dashboard")

@@ -2,20 +2,68 @@
   "name": "YouTube warmup",
   "description": "Visits YouTube, watches the homepage feed for ~30s, plays a generic trending video and dwells on it. Builds a YouTube watch-history footprint that helps the profile look like a real returning user when later activity touches Google's ad ecosystem.",
   "category": "warmup",
-  "tags": ["youtube", "google", "warmup"],
+  "tags": [
+    "youtube",
+    "google",
+    "warmup"
+  ],
   "flow": [
-    { "type": "visit", "url": "https://www.youtube.com" },
-    { "type": "dwell", "min": 4, "max": 10 },
-    { "type": "scroll", "amount_min": 300, "amount_max": 800 },
-    { "type": "dwell", "min": 6, "max": 12 },
-    { "type": "scroll", "amount_min": 400, "amount_max": 900 },
-    { "type": "dwell", "min": 5, "max": 12 },
-
-    { "type": "visit", "url": "https://www.youtube.com/feed/trending" },
-    { "type": "wait_for", "selector": "ytd-video-renderer, ytd-rich-item-renderer", "timeout": 15 },
-    { "type": "dwell", "min": 4, "max": 10 },
-    { "type": "click_selector", "selector": "ytd-video-renderer #video-title, ytd-rich-item-renderer #video-title-link" },
-    { "type": "wait_for", "selector": "video", "timeout": 15 },
-    { "type": "dwell", "min": 30, "max": 75 }
+    {
+      "type": "visit",
+      "url": "https://www.youtube.com"
+    },
+    {
+      "type": "dwell",
+      "min": 4,
+      "max": 10
+    },
+    {
+      "type": "scroll",
+      "amount_min": 300,
+      "amount_max": 800
+    },
+    {
+      "type": "dwell",
+      "min": 6,
+      "max": 12
+    },
+    {
+      "type": "scroll",
+      "amount_min": 400,
+      "amount_max": 900
+    },
+    {
+      "type": "dwell",
+      "min": 5,
+      "max": 12
+    },
+    {
+      "type": "visit",
+      "url": "https://www.youtube.com/feed/trending"
+    },
+    {
+      "type": "wait_for",
+      "selector": "ytd-video-renderer, ytd-rich-item-renderer, ytd-rich-grid-row, ytd-grid-video-renderer",
+      "timeout": 15
+    },
+    {
+      "type": "dwell",
+      "min": 4,
+      "max": 10
+    },
+    {
+      "type": "click_selector",
+      "selector": "ytd-video-renderer #video-title, ytd-rich-item-renderer #video-title-link, ytd-rich-grid-row a#video-title-link, ytd-grid-video-renderer #video-title"
+    },
+    {
+      "type": "wait_for",
+      "selector": "video",
+      "timeout": 15
+    },
+    {
+      "type": "dwell",
+      "min": 30,
+      "max": 75
+    }
   ]
 }

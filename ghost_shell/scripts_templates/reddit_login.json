@@ -12,6 +12,14 @@
       "url": "https://www.reddit.com/login"
     },
     {
+      "type": "click_selector",
+      "comment": "TPL-03: dismiss GDPR/consent banner if present (EU exits). Non-EU runs fall through silently — _act_click_selector logs 'not found' and the script continues.",
+      "selector": "#onetrust-accept-btn-handler, .qc-cmp2-summary-buttons button[mode='primary'], #CybotCookiebotDialogBodyButtonAccept, #CybotCookiebotDialogBodyLevelButtonLevelOptinAllowAll, button[aria-label*='Accept all' i], button[aria-label*='Allow all' i], [data-cookiebanner='accept_button'], [data-testid='cookie-policy-manage-dialog-accept-button'], button[aria-label='Accept all'], button[aria-label='Принять все'], button[action-type='ACCEPT'], [data-testid='accept_cookies_button']",
+      "timeout": 4,
+      "probability": 1.0,
+      "abort_on_error": false
+    },
+    {
       "type": "wait_for",
       "selector": "input[name='username'], input#loginUsername",
       "timeout": 15
@@ -45,11 +53,11 @@
     },
     {
       "type": "click_selector",
-      "selector": "button[type='submit'], button:has-text('Log In')"
+      "selector": "button[type='submit']"
     },
     {
       "type": "wait_for",
-      "selector": "header, [data-testid='community-list']",
+      "selector": "shreddit-app, reddit-header-large, header, [data-testid='community-list'], a[href='/']",
       "timeout": 25
     },
     {

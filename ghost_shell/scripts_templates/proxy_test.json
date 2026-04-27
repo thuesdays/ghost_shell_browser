@@ -1,15 +1,50 @@
 {
   "name": "Proxy / IP smoke test",
-  "description": "Quickest possible sanity check. Hits an IP-echo service to confirm the profile's proxy is alive and routing correctly, then dwells briefly so the run shows up as not-instant in the run history. Great as the first script you assign to a freshly-created profile.",
+  "description": "Verifies the profile is routing through its assigned proxy. Visits ipify (returns the exit IP as JSON), captures it via extract_text + save_var, then visits browserleaks for a human-readable secondary check. The captured IP is stored in the run's vars as 'reported_ip' so it shows up in the run detail log — useful for confirming a rotating proxy actually rotated, or that a dedicated proxy hasn't silently fallen back to the host's direct connection.",
   "category": "diagnostic",
-  "tags": ["proxy", "smoke-test", "diagnostic"],
+  "tags": ["proxy", "smoke-test", "ip-check", "rotation"],
   "flow": [
-    { "type": "visit", "url": "https://api.ipify.org/?format=json" },
-    { "type": "dwell", "min": 1, "max": 3 },
-    { "type": "extract_text", "selector": "body", "store_as": "exit_ip_json" },
-    { "type": "visit", "url": "https://browserleaks.com/ip" },
-    { "type": "dwell", "min": 4, "max": 8 },
-    { "type": "scroll", "amount_min": 200, "amount_max": 600 },
-    { "type": "dwell", "min": 3, "max": 6 }
+    {
+      "type": "visit",
+      "url": "https://api.ipify.org/?format=json",
+      "new_tab": false
+    },
+    {
+      "type": "dwell",
+      "min": 1,
+      "max": 2
+    },
+    {
+      "type": "extract_text",
+      "selector": "pre, body",
+      "store_as": "reported_ip_raw",
+      "comment": "ipify returns {\"ip\":\"x.x.x.x\"} as the page body. We capture the whole text; the user can post-process it from run vars."
+    },
+    {
+      "type": "execute_js",
+      "code": "try { const j = JSON.parse(document.body.innerText); return j.ip || ''; } catch(e) { return ''; }",
+      "store_as": "reported_ip",
+      "comment": "Pulls the bare IP out of the JSON for cleaner display in run logs."
+    },
+    {
+      "type": "visit",
+      "url": "https://browserleaks.com/ip",
+      "new_tab": false
+    },
+    {
+      "type": "dwell",
+      "min": 3,
+      "max": 5,
+      "comment": "browserleaks renders WebRTC + DNS + IP geolocation server-side, so a short dwell is enough."
+    },
+    {
+      "type": "scroll",
+      "amount": 800
+    },
+    {
+      "type": "dwell",
+      "min": 2,
+      "max": 4
+    }
   ]
 }

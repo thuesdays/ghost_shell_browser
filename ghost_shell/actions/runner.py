@@ -448,6 +448,69 @@ def _act_click_ad(driver, action: dict, ctx: dict):
             driver.switch_to.window(original)
 
 
+def _resolve_selector(sel: str):
+    """Translate a user-friendly selector string into a (By, value)
+    pair the Selenium API accepts.
+
+    Sprint 9 (TPL-01): templates inherited from a Playwright-style
+    syntax that includes ``:has-text('foo')`` and ``text:foo`` — these
+    are NOT valid CSS selectors. Selenium ≥ 4.18 raises
+    ``InvalidSelectorException`` on them. We rewrite the common
+    forms into XPath so the same templates work without per-template
+    edits:
+
+      ``xpath=//div``               → (By.XPATH, '//div')
+      ``xpath://div``               → (By.XPATH, '//div')
+      ``text:Foo``                  → (By.XPATH, "//*[contains(., 'Foo')]")
+      ``button:has-text('Foo')``    → (By.XPATH,
+                                       "//button[contains(., 'Foo')]")
+      ``a, b:has-text('X')``        → first non-`:has-text` branch as
+                                       CSS; if all branches contain
+                                       it, the whole thing converts
+                                       to a chained XPath OR.
+
+    Falls back to ``By.CSS_SELECTOR`` for anything else."""
+    if not sel:
+        return (By.CSS_SELECTOR, sel)
+    s = sel.strip()
+    if s.startswith("xpath="):
+        return (By.XPATH, s[len("xpath="):])
+    if s.startswith("xpath:"):
+        return (By.XPATH, s[len("xpath:"):])
+    if s.startswith("text:"):
+        text = s[len("text:"):].strip().strip("'").strip('"')
+        # XPath 1.0 has no escape — single quotes inside the text
+        # break the literal. Swap to double-quote literal if needed.
+        quote = '"' if "'" in text else "'"
+        return (By.XPATH, f"//*[contains(., {quote}{text}{quote})]")
+    if ":has-text(" in s:
+        # Try to keep the CSS branches that DON'T use :has-text and
+        # discard the others. If everything uses it, fall back to a
+        # chained XPath OR over the tag-prefixed branches.
+        parts = [p.strip() for p in s.split(",")]
+        css_parts = [p for p in parts if ":has-text(" not in p]
+        if css_parts:
+            return (By.CSS_SELECTOR, ", ".join(css_parts))
+        # Build XPath OR from each :has-text branch.
+        xpath_branches = []
+        import re as _re
+        for p in parts:
+            m = _re.match(r"^([a-zA-Z][\w-]*)?\s*:has-text\(\s*['\"](.+?)['\"]\s*\)\s*$", p)
+            if not m:
+                continue
+            tag = m.group(1) or "*"
+            text = m.group(2)
+            quote = '"' if "'" in text else "'"
+            xpath_branches.append(
+                f"//{tag}[contains(., {quote}{text}{quote})]"
+            )
+        if xpath_branches:
+            return (By.XPATH, " | ".join(xpath_branches))
+        # Couldn't parse — pass through as CSS and let it fail loudly.
+        return (By.CSS_SELECTOR, sel)
+    return (By.CSS_SELECTOR, sel)
+
+
 def _act_click_selector(driver, action: dict, ctx: dict):
     """Click any element by CSS selector with human mouse movement."""
     sel = action.get("selector")
@@ -455,8 +518,9 @@ def _act_click_selector(driver, action: dict, ctx: dict):
         log.warning("    click_selector: no selector given")
         return
 
+    by, value = _resolve_selector(sel)
     try:
-        el = driver.find_element(By.CSS_SELECTOR, sel)
+        el = driver.find_element(by, value)
     except Exception:
         log.warning(f"    click_selector: not found: {sel}")
         return
@@ -638,8 +702,9 @@ def _act_type(driver, action: dict, ctx: dict):
     sel  = action.get("selector")
     text = action.get("text", "")
     if not sel or not text: return
+    by, value = _resolve_selector(sel)
     try:
-        el = driver.find_element(By.CSS_SELECTOR, sel)
+        el = driver.find_element(by, value)
     except Exception:
         log.warning(f"    type: selector not found: {sel}")
         return
@@ -745,11 +810,15 @@ def _act_switch_tab(driver, action: dict, ctx: dict):
 
 def _act_wait_for(driver, action: dict, ctx: dict):
     sel     = action.get("selector")
-    timeout = float(action.get("timeout_sec", 10))
+    # Templates use both `timeout` and `timeout_sec` interchangeably —
+    # honour either rather than silently defaulting to 10s when the
+    # template author wrote `timeout: 30`.
+    timeout = float(action.get("timeout_sec", action.get("timeout", 10)))
     if not sel: return
+    by, value = _resolve_selector(sel)
     try:
         WebDriverWait(driver, timeout).until(
-            EC.presence_of_element_located((By.CSS_SELECTOR, sel))
+            EC.presence_of_element_located((by, value))
         )
         log.info(f"    → wait_for: {sel} appeared")
     except Exception:
@@ -1161,6 +1230,131 @@ def _act_execute_js(driver, action: dict, ctx: dict):
         log.warning(f"    execute_js failed: {e}")
 
 
+def _act_health_check_canary(driver, action: dict, ctx: dict):
+    """Sprint 4 — visit fingerprint detection sites, score the result,
+    save to profile_health. Sprint 6 — added every_n_runs gate.
+
+    Action params:
+      sites: list of site IDs (default ["sannysoft"]). Valid:
+             "sannysoft", "creepjs", "pixelscan".
+      timeout: navigation timeout per site in seconds (default 20).
+      settle_sec: wait time after onload before scraping (default 2).
+      every_n_runs: only run the canary every Nth finished run for
+        this profile. 0 / None = run every time (default). When set,
+        falls back to scheduler.canary_every_n_runs config if action
+        doesn't override. Lets script authors drop one canary step
+        into a per-ad pipeline without spamming detection sites on
+        every iteration.
+
+    Best-effort: each site visit + parse is independent — one failure
+    doesn't skip the rest. Results land in profile_health table; the
+    dashboard renders sparklines + drift alerts off that data.
+
+    Does NOT affect the surrounding script's main outcome — never
+    raises out, returns None on full failure (logged)."""
+    sites = action.get("sites") or ["sannysoft"]
+    if isinstance(sites, str):
+        sites = [s.strip() for s in sites.split(",") if s.strip()]
+    # RC-82: safe-parse — caller-provided strings shouldn't crash
+    # the action runner on type errors.
+    def _safe_float(v, default):
+        try: return float(v) if v not in (None, "") else default
+        except (TypeError, ValueError): return default
+    def _safe_int(v, default):
+        try: return int(v) if v not in (None, "") else default
+        except (TypeError, ValueError): return default
+    timeout      = _safe_float(action.get("timeout"),    20.0)
+    settle_sec   = _safe_float(action.get("settle_sec"),  2.0)
+    every_n_runs = _safe_int(action.get("every_n_runs"),  0)
+
+    profile_name = ctx.get("profile_name") or "unknown"
+
+    # Sprint 6: every-N-runs gate. Action param wins; fall back to
+    # global scheduler config. 0 / None = no gate (run every time).
+    try:
+        from ghost_shell.db.database import get_db
+        db_check = get_db()
+    except Exception as e:
+        log.debug(f"[health_canary] DB unavailable for gate: {e}")
+        db_check = None
+
+    if every_n_runs <= 0 and db_check is not None:
+        try:
+            cfg_n = db_check.config_get("scheduler.canary_every_n_runs")
+            if cfg_n is not None:
+                every_n_runs = _safe_int(cfg_n, 0)
+        except Exception:
+            pass
+
+    if every_n_runs > 0 and db_check is not None:
+        try:
+            count = db_check.runs_count_for_profile(profile_name,
+                                                    only_finished=True)
+            # Run when count is divisible by N. Count is finished runs
+            # only — the IN-FLIGHT current run isn't counted yet, so
+            # this fires on the iteration AFTER an Nth finish.
+            if count > 0 and (count % every_n_runs) != 0:
+                log.debug(
+                    f"[health_canary] gate skip: {count} finished runs "
+                    f"for {profile_name!r}, every_n_runs={every_n_runs} "
+                    f"({count % every_n_runs} mod {every_n_runs})"
+                )
+                return None
+            elif count == 0:
+                # First-ever run — go ahead, establish baseline
+                log.debug(
+                    f"[health_canary] gate pass (first run): "
+                    f"every_n_runs={every_n_runs}"
+                )
+        except Exception as e:
+            log.debug(f"[health_canary] gate check failed: {e}; running anyway")
+
+    try:
+        from ghost_shell.profile.health_canary import run_canary
+        results = run_canary(driver, sites=sites,
+                             navigation_timeout=timeout,
+                             settle_sec=settle_sec)
+    except Exception as e:
+        log.warning(f"[health_canary] orchestrator crashed: {e}")
+        return None
+
+    # Persist each site result to profile_health
+    profile_name = ctx.get("profile_name") or "unknown"
+    run_id       = ctx.get("run_id")
+    db = db_check  # reuse handle from gate check above
+
+    saved = 0
+    for r in results or []:
+        site = r.get("site") or "?"
+        if db is not None:
+            try:
+                db.profile_health_save(
+                    profile_name = profile_name,
+                    site         = site,
+                    run_id       = run_id,
+                    score        = r.get("score"),
+                    raw_score    = r.get("raw_score"),
+                    passed       = r.get("passed"),
+                    total        = r.get("total"),
+                    details      = r.get("details"),
+                    error        = r.get("error"),
+                )
+                saved += 1
+            except Exception as e:
+                log.debug(f"[health_canary] save({site}) failed: {e}")
+        # Per-site log line so the user sees progress in tail mode
+        if r.get("error"):
+            log.warning(
+                f"[health_canary] {site}: probe failed — {r['error']}"
+            )
+        else:
+            log.info(
+                f"[health_canary] {site}: score={r.get('score')} "
+                f"raw={r.get('raw_score')!r}"
+            )
+    log.info(f"[health_canary] saved {saved}/{len(results or [])} site results")
+
+
 def _act_screenshot(driver, action: dict, ctx: dict):
     """Save a screenshot to profiles/<n>/screenshots/<name>.png.
     The filename gets a timestamp suffix automatically to avoid clobbering
@@ -1369,6 +1563,9 @@ ACTION_HANDLERS: dict[str, Callable] = {
     "extract_text":       _act_extract_text,
     "execute_js":         _act_execute_js,
     "screenshot":         _act_screenshot,
+
+    # Health monitor (Sprint 4): visit detection sites + record scores
+    "health_check_canary": _act_health_check_canary,
     "wait_for_url":       _act_wait_for_url,
 
     # Ad-density inflater: pre-warm Google's commercial-intent

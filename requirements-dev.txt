@@ -1,0 +1,7 @@
+# Install on top of the regular requirements:
+#   pip install -r requirements-dev.txt
+#
+# (or)  pip install -e ".[dev]"   if you wire it into pyproject.toml
+
+pytest>=7.4
+pytest-cov>=4.1     # coverage reporting (optional but recommended)

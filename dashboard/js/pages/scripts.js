@@ -2942,20 +2942,42 @@ const ScriptsPage = {
             ${errors.length} template${errors.length>1?"s":""} failed to load: ${escapeHtml(errors.join("; "))}
           </div>` : ""}
           <div class="templates-grid">
-            ${templates.length ? templates.map(t => `
-              <div class="template-card" data-tpl="${escapeHtml(t.filename || t.name)}">
-                <div class="template-card-name">${escapeHtml(t.name)}</div>
-                <div class="template-card-desc">${escapeHtml(t.description || "")}</div>
-                <div class="template-card-meta">
-                  <span class="template-card-tag">${escapeHtml(t.category || "general")}</span>
-                  <span class="template-card-stat"><strong>${t.step_count || 0}</strong> steps</span>
-                </div>
-                ${(t.tags || []).length ? `<div class="template-card-tags">
-                  ${t.tags.map(tag => `<span class="template-tag">${escapeHtml(tag)}</span>`).join("")}
-                </div>` : ""}
-                <button class="btn btn-primary btn-sm template-use-btn">Use this</button>
-              </div>
-            `).join("") : `<div class="library-empty">No templates available.</div>`}
+            ${templates.length ? templates.map(t => {
+              // UX-C from sprint-9-scripts-audit: collapsible step
+              // preview. Each step renders as a one-liner so the
+              // user can eyeball the recipe before clicking Use.
+              const stepPreview = (Array.isArray(t.flow) ? t.flow : [])
+                .map((s, i) => {
+                  const tag  = (s.type || "?");
+                  const raw  = s.selector || s.url || s.text || s.code || "";
+                  const trimmed = String(raw).slice(0, 60);
+                  const snippet = raw ? ` · <code>${escapeHtml(trimmed)}${String(raw).length > 60 ? "…" : ""}</code>` : "";
+                  return `<li><strong>${i + 1}.</strong> ${escapeHtml(tag)}${snippet}</li>`;
+                }).join("");
+              return `
+                <div class="template-card" data-tpl="${escapeHtml(t.filename || t.name)}">
+                  <div class="template-card-name">${escapeHtml(t.name)}</div>
+                  <div class="template-card-desc">${escapeHtml(t.description || "")}</div>
+                  <div class="template-card-meta">
+                    <span class="template-card-tag">${escapeHtml(t.category || "general")}</span>
+                    <span class="template-card-stat"><strong>${t.step_count || 0}</strong> steps</span>
+                  </div>
+                  ${(t.tags || []).length ? `<div class="template-card-tags">
+                    ${t.tags.map(tag => `<span class="template-tag">${escapeHtml(tag)}</span>`).join("")}
+                  </div>` : ""}
+                  ${stepPreview ? `
+                    <details class="template-card-preview"
+                             style="margin: 8px 0; font-size: 12px;">
+                      <summary style="cursor:pointer; user-select:none; color: var(--accent, #8aa);">
+                        Show steps
+                      </summary>
+                      <ol style="margin: 8px 0 0; padding-left: 22px; line-height: 1.45;">
+                        ${stepPreview}
+                      </ol>
+                    </details>` : ""}
+                  <button class="btn btn-primary btn-sm template-use-btn">Use this</button>
+                </div>`;
+            }).join("") : `<div class="library-empty">No templates available.</div>`}
           </div>
         </div>
         <div class="profile-modal-footer">

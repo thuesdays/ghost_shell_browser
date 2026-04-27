@@ -442,6 +442,39 @@ CREATE TABLE IF NOT EXISTS profile_extensions (
     FOREIGN KEY (extension_id) REFERENCES extensions(id) ON DELETE CASCADE
 );
 CREATE INDEX IF NOT EXISTS idx_profext_profile ON profile_extensions(profile_name);
+
+
+-- ─── Health canary timeline ───────────────────────────────────
+-- Sprint 4: profile detection-fitness over time. The
+-- `health_check_canary` flow-action visits well-known fingerprint
+-- detection sites (bot.sannysoft.com, creepjs, pixelscan.net),
+-- parses the resulting score, and inserts one row per (profile,
+-- site) per check. The dashboard renders a sparkline per profile
+-- so users see "trust score is dropping over the last 7 days,
+-- profile is getting noticed" BEFORE captchas start firing.
+--
+-- Sites differ in scoring scale, so we store both a normalized
+-- 0..100 score (`score`) and the raw site-specific value
+-- (`raw_score`). Pass/fail counts (`passed`/`total`) are populated
+-- where the site exposes them (sannysoft has 14+ binary checks).
+-- `details` is JSON with parser-specific extras for forensic dives.
+CREATE TABLE IF NOT EXISTS profile_health (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    profile_name  TEXT NOT NULL,
+    run_id        INTEGER,                    -- NULL for manual canary runs
+    checked_at    TEXT NOT NULL,
+    site          TEXT NOT NULL,              -- 'sannysoft' | 'creepjs' | 'pixelscan'
+    score         INTEGER,                    -- normalized 0..100, NULL if parser couldnt extract
+    raw_score     TEXT,                       -- raw site-specific value
+    passed        INTEGER,                    -- pass count (sannysoft); NULL otherwise
+    total         INTEGER,                    -- total checks (sannysoft); NULL otherwise
+    details       TEXT,                       -- JSON blob with parser extras
+    error         TEXT,                       -- non-null when probe failed entirely
+    FOREIGN KEY (run_id) REFERENCES runs(id) ON DELETE SET NULL
+);
+CREATE INDEX IF NOT EXISTS idx_health_profile_time
+    ON profile_health(profile_name, checked_at DESC);
+CREATE INDEX IF NOT EXISTS idx_health_run ON profile_health(run_id);
 CREATE INDEX IF NOT EXISTS idx_profext_ext     ON profile_extensions(extension_id);
 
 -- ───────────────────────────────────────────────────────────────
@@ -1551,6 +1584,78 @@ class DB:
             (script_id,),
         ).fetchall()
         return [r["name"] for r in rows]
+
+    def runs_active_for_script(self, script_id: int) -> int:
+        """Sprint 9 (RC-A): count in-flight runs whose profile
+        currently resolves to ``script_id``. Drives the editor's
+        "N profiles running this script" banner so a user clicking
+        Save knows their change will affect ongoing iterations.
+
+        Counts runs with finished_at IS NULL joined against the
+        profiles table — a run is "active for script" when the
+        profile's CURRENT script_id matches OR the profile has no
+        script_id and this script is the default."""
+        conn = self._get_conn()
+        row = conn.execute(
+            """SELECT COUNT(*) AS n
+               FROM runs r
+               JOIN profiles p ON p.name = r.profile_name
+               LEFT JOIN scripts s ON s.is_default = 1
+               WHERE r.finished_at IS NULL
+                 AND (p.script_id = ?
+                      OR (p.script_id IS NULL AND s.id = ?))""",
+            (script_id, script_id),
+        ).fetchone()
+        return int(row["n"] if row else 0)
+
+    def script_pin_add(self, script_id: int, profile_name: str) -> bool:
+        """Sprint 9 (RC-B): add a single profile to the pinned set,
+        idempotent. Replaces the whole-list overwrite pattern that
+        had two-tab race conditions.
+
+        Returns True when the profile was newly added, False if it
+        was already pinned (or the script doesn't exist)."""
+        if not isinstance(profile_name, str) or not profile_name:
+            return False
+        sc = self.script_get(script_id)
+        if not sc:
+            return False
+        current = list(self.script_get_pinned(script_id))
+        if profile_name in current:
+            return False
+        current.append(profile_name)
+        self.script_set_pinned(script_id, current)
+        return True
+
+    def script_pin_remove(self, script_id: int, profile_name: str) -> bool:
+        """Sprint 9 (RC-B): remove a single profile, idempotent.
+        Returns True when removed, False when not present."""
+        if not isinstance(profile_name, str) or not profile_name:
+            return False
+        current = list(self.script_get_pinned(script_id))
+        if profile_name not in current:
+            return False
+        current = [p for p in current if p != profile_name]
+        self.script_set_pinned(script_id, current)
+        return True
+
+    def script_suggest_available_name(self, base_name: str,
+                                       max_suffix: int = 999) -> str:
+        """Sprint 9 (RC-D): given a desired script name, return the
+        first non-colliding variant ('Foo (2)', 'Foo (3)', ...). Used
+        by the create endpoint to respond with a friendly suggestion
+        when the chosen name is taken. Avoids ping-pong between
+        client and server."""
+        if not base_name:
+            base_name = "Untitled"
+        if not self.script_get_by_name(base_name):
+            return base_name
+        for n in range(2, max_suffix + 1):
+            candidate = f"{base_name} ({n})"
+            if not self.script_get_by_name(candidate):
+                return candidate
+        from datetime import datetime as _dt
+        return f"{base_name} {_dt.now().strftime('%H%M%S')}"
 
     def script_resolve_for_profile(self, profile_name: str) -> dict | None:
         """Runtime: which script should this profile use, if any.
@@ -3751,6 +3856,331 @@ class DB:
         )
         conn.commit()
 
+    # ──────────────────────────────────────────────────────────
+    # Profile health canary timeline
+    # ──────────────────────────────────────────────────────────
+
+    def profile_health_save(self, profile_name: str, site: str, *,
+                            run_id=None, score=None, raw_score=None,
+                            passed=None, total=None, details=None,
+                            error=None) -> int:
+        """Insert one row into profile_health. Returns the new row's id.
+
+        Sprint 4 (Health monitor canary): per-canary-visit record for
+        the ``profile_name``/``site`` pair. Score is normalized 0..100;
+        raw_score is the site-specific raw value (e.g. trust pct,
+        risk label).
+
+        Either ``score`` (success path) or ``error`` (failed probe)
+        should be populated; both can coexist on partial-success.
+        ``details`` is JSON-encoded if a dict is passed."""
+        from datetime import datetime as _dt
+        import json as _json
+        details_str = None
+        if details is not None:
+            details_str = (
+                _json.dumps(details, default=str)
+                if isinstance(details, (dict, list))
+                else str(details)
+            )
+        conn = self._get_conn()
+        with conn:
+            cur = conn.execute(
+                """INSERT INTO profile_health
+                   (profile_name, run_id, checked_at, site, score,
+                    raw_score, passed, total, details, error)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (profile_name, run_id,
+                 _dt.now().isoformat(timespec="seconds"),
+                 site, score, raw_score, passed, total,
+                 details_str, error),
+            )
+            return int(cur.lastrowid or 0)
+
+    def profile_health_recent(self, profile_name: str,
+                              days: int = 30, site: str = None,
+                              limit: int = 200) -> list[dict]:
+        """Return the most recent N canary rows for the profile.
+
+        Used by the dashboard's per-profile sparkline + the Overview
+        ``health drift`` alert (planned). Newest first.
+
+        Args:
+          profile_name: required.
+          days:         filter to checks within the last N days.
+                        ``0`` disables the date filter.
+          site:         filter to one site, or None for all.
+          limit:        cap row count (default 200, plenty for a
+                        sparkline of weekly canaries)."""
+        from datetime import datetime as _dt, timedelta as _td
+        sql = ("SELECT id, run_id, checked_at, site, score, raw_score, "
+               "passed, total, details, error "
+               "FROM profile_health WHERE profile_name = ?")
+        params = [profile_name]
+        if days and days > 0:
+            cutoff = (_dt.now() - _td(days=days)).isoformat(timespec="seconds")
+            sql += " AND checked_at >= ?"
+            params.append(cutoff)
+        if site:
+            sql += " AND site = ?"
+            params.append(site)
+        sql += " ORDER BY checked_at DESC LIMIT ?"
+        params.append(int(limit))
+        rows = self._get_conn().execute(sql, params).fetchall()
+        return [dict(r) for r in rows]
+
+    def profile_health_summary(self, profile_name: str,
+                               days: int = 7) -> dict:
+        """Compact aggregate for the profile detail card. Returns:
+
+            {
+              "latest":  {site: {score, checked_at}, ...},
+              "trend":   {site: "improving"|"flat"|"degrading"},
+              "n_total": int     # checks in the window
+            }
+
+        Trend is determined by linear regression on the last 5
+        scores per site — slope > +5 → improving, < -5 → degrading,
+        else flat. Empty / single-data-point trends are 'flat'."""
+        rows = self.profile_health_recent(profile_name, days=days, limit=500)
+        latest = {}
+        per_site_scores = {}
+        for r in rows:
+            site = r.get("site") or "?"
+            score = r.get("score")
+            if site not in latest:
+                latest[site] = {
+                    "score": score,
+                    "checked_at": r.get("checked_at"),
+                }
+            if score is not None:
+                per_site_scores.setdefault(site, []).append(score)
+        trend = {}
+        for site, scores in per_site_scores.items():
+            sample = list(reversed(scores[:5]))   # oldest -> newest
+            if len(sample) < 2:
+                trend[site] = "flat"
+                continue
+            # Simple slope: (last - first) / span. Robust enough.
+            slope = (sample[-1] - sample[0]) / max(1, len(sample) - 1)
+            if slope > 5:
+                trend[site] = "improving"
+            elif slope < -5:
+                trend[site] = "degrading"
+            else:
+                trend[site] = "flat"
+        return {
+            "latest":  latest,
+            "trend":   trend,
+            "n_total": len(rows),
+        }
+
+    def runs_captcha_history(self, profile_name: str,
+                             days: int = 30) -> list[dict]:
+        """Per-day captcha counts + run counts for a profile.
+
+        Real-workload signal: aggregates over actual monitor runs,
+        not synthetic detection-site visits. Captcha frequency is
+        the most direct measure of "is this profile getting flagged?"
+
+        Returns rows in date-ascending order (oldest → newest),
+        suitable for sparkline rendering. Days with zero runs are
+        omitted (no data point).
+
+        Schema:
+            [{date: 'YYYY-MM-DD',
+              run_count: int,
+              total_captchas: int,
+              captcha_rate: float},  # captchas / runs, 0..1
+             ...]
+        """
+        from datetime import datetime as _dt, timedelta as _td
+        cutoff = (_dt.now() - _td(days=max(1, days))).strftime("%Y-%m-%d")
+        rows = self._get_conn().execute(
+            """SELECT
+                   substr(started_at, 1, 10) AS day,
+                   COUNT(*)                  AS run_count,
+                   COALESCE(SUM(captchas), 0) AS total_captchas
+               FROM runs
+               WHERE profile_name = ?
+                 AND started_at >= ?
+                 AND finished_at IS NOT NULL
+               GROUP BY day
+               ORDER BY day ASC""",
+            (profile_name, cutoff),
+        ).fetchall()
+        out = []
+        for r in rows:
+            run_count = int(r["run_count"] or 0)
+            captchas  = int(r["total_captchas"] or 0)
+            rate = round(captchas / run_count, 3) if run_count > 0 else 0.0
+            out.append({
+                "date":           r["day"],
+                "run_count":      run_count,
+                "total_captchas": captchas,
+                "captcha_rate":   rate,
+            })
+        return out
+
+    def health_drift_profiles(self, days: int = 7,
+                              min_score_drop: int = 15,
+                              min_captcha_rate: float = 0.3) -> list[dict]:
+        """Find profiles whose health is trending DOWN or whose
+        captcha rate is high. Powers the Overview drift-alert banner.
+
+        Args:
+          days: window for trend computation.
+          min_score_drop: profiles whose canary score drops by this
+            many points (latest vs first-in-window) qualify.
+          min_captcha_rate: profiles with avg captcha rate above this
+            qualify too.
+
+        Returns: list of profiles with reason breakdown.
+            [{
+              "profile_name": str,
+              "reasons":      [str, ...],   # human-readable why
+              "health_score": int|None,
+              "captcha_rate": float,
+              "severity":     "warn"|"critical",
+            }, ...]
+
+        Sorted by severity (critical first), then by deepest drop.
+        """
+        from datetime import datetime as _dt, timedelta as _td
+
+        # Step 1: profiles with canary data in window
+        cutoff = (_dt.now() - _td(days=max(1, days))).isoformat(timespec="seconds")
+        rows = self._get_conn().execute(
+            """SELECT profile_name, score, checked_at
+               FROM profile_health
+               WHERE checked_at >= ? AND score IS NOT NULL
+               ORDER BY profile_name, checked_at ASC""",
+            (cutoff,),
+        ).fetchall()
+
+        per_profile_health: dict = {}
+        for r in rows:
+            per_profile_health.setdefault(r["profile_name"], []).append(r["score"])
+
+        # Step 2: profiles with finished runs in window for captcha rate
+        cap_rows = self._get_conn().execute(
+            """SELECT profile_name,
+                      COALESCE(SUM(captchas), 0) AS total_caps,
+                      COUNT(*) AS run_count
+               FROM runs
+               WHERE started_at >= ? AND finished_at IS NOT NULL
+               GROUP BY profile_name""",
+            (cutoff,),
+        ).fetchall()
+        per_profile_caps: dict = {}
+        for r in cap_rows:
+            run_count = int(r["run_count"] or 0)
+            caps      = int(r["total_caps"] or 0)
+            rate = caps / run_count if run_count > 0 else 0.0
+            per_profile_caps[r["profile_name"]] = (run_count, caps, rate)
+
+        # Step 3: classify each profile
+        out: list = []
+        all_profiles = set(per_profile_health) | set(per_profile_caps)
+        for name in all_profiles:
+            reasons = []
+            scores = per_profile_health.get(name, [])
+            health_score = scores[-1] if scores else None
+
+            # Health drift detection — first-vs-last in window
+            if len(scores) >= 2:
+                drop = scores[0] - scores[-1]
+                if drop >= min_score_drop:
+                    reasons.append(
+                        f"canary score dropped {scores[0]} → {scores[-1]} "
+                        f"(-{drop} pts) over {len(scores)} checks"
+                    )
+
+            # Captcha rate
+            run_count, caps, rate = per_profile_caps.get(name, (0, 0, 0.0))
+            if rate >= min_captcha_rate:
+                reasons.append(
+                    f"captcha rate {rate:.2f}/run "
+                    f"({caps} captchas across {run_count} runs)"
+                )
+
+            if not reasons:
+                continue
+
+            # Severity: critical if health_score < 50 OR captcha_rate >= 0.5
+            severity = "warn"
+            if (health_score is not None and health_score < 50) or rate >= 0.5:
+                severity = "critical"
+
+            out.append({
+                "profile_name": name,
+                "reasons":      reasons,
+                "health_score": health_score,
+                "captcha_rate": round(rate, 3),
+                "severity":     severity,
+            })
+
+        # Sort: critical first, then by composite "drift score"
+        def _sort_key(p):
+            sev_rank = 0 if p["severity"] == "critical" else 1
+            score    = p["health_score"] if p["health_score"] is not None else 50
+            return (sev_rank, score, -p["captcha_rate"])
+        out.sort(key=_sort_key)
+        return out
+
+    def runs_count_for_profile(self, profile_name: str,
+                                only_finished: bool = True) -> int:
+        """Total run count for a profile. Used by the canary action's
+        every-N-runs gate (Sprint 6)."""
+        sql = "SELECT COUNT(*) FROM runs WHERE profile_name = ?"
+        if only_finished:
+            sql += " AND finished_at IS NOT NULL"
+        row = self._get_conn().execute(sql, (profile_name,)).fetchone()
+        return int(row[0]) if row else 0
+
+    def runs_captcha_summary(self, profile_name: str,
+                             days: int = 7) -> dict:
+        """Compact 7d/30d summary suitable for the profile card header.
+
+        Returns:
+            {
+              "total_runs":     int,
+              "total_captchas": int,
+              "avg_rate":       float,        # captchas/run over window
+              "trend":          "improving"|"flat"|"degrading",
+            }
+
+        Trend = compare avg rate of first half vs second half of window.
+        Higher rate = worse → reverse the comparison so 'improving'
+        means rate dropping."""
+        history = self.runs_captcha_history(profile_name, days=days)
+        if not history:
+            return {"total_runs": 0, "total_captchas": 0,
+                    "avg_rate": 0.0, "trend": "flat"}
+        total_runs = sum(h["run_count"] for h in history)
+        total_caps = sum(h["total_captchas"] for h in history)
+        avg_rate = round(total_caps / total_runs, 3) if total_runs else 0.0
+        trend = "flat"
+        if len(history) >= 4:
+            mid = len(history) // 2
+            first_half  = history[:mid]
+            second_half = history[mid:]
+            r1_runs = sum(h["run_count"] for h in first_half) or 1
+            r2_runs = sum(h["run_count"] for h in second_half) or 1
+            r1 = sum(h["total_captchas"] for h in first_half)  / r1_runs
+            r2 = sum(h["total_captchas"] for h in second_half) / r2_runs
+            # Lower rate = better. trend reflects directional change.
+            if r2 < r1 - 0.1:
+                trend = "improving"
+            elif r2 > r1 + 0.1:
+                trend = "degrading"
+        return {
+            "total_runs":     total_runs,
+            "total_captchas": total_caps,
+            "avg_rate":       avg_rate,
+            "trend":          trend,
+        }
+
     def profile_meta_delete(self, name: str) -> None:
         """Remove a profile's metadata row. Called when the whole
         profile is being deleted — group memberships cascade via FK."""
@@ -3821,6 +4251,7 @@ class DB:
                 ("warmup_runs",            "profile_name"),
                 ("action_events",          "profile_name"),
                 ("traffic_stats",          "profile_name"),
+                ("profile_health",         "profile_name"),  # Sprint 4
                 ("profile_group_members",  "profile_name"),
                 ("profiles",               "name"),
             ]:

@@ -770,13 +770,29 @@ class GhostShellBrowser:
     def _lock_heartbeat_loop(self):
         """Daemon body — touches the lock every refresh interval until
         signalled to stop OR a heartbeat write fails (lock claimed by
-        someone else / file deleted by close)."""
+        someone else / file deleted by close).
+
+        Sprint 3.1 bridge: also refresh runs.heartbeat_at so the DB-
+        level liveness classification (process_reaper.classify_run_liveness)
+        sees a consistent picture across the two heartbeat mechanisms.
+        The DB write is best-effort — if it fails (DB locked, run_id
+        not yet assigned for early-failure paths), we log and keep
+        refreshing the file lock."""
         while not self._lock_heartbeat_stop.wait(LOCK_HEARTBEAT_REFRESH_SEC):
             if not self._gs_lock_path:
                 return
             ok = _heartbeat_gs_lock(self._gs_lock_path)
             if not ok:
                 return
+            # Mirror to DB heartbeat — best effort, never raise out
+            try:
+                if getattr(self, "run_id", None):
+                    from ghost_shell.db.database import get_db
+                    get_db().run_heartbeat(self.run_id)
+            except Exception as _e:
+                logging.debug(
+                    f"[GhostShellBrowser] DB heartbeat mirror skipped: {_e}"
+                )
 
     def _stop_lock_heartbeat(self):
         """Signal the heartbeat loop to exit and wait briefly."""
