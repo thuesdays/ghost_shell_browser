@@ -7736,4 +7736,113 @@ if __name__ == "__main__":
     _phase("ok    : orphan keys cleaned")
 
     # One-shot pool repair: walk every extension in data/extensions_pool/
-    # 
+    # and apply _ensure_default_locale + _sanitize_match_patterns to its
+    # manifest. Fixes pool entries installed before those checks landed
+    # so the user doesn't have to re-install. Runs synchronously on
+    # startup; cheap (~10ms per extension).
+    _phase("init  : extension pool manifest repair")
+    try:
+        from ghost_shell.extensions.pool import (
+            parse_manifest, _ensure_default_locale,
+            _sanitize_match_patterns, _ensure_required_fields,
+        )
+        import json as _json_repair
+        rows = _db_boot.extension_list()
+        repaired = 0
+        for r in rows:
+            pp = r.get("pool_path")
+            if not pp or not os.path.isdir(pp):
+                continue
+            mf_path = os.path.join(pp, "manifest.json")
+            try:
+                manifest = parse_manifest(mf_path)
+                if not manifest:
+                    continue
+                before = _json_repair.dumps(manifest, sort_keys=True)
+                _ensure_default_locale(pp, manifest)
+                _ensure_required_fields(pp, manifest)
+                _sanitize_match_patterns(manifest)
+                after = _json_repair.dumps(manifest, sort_keys=True)
+                if before != after:
+                    with open(mf_path, "w", encoding="utf-8") as _f:
+                        _json_repair.dump(manifest, _f,
+                                          ensure_ascii=False, indent=2)
+                    repaired += 1
+                    print(f"[startup] repaired manifest for "
+                          f"{r.get('name') or r.get('id')}")
+            except Exception as _e:
+                print(f"[startup] repair skipped for {r.get('id')}: {_e}")
+        if repaired:
+            print(f"[startup] extension pool: repaired {repaired} manifest(s)")
+    except Exception as e:
+        print(f"[startup] pool repair pass skipped: {e}")
+    _phase("ok    : extension pool repair done")
+
+    # Traffic-stats retention cleanup — deletes rows older than
+    # traffic.retention_days (default 90). Runs once at startup; the
+    # background traffic collectors don't need a periodic task beyond
+    # this because writes are bounded (~50 rows/hour per profile).
+    _phase("init  : traffic_cleanup")
+    try:
+        retention = int(_db_boot.config_get("traffic.retention_days") or 90)
+        if retention > 0:
+            deleted = _db_boot.traffic_cleanup(retention_days=retention)
+            if deleted > 0:
+                print(f"[startup] Cleaned up {deleted} traffic rows older than "
+                      f"{retention} days")
+    except Exception as e:
+        print(f"[startup] traffic cleanup skipped: {e}")
+    _phase("ok    : traffic_cleanup done")
+
+    port = int(os.environ.get("PORT", 5000))
+    url  = f"http://127.0.0.1:{port}"
+    print("╔" + "═"*58 + "╗")
+    print("║  Ghost Shell Dashboard                                    ║")
+    print(f"║  → {url:<55}║")
+    print("║  Ctrl+C to stop                                           ║")
+    print("╚" + "═"*58 + "╝" + "\n")
+
+    # ────────────────────────────────────────────────────────────
+    # Runtime metadata for the installer / external supervisors.
+    #
+    # Writes %LOCALAPPDATA%\GhostShellAnty\runtime.json with our PID,
+    # bind port, and a one-shot shutdown token. The Inno Setup updater
+    # reads this file to (a) confirm the dashboard is running and (b)
+    # call POST /api/admin/shutdown gracefully before replacing files.
+    #
+    # The file is removed on graceful exit, but if we crash it sticks
+    # around — that's why is_pid_alive() is used on the installer side
+    # to disambiguate "stale file" from "really running".
+    # ────────────────────────────────────────────────────────────
+    try:
+        info = gs_runtime.write_runtime_info(
+            port=port,
+            install_dir=PROJECT_ROOT,
+        )
+        _SHUTDOWN_TOKEN = info["shutdown_token"]
+        print(f"[startup] runtime info → {gs_runtime.runtime_path('runtime.json')}")
+
+        import atexit as _atexit
+        _atexit.register(gs_runtime.clear_runtime_info)
+    except Exception as e:
+        # Non-fatal: dashboard still serves even if we can't write the
+        # runtime file. The installer will fall back to taskkill on PID
+        # discovery via process enumeration.
+        print(f"[startup] couldn't write runtime info: {e}")
+
+    # Auto-open the dashboard in the user's default browser.
+    # Disable via env: GHOST_SHELL_NO_BROWSER=1 (useful for headless hosts).
+    if os.environ.get("GHOST_SHELL_NO_BROWSER") != "1":
+        import webbrowser, threading, time as _t
+        def _open_after_ready():
+            # Wait briefly so Flask is actually listening before we hit it
+            _t.sleep(1.2)
+            try:
+                webbrowser.open(url)
+            except Exception as e:
+                print(f"[warn] couldn't auto-open browser: {e}")
+        threading.Thread(target=_open_after_ready, daemon=True).start()
+
+    # Final hand-off to Flask's dev server. Threaded so multiple HTTP
+    # clients (dashboard tabs + SSE streams) can be served concurrently.
+    app.run(host="127.0.0.1", port=port, debug=False, threaded=True)

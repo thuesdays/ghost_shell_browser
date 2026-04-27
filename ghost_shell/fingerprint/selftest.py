@@ -208,6 +208,145 @@ PROBE_SCRIPT = r"""
         result.fonts = detected;
     } catch (e) { errors.push("fonts: " + e.message); }
 
+    // ---- Sprint 11: C++ stealth-patch active-checks ----
+    //
+    // Each block collects raw signals that prove (or disprove) one
+    // Tier-2 patch is firing in this browser process. The validator
+    // (validator.py) compares against expectations; the JS side just
+    // gathers raw observations.
+
+    // Canvas noise — render a deterministic ops sequence twice; if the
+    // patch is firing, both renders carry the same noise (because the
+    // noise is keyed by (profile_seed, x, y)) and both hashes match.
+    // If they differ, the patch generated non-deterministic noise, OR
+    // is interacting with a non-deterministic Skia path. Either way,
+    // a red flag.
+    try {
+        const canvasHash = (cnv) => {
+            const ctx = cnv.getContext('2d');
+            const data = ctx.getImageData(0, 0, cnv.width, cnv.height).data;
+            let h = 0x811c9dc5;             // FNV-1a 32-bit
+            for (let i = 0; i < data.length; i++) {
+                h ^= data[i];
+                h = (h * 0x01000193) >>> 0;
+            }
+            return h.toString(16).padStart(8, '0');
+        };
+        const drawProbe = () => {
+            const c = document.createElement('canvas');
+            c.width = 220; c.height = 60;
+            const x = c.getContext('2d');
+            x.fillStyle = '#f60';      x.fillRect(0, 0, 220, 60);
+            x.fillStyle = '#069';      x.font = '20px Arial';
+            x.fillText('Ghost Shell 0.3.0', 4, 24);
+            x.strokeStyle = 'rgba(0,0,255,0.7)';
+            x.beginPath(); x.arc(110, 35, 18, 0, Math.PI * 2); x.stroke();
+            return c;
+        };
+        const c1 = drawProbe();
+        const c2 = drawProbe();
+        result.cpp_canvas = {
+            hash_a:    canvasHash(c1),
+            hash_b:    canvasHash(c2),
+            data_url:  c1.toDataURL().slice(-32),  // tail for sparse logging
+        };
+    } catch (e) { errors.push("cpp_canvas: " + e.message); }
+
+    // WebRTC ICE filter — open a peer connection, gather candidates for
+    // up to 1.5 seconds, classify them. With --webrtc-public-only the
+    // host_count must be zero. Without it, on a wired box, host_count
+    // is typically >= 1 (ethernet adapter).
+    try {
+        const counts = await new Promise(resolve => {
+            const tally = { host: 0, srflx: 0, relay: 0, prflx: 0, total: 0 };
+            let pc;
+            try {
+                pc = new RTCPeerConnection({iceServers: []});
+            } catch (e) {
+                resolve(tally);
+                return;
+            }
+            pc.createDataChannel('probe');
+            pc.onicecandidate = (e) => {
+                if (!e.candidate) return;
+                tally.total++;
+                const cand = e.candidate.candidate || '';
+                const m = cand.match(/typ\s+(host|srflx|relay|prflx)/);
+                if (m) tally[m[1]]++;
+            };
+            pc.createOffer().then(o => pc.setLocalDescription(o)).catch(()=>{});
+            // Generous timeout: host candidates fire fast, srflx/relay
+            // can take a beat if STUN is configured.
+            setTimeout(() => {
+                try { pc.close(); } catch (_) {}
+                resolve(tally);
+            }, 1500);
+        });
+        result.cpp_webrtc = counts;
+    } catch (e) { errors.push("cpp_webrtc: " + e.message); }
+
+    // Font privacy budget — count "obscure" fonts visible to the
+    // canvas-measurement detection trick. A patched build with budget
+    // active sees a smaller subset; an unpatched build sees the host's
+    // full installation.
+    try {
+        const probeList = [
+            "Arial Black", "Bahnschrift", "Bookman Old Style", "Calibri",
+            "Cambria", "Candara", "Cascadia Code", "Centaur", "Century",
+            "Colonna MT", "Consolas", "Constantia", "Corbel", "Courier New",
+            "Ebrima", "Engravers MT", "Eras Bold ITC", "Felix Titling",
+            "Footlight MT Light", "Forte", "Franklin Gothic Book",
+            "Freestyle Script", "Garamond", "Georgia", "Gigi", "Gill Sans MT",
+            "Goudy Old Style", "Haettenschweiler", "Harlow Solid Italic",
+            "High Tower Text", "Impact", "Imprint MT Shadow",
+            "Informal Roman", "Javanese Text", "Jokerman", "Juice ITC",
+            "Kristen ITC", "Kunstler Script", "Lucida Bright",
+            "MV Boli", "Magneto", "Maiandra GD", "Matura MT Script Capitals",
+            "Mistral", "Modern No. 20", "Mongolian Baiti", "Niagara Solid",
+            "Old English Text MT", "Onyx", "Palatino Linotype", "Papyrus",
+            "Parchment", "Perpetua", "Playbill", "Pristina", "Rage Italic",
+            "Ravie", "Rockwell", "Script MT Bold", "Segoe UI",
+            "Showcard Gothic", "Snap ITC", "Stencil", "Sylfaen", "Tahoma",
+            "Tempus Sans ITC", "Times New Roman", "Trebuchet MS", "Tw Cen MT",
+            "Verdana", "Viner Hand ITC", "Vivaldi", "Vladimir Script",
+            "Wide Latin",
+        ];
+        const span = document.createElement('span');
+        span.style.cssText =
+            'visibility:hidden;position:absolute;font-size:64px;';
+        span.innerText = "mmmwwwAEFGHILMOPQRTU0123456789";
+        document.body.appendChild(span);
+        const baseRefs = ["serif", "sans-serif", "monospace"];
+        const refs = {};
+        for (const b of baseRefs) {
+            span.style.fontFamily = b;
+            refs[b] = { w: span.offsetWidth, h: span.offsetHeight };
+        }
+        let visibleCount = 0;
+        const visibleNames = [];
+        for (const f of probeList) {
+            let detected = false;
+            for (const b of baseRefs) {
+                span.style.fontFamily = `"${f}",${b}`;
+                if (span.offsetWidth !== refs[b].w ||
+                    span.offsetHeight !== refs[b].h) {
+                    detected = true;
+                    break;
+                }
+            }
+            if (detected) {
+                visibleCount++;
+                visibleNames.push(f);
+            }
+        }
+        document.body.removeChild(span);
+        result.cpp_fonts = {
+            probed:        probeList.length,
+            visible_count: visibleCount,
+            visible_names: visibleNames.slice(0, 12),
+        };
+    } catch (e) { errors.push("cpp_fonts: " + e.message); }
+
     // ---- Misc ----
     try {
         result.plugins = Array.from(navigator.plugins || []).map(p => p.name);

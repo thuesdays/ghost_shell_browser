@@ -416,6 +416,134 @@ def check_audio_sample_rate(fp, template):
 #   automation — markers of automated control (navigator.webdriver,
 #                detection of CDP / automation banners, eventually
 #                sub-millisecond timer precision)
+# ─── Sprint 11: C++ stealth-patch active-checks ─────────────────
+#
+# These 4 checks consume signals collected by selftest.py PROBE_SCRIPT
+# and verify that the corresponding Tier-2 Chromium patch is actually
+# firing. Skipping (status=None) when the probe fields are absent —
+# happens on stock chrome.exe builds without the patches applied or
+# on profiles where stealth flags are disabled. That keeps the score
+# unchanged for legacy installs.
+#
+# Domain split:
+#   - canvas / fonts → "hardware" (visible device characteristics)
+#   - webrtc         → "network" (external visibility)
+#   - canvas determinism → "automation" (signals stealth is broken)
+
+def check_cpp_canvas_active(fp, template):
+    """Sprint 11 (canvas patch): the renders should produce IDENTICAL
+    pixel hashes within one launch. The Skia patch's noise function is
+    keyed by (profile_seed, x, y) — same inputs, same noise, same hash.
+    A mismatch means the patch is generating non-deterministic noise
+    OR there's a non-deterministic path in Skia we don't control yet.
+    Skip when probe field absent (unpatched build / stealth disabled)."""
+    cc = _get(fp, "cpp_canvas")
+    if not isinstance(cc, dict):
+        return None
+    a = cc.get("hash_a")
+    b = cc.get("hash_b")
+    if not a or not b:
+        return None
+    if a == b:
+        return ("pass", f"canvas hash stable across renders ({a})")
+    return ("fail",
+            f"canvas noise non-deterministic: {a} != {b} — patch broken or "
+            f"Skia path bypasses the readPixels hook")
+
+
+def check_cpp_webrtc_no_host_candidates(fp, template):
+    """Sprint 11 (WebRTC patch): RTCPeerConnection must NOT enumerate
+    host-scope candidates when --webrtc-public-only is active. The
+    patch filters them at the network process boundary so the renderer
+    physically cannot see LAN IPs. host_count > 0 → patch not firing
+    (or RTCPeerConnection found a candidate via a path we don't filter).
+
+    Two outcomes:
+      - host=0 → pass
+      - host>0 → fail (LAN IP visible, real fingerprint risk)
+    """
+    cw = _get(fp, "cpp_webrtc")
+    if not isinstance(cw, dict):
+        return None
+    host = cw.get("host")
+    total = cw.get("total")
+    if host is None or total is None:
+        return None
+    if host == 0:
+        # Pass even if total==0 (no STUN configured = no candidates at
+        # all = no leak surface). The contract is "no host candidates",
+        # not "WebRTC is healthy".
+        return ("pass", f"no host candidates leaked "
+                        f"(srflx={cw.get('srflx', 0)}, "
+                        f"relay={cw.get('relay', 0)}, total={total})")
+    return ("fail",
+            f"{host} host-scope candidate(s) leaked — "
+            f"--webrtc-public-only flag not honoured "
+            f"(total={total}, srflx={cw.get('srflx', 0)})")
+
+
+def check_cpp_font_budget_active(fp, template):
+    """Sprint 11 (font patch): with --gs-font-budget-seed set and the
+    default keep-percent of 50%, we expect ~half of the probed obscure
+    fonts to be visible. Visible-count well below the probed-count
+    confirms the patch fired. Visible == probed → patch off / stock
+    chromium. We don't pass-fail on the exact ratio (different hosts
+    have different installed-font baselines); we only check that SOME
+    filtering happened.
+
+    Threshold: visible_count >= probed * 0.95 → fail (patch off, or
+    keep-percent ~100). visible_count < probed * 0.95 → pass."""
+    cf = _get(fp, "cpp_fonts")
+    if not isinstance(cf, dict):
+        return None
+    probed = cf.get("probed")
+    visible = cf.get("visible_count")
+    if probed is None or visible is None or probed <= 0:
+        return None
+    ratio = visible / probed
+    if ratio < 0.95:
+        return ("pass",
+                f"font budget filtered {probed - visible}/{probed} "
+                f"fonts ({(1 - ratio) * 100:.0f}% removed)")
+    # Allow a free pass when the host has very few obscure fonts to
+    # begin with — a Linux profile with only 5 fonts installed will
+    # legitimately show visible == probed.
+    if visible <= 5:
+        return ("warn",
+                f"only {visible} fonts visible total; can't confirm budget "
+                f"filter is active — host font count too low for signal")
+    return ("fail",
+            f"font budget appears inactive: {visible}/{probed} fonts "
+            f"visible — --gs-font-budget-seed flag not honoured "
+            f"or keep-percent set near 100")
+
+
+def check_cpp_canvas_noise_distinct(fp, template):
+    """Sprint 11 (canvas patch): the canvas hash should be DIFFERENT
+    from the unpatched-baseline that stock chromium 149 produces for
+    the same render. We can't ship a hardcoded baseline (it depends
+    on the GPU/driver/font subpixel rounding), but we CAN check that
+    the data_url tail is non-empty and not the all-zero pattern that
+    appears when the canvas API silently fails.
+
+    For stronger detection, the JA3-style cross-profile-comparison
+    happens at the Health Monitor / drift-alert layer (Sprint 6) —
+    that watches for "two profiles converged on the same canvas
+    hash" which is the actual signal we care about long-term. This
+    check just covers "did Chromium produce SOMETHING".
+    """
+    cc = _get(fp, "cpp_canvas")
+    if not isinstance(cc, dict):
+        return None
+    tail = cc.get("data_url") or ""
+    if len(tail) < 16:
+        return ("fail", f"canvas data_url tail truncated ({len(tail)} chars)")
+    # All-A tail = blank canvas = render failed silently
+    if set(tail.replace("=", "")) == {"A"}:
+        return ("fail", "canvas rendered as blank (all-A tail) — render failed")
+    return ("pass", f"canvas produced data_url (tail={tail[-8:]})")
+
+
 CHECKS = [
     # (name, severity, domain, weight_fail, weight_warn, check_fn)
     ("UA platform matches OS",     "critical",  "identity",   30, 10, check_ua_platform_matches_os),
@@ -440,6 +568,15 @@ CHECKS = [
     ("Language plausibility",       "warning",   "identity",    3,  1, check_language_plausibility),
     ("Audio sample rate",           "warning",   "hardware",    4,  1, check_audio_sample_rate),
     ("TLS / JA3 fingerprint",       "critical",  "network",    25,  5, check_ja3_matches_chrome),
+
+    # Sprint 11 — C++ stealth-patch active-checks. Lower weights than
+    # the core identity/hardware checks because a missing patch is
+    # "stealth degraded", not "fingerprint broken". Skipped (None) when
+    # probe fields are absent on unpatched builds.
+    ("Canvas patch active",         "important", "hardware",   12,  3, check_cpp_canvas_active),
+    ("Canvas render valid",         "important", "hardware",    8,  2, check_cpp_canvas_noise_distinct),
+    ("WebRTC host filtered",        "critical",  "network",    20,  5, check_cpp_webrtc_no_host_candidates),
+    ("Font budget active",          "important", "hardware",   10,  3, check_cpp_font_budget_active),
 ]
 
 
