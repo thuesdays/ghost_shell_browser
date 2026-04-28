@@ -162,13 +162,12 @@ const SimpleFontData* FontCache::GetFontData(
     if (!allowed.empty()) {
       bool found = false;
       for (const String& allowed_name : allowed) {
-        if (EqualIgnoringAsciiCase(allowed_name, family)) { // <-- ИСПРАВЛЕНО (AsciiCase)
+        if (EqualIgnoringAsciiCase(allowed_name, family)) {
           found = true;
           break;
         }
       }
       if (!found) {
-        // Пропускаем generic families без выделения памяти под новую строку (без LowerASCII)
         if (!EqualIgnoringAsciiCase(family, "serif") &&
             !EqualIgnoringAsciiCase(family, "sans-serif") &&
             !EqualIgnoringAsciiCase(family, "monospace") &&
@@ -410,3 +409,4 @@ FontFallbackMap& FontCache::GetFontFallbackMap() {
 }
 
 }  // namespace blink
+                                                                                                                                                                                   

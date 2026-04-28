@@ -1090,6 +1090,11 @@ const CreateProfileModal = {
     });
     rebind("np-preview-btn", "click", () => this.preview());
     rebind("np-create-btn",  "click", () => this.create());
+    // Proxy dropdown — re-bind on every open to wire the change handler.
+    // The select itself is preserved; only the change listener is fresh.
+    rebind("np-proxy-select", "change", (e) => {
+      this._onProxySelectChange(e.target.value);
+    });
 
     // Live preview reset if any field changes
     ["np-name", "np-template", "np-language"].forEach(id => {
@@ -1154,8 +1159,73 @@ const CreateProfileModal = {
     $("#np-preview-panel").style.display = "none";
     $("#np-preview-panel").innerHTML = "";
 
+    // Reload proxies into the dropdown EVERY open. Proxies the user
+    // adds on the Proxy page should appear without reloading the
+    // dashboard. Also resets the dropdown to "inherit global" and
+    // hides the custom URL field.
+    await this._loadProxiesIntoSelect();
+    const proxyInput = $("#np-proxy");
+    if (proxyInput) {
+      proxyInput.value = "";
+      proxyInput.style.display = "none";
+    }
+
     modal.style.display = "flex";
     setTimeout(() => $("#np-name").focus(), 50);
+  },
+
+  async _loadProxiesIntoSelect() {
+    const sel = $("#np-proxy-select");
+    if (!sel) return;
+    // Build the fixed-position options first; library proxies go in
+    // between so the user always has the inherit/custom escape hatches
+    // visible at the top and bottom of the list.
+    const inheritOpt = `<option value="">— inherit global proxy —</option>`;
+    const customOpt  = `<option value="__custom__">Custom URL…</option>`;
+    let libraryOpts  = "";
+    try {
+      const resp = await api("/api/proxies");
+      const list = resp?.proxies || resp || [];
+      // Cache for create() — we resolve id → URL there if the user
+      // picks a library proxy. This avoids a second roundtrip on submit.
+      this._proxyCache = {};
+      for (const p of list) {
+        this._proxyCache[String(p.id)] = p;
+      }
+      libraryOpts = list.map(p => {
+        // Compose a label: name (host:port · type · country)
+        const name = p.name || p.url || `proxy #${p.id}`;
+        const meta = [];
+        if (p.host && p.port) meta.push(`${p.host}:${p.port}`);
+        else if (p.url)        meta.push(p.url);
+        if (p.type)           meta.push(p.type.toUpperCase());
+        if (p.last_country)   meta.push(p.last_country);
+        if (p.is_rotating)    meta.push("rotating");
+        const metaStr = meta.length ? ` — ${meta.join(" · ")}` : "";
+        return `<option value="${p.id}">${escapeHtml(name)}${escapeHtml(metaStr)}</option>`;
+      }).join("");
+    } catch (e) {
+      console.warn("Could not load proxies for create-profile dropdown", e);
+      libraryOpts = "";
+    }
+    sel.innerHTML = inheritOpt + libraryOpts + customOpt;
+    sel.value = "";
+  },
+
+  _onProxySelectChange(value) {
+    // Show the free-text input only when the user explicitly chose
+    // "Custom URL…". For library proxies we'll send proxy_id straight
+    // to the backend; for "inherit", neither field is sent.
+    const proxyInput = $("#np-proxy");
+    if (!proxyInput) return;
+    if (value === "__custom__") {
+      proxyInput.style.display = "";
+      proxyInput.value = "";
+      setTimeout(() => proxyInput.focus(), 30);
+    } else {
+      proxyInput.style.display = "none";
+      proxyInput.value = "";
+    }
   },
 
   close() {
@@ -1218,7 +1288,20 @@ const CreateProfileModal = {
     const language  = $("#np-language").value;
     const enrich    = $("#np-enrich").checked;
     const openAfter = $("#np-open-after")?.checked ?? true;
+
+    // Three-way proxy decision based on the dropdown:
+    //   ""             → inherit global (don't send proxy_url or proxy_id)
+    //   "__custom__"   → send proxy_url from the now-visible text input
+    //   "<id>"         → send proxy_id, backend resolves it to URL
+    const proxySel  = ($("#np-proxy-select")?.value || "").trim();
     const proxyUrl  = ($("#np-proxy")?.value || "").trim();
+    let proxyId = null;
+    let outboundUrl = "";
+    if (proxySel === "__custom__") {
+      outboundUrl = proxyUrl;
+    } else if (proxySel) {
+      proxyId = parseInt(proxySel, 10) || null;
+    }
 
     if (!name) {
       toast("Name is required", true);
@@ -1231,11 +1314,19 @@ const CreateProfileModal = {
     }
     // Light client-side validation of the proxy URL — server does the
     // authoritative check. This catches the most common typos before we
-    // round-trip a creation.
-    if (proxyUrl && !/^(https?|socks5):\/\//i.test(proxyUrl)) {
-      toast("Proxy URL must start with http://, https:// or socks5://", true);
-      $("#np-proxy").focus();
-      return;
+    // round-trip a creation. Only applies to the "Custom URL…" branch;
+    // library-picked proxies are server-validated.
+    if (proxySel === "__custom__") {
+      if (!outboundUrl) {
+        toast("Enter a proxy URL or pick from the dropdown", true);
+        $("#np-proxy").focus();
+        return;
+      }
+      if (!/^(https?|socks5):\/\//i.test(outboundUrl)) {
+        toast("Proxy URL must start with http://, https:// or socks5://", true);
+        $("#np-proxy").focus();
+        return;
+      }
     }
 
     const btn = $("#np-create-btn");
@@ -1243,10 +1334,12 @@ const CreateProfileModal = {
     btn.textContent = "⏳ Creating…";
 
     try {
+      const body = { name, template, language, enrich };
+      if (proxyId)         body.proxy_id  = proxyId;
+      else if (outboundUrl) body.proxy_url = outboundUrl;
       const r = await api("/api/profiles", {
         method: "POST",
-        body: JSON.stringify({ name, template, language, enrich,
-                               proxy_url: proxyUrl || undefined }),
+        body: JSON.stringify(body),
       });
       if (!r.ok) {
         toast(r.error || "create failed", true);

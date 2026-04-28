@@ -637,15 +637,74 @@ def ensure_profile_ready_to_launch(db, profile_name: str) -> Optional[str]:
     """
     try:
         if hasattr(db, "profile_is_ready") and not db.profile_is_ready(profile_name):
-            return (
-                f"profile '{profile_name}' is not ready yet "
-                f"(setup pipeline incomplete — likely a bulk-create "
-                f"in progress). Wait a moment and try again."
-            )
+            # SELF-HEAL: a row with ready_at=NULL doesn't always mean
+            # "bulk-create in progress" — the historical single-create
+            # path forgot to call profile_mark_ready, so any profile
+            # created via the dashboard's Create Profile modal AND
+            # given a proxy ended up stuck in this state forever. Same
+            # for any profile created before the readiness column was
+            # introduced and then later edited (which causes
+            # profile_meta_upsert to insert a fresh row with ready_at
+            # NULL).
+            #
+            # Heuristic for "actually ready, just not stamped":
+            #   • fingerprint exists in DB              (setup ran)
+            #   • profile dir exists on disk            (validator ran)
+            # Bulk-create's intermediate states have neither — there's
+            # no fingerprint until step 4 of the pipeline, and no dir
+            # until step 6. So this self-heal can't accidentally
+            # green-light an actually-mid-pipeline profile.
+            if _looks_setup_complete(db, profile_name):
+                try:
+                    if hasattr(db, "profile_mark_ready"):
+                        db.profile_mark_ready(profile_name)
+                    logging.info(
+                        f"[ProcessReaper] self-heal: profile "
+                        f"'{profile_name}' had ready_at=NULL but "
+                        f"fingerprint+dir exist — marked ready, "
+                        f"proceeding with launch"
+                    )
+                except Exception as _hh:
+                    logging.debug(
+                        f"[ProcessReaper] self-heal mark-ready failed: {_hh}"
+                    )
+            else:
+                return (
+                    f"profile '{profile_name}' is not ready yet "
+                    f"(setup pipeline incomplete — likely a bulk-create "
+                    f"in progress). Wait a moment and try again."
+                )
     except Exception as e:
         # Don't break legacy DBs that lack the column — log and proceed
         logging.debug(f"[ProcessReaper] ready check skipped: {e}")
     return ensure_no_live_run_for_profile(db, profile_name)
+
+
+def _looks_setup_complete(db, profile_name: str) -> bool:
+    """Best-effort detection of "profile setup actually finished, just
+    not stamped ready". Used by the self-heal branch above. Returns
+    True only if BOTH the fingerprint row and the on-disk profile dir
+    exist — bulk-create's earlier pipeline steps don't leave both.
+    """
+    try:
+        fp = db.fingerprint_get(profile_name) if hasattr(db, "fingerprint_get") else None
+        if not fp:
+            return False
+    except Exception:
+        return False
+    try:
+        # Look up the canonical profile dir relative to the project
+        # root. Reaper module doesn't import dashboard config, so we
+        # mirror the layout dashboard uses (profiles/<name>) relative
+        # to the package root.
+        import os as _os
+        from pathlib import Path as _P
+        # ghost_shell/core/process_reaper.py → repo root = parents[2]
+        repo_root = _P(__file__).resolve().parents[2]
+        profile_dir = repo_root / "profiles" / profile_name
+        return profile_dir.is_dir()
+    except Exception:
+        return False
 
 
 def ensure_no_live_run_for_profile(db, profile_name: str) -> Optional[str]:

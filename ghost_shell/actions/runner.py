@@ -275,10 +275,10 @@ def _act_click_ad(driver, action: dict, ctx: dict):
         except Exception:
             anchor = None
 
-    # ── FALLBACK: URL fragment match with own-domain guard ──────
-    # Only reached if the stamped anchor vanished (page re-rendered,
+    # ── FALLBACK 1: URL fragment match with own-domain guard ────
+    # Reached if the stamped anchor vanished (page re-rendered,
     # Google dynamically swapped the ad block, etc). Still requires
-    # owndomain verification on whatever we find.
+    # own-domain verification on whatever we find.
     if anchor is None:
         url = ad.get("google_click_url") or ad.get("clean_url") or ""
         if url:
@@ -294,6 +294,52 @@ def _act_click_ad(driver, action: dict, ctx: dict):
                     log.info(f"    click_ad: URL-match fallback hit own domain, aborting")
             except Exception:
                 pass
+
+    # ── FALLBACK 2: domain match via JS scan ────────────────────
+    # Last-resort fallback when both anchor_id AND URL fragment miss.
+    # Use the stable `domain` field — Google's /aclk URLs include the
+    # destination host as a query param (most modern templates have
+    # `&adurl=https://...`). We do a JS-side scan across all anchors
+    # whose href contains the domain string AND that go through
+    # /aclk (so it's a real ad, not an organic result with the same
+    # domain). Apply own-domain + maps + google-internal guards.
+    # This catches the "Google rebuilt the SERP between parse and
+    # click" case where data-gs-ad-id attributes were wiped.
+    if anchor is None:
+        ad_domain = (ad.get("domain") or "").lower().strip()
+        if ad_domain:
+            try:
+                candidate = driver.execute_script(r"""
+                    const dom = arguments[0].toLowerCase();
+                    const own = arguments[1] || [];
+                    const all = document.querySelectorAll('a[href]');
+                    for (const a of all) {
+                        const href = (a.href || '').toLowerCase();
+                        if (!href.includes(dom)) continue;
+                        // Must be an ad anchor (Google routes ads through
+                        // /aclk or googleadservices). Organic results
+                        // pointing to the same domain are skipped here.
+                        const isAd = href.includes('/aclk?') ||
+                                     href.includes('googleadservices') ||
+                                     href.includes('googlesyndication');
+                        if (!isAd) continue;
+                        // Skip own-domain-shaped destinations.
+                        if (own.some(d => href.includes(d.toLowerCase()))) continue;
+                        // Skip maps / google-internal landings.
+                        if (href.includes('google.com/maps') ||
+                            href.includes('maps.google.com')) continue;
+                        return a;
+                    }
+                    return null;
+                """, ad_domain, own_domains)
+                if candidate:
+                    anchor = candidate
+                    log.info(
+                        f"    click_ad: anchor_id+URL-fragment both missed; "
+                        f"recovered via domain-match JS scan for {ad_domain!r}"
+                    )
+            except Exception as _ds_err:
+                log.debug(f"    click_ad: domain-match scan failed: {_ds_err}")
 
     if anchor is None:
         log.warning(
@@ -316,23 +362,84 @@ def _act_click_ad(driver, action: dict, ctx: dict):
     _random_sleep(0.1, 0.4)
 
     original = driver.current_window_handle
+    # Three-stage click ladder:
+    #   1. ActionChains Ctrl-click (preferred — most realistic, opens
+    #      in new tab via OS-level Ctrl modifier)
+    #   2. Native element.click() (Selenium API)
+    #   3. JS-side .click() (works even on 0×0 / hidden / absolute-
+    #      positioned elements where Selenium throws
+    #      ElementNotInteractableException — Google ad anchors are
+    #      sometimes wrapped this way: the visible click target is a
+    #      different element with the geometry, while the /aclk
+    #      anchor itself has display:none-style positioning)
+    # We force OPEN_IN_NEW_TAB at the JS layer by setting target=_blank
+    # before .click(); the post-click logic below already expects a
+    # new tab to appear and switch to it.
+    click_ok = False
     try:
         ac = ActionChains(driver)
         ac.key_down(Keys.CONTROL).click(anchor).key_up(Keys.CONTROL).perform()
+        click_ok = True
     except Exception as e:
-        log.warning(f"    click_ad: ctrl-click failed ({e}), falling back to plain click")
+        log.warning(
+            f"    click_ad: ctrl-click failed "
+            f"({type(e).__name__}: {str(e)[:120]}); "
+            f"trying plain click"
+        )
         try:
             anchor.click()
-        except Exception:
-            log.warning("    click_ad: click failed entirely")
-            return
+            click_ok = True
+        except Exception as e2:
+            log.warning(
+                f"    click_ad: plain click failed "
+                f"({type(e2).__name__}: {str(e2)[:120]}); "
+                f"falling back to JS click"
+            )
+            try:
+                # JS-side click — bypasses Selenium's interactability
+                # geometry check. Force target=_blank first so the
+                # tab-tracking code below picks up a new window.
+                driver.execute_script(
+                    "arguments[0].setAttribute('target', '_blank');"
+                    "arguments[0].click();",
+                    anchor,
+                )
+                click_ok = True
+                log.info("    click_ad: JS click succeeded")
+            except Exception as e3:
+                log.warning(
+                    f"    click_ad: JS click also failed "
+                    f"({type(e3).__name__}: {str(e3)[:120]}); "
+                    f"giving up on this ad"
+                )
+                return
+
+    if not click_ok:
+        return
 
     _random_sleep(1.0, 2.5)
-    # Switch to the new tab if one opened
-    tabs = [h for h in driver.window_handles if h != original]
+    # Switch to the new tab if one opened. Wrap in try/except — the
+    # tab can VANISH between handles enumeration and switch_to (Maps
+    # redirects, popup-blocker close, antifraud heuristic close).
+    tabs = []
+    landed_url = ""
+    try:
+        tabs = [h for h in driver.window_handles if h != original]
+    except Exception as _wh_err:
+        log.warning(f"    click_ad: window_handles failed ({_wh_err}); aborting")
+        return
     if tabs:
-        driver.switch_to.window(tabs[-1])
-        landed_url = driver.current_url or ""
+        try:
+            driver.switch_to.window(tabs[-1])
+            landed_url = driver.current_url or ""
+        except Exception as _sw_err:
+            log.warning(
+                f"    click_ad: tab vanished before switch "
+                f"({type(_sw_err).__name__}); returning to SERP"
+            )
+            try: driver.switch_to.window(original)
+            except Exception: pass
+            return
         log.info(f"    → clicked ad, now on: {landed_url[:80]}")
 
         # ── POST-CLICK SAFETY NET ──────────────────────────────────
@@ -354,18 +461,69 @@ def _act_click_ad(driver, action: dict, ctx: dict):
                 except Exception: pass
             return
 
-    # Dwell
+        # ── MAPS / GOOGLE-INTERNAL BAIL-OUT ────────────────────────
+        # Local Pack ads have a "see on Google Maps" anchor that sits
+        # inside the same ad container as the merchant link. parse_ads
+        # sometimes stamps that maps anchor instead of the merchant
+        # one — when we click it we land on google.com/maps/place,
+        # which is (a) not a real ad click, (b) prone to closing its
+        # own tab via maps' embedded behaviour, causing
+        # NoSuchWindowException further in the dwell loop.
+        # Same goes for any other google-internal landing
+        # (search-redirect chains, AMP viewer fallback, etc).
+        # Closing immediately keeps the SERP clean and the next
+        # foreach_ad iteration from running on a dead window.
+        low_url = landed_url.lower()
+        if ("google.com/maps" in low_url or
+            "maps.google.com"  in low_url or
+            "google.com/url?"  in low_url or
+            "google.com/aclk"  in low_url and "redirect" in low_url):
+            log.warning(
+                f"    click_ad: landed on google-internal page "
+                f"({landed_url[:60]}) — not a real ad destination; "
+                f"closing tab without dwell"
+            )
+            try:
+                driver.close()
+            finally:
+                try: driver.switch_to.window(original)
+                except Exception: pass
+            return
+
+    # Dwell — wrap so a tab close mid-sleep doesn't propagate as a
+    # crash. NoSuchWindowException can come from chrome auto-closing
+    # the tab during a redirect chain on the destination site (some
+    # antifraud setups serve a JS-driven `window.close()` to bots).
     dwell_lo = float(action.get("dwell_min", 6))
     dwell_hi = float(action.get("dwell_max", 18))
-    _random_sleep(dwell_lo, dwell_hi)
+    try:
+        _random_sleep(dwell_lo, dwell_hi)
+    except Exception:
+        pass
 
-    # Optional post-click scroll
+    # Mid-dwell health-probe: if the window vanished while sleeping,
+    # bail out cleanly so the parent foreach_ad picks up the next ad.
+    try:
+        _ = driver.current_url
+    except Exception as _hp_err:
+        log.warning(
+            f"    click_ad: window closed during dwell "
+            f"({type(_hp_err).__name__}); returning to SERP"
+        )
+        try: driver.switch_to.window(original)
+        except Exception: pass
+        return
+
+    # Optional post-click scroll — also protected.
     if action.get("scroll_after_click", True):
         try:
             _human_scroll(driver)
         except Exception:
             pass
-        _random_sleep(1, 3)
+        try:
+            _random_sleep(1, 3)
+        except Exception:
+            pass
 
     # ── DEEP DIVE: click 1-2 internal links ──────────────────────
     # A real shopper who clicks an ad doesn't just scroll the
@@ -440,12 +598,29 @@ def _act_click_ad(driver, action: dict, ctx: dict):
         except Exception as e:
             log.debug(f"    deep_dive failed: {e}")
 
-    # Close tab and return to SERP
+    # Close tab and return to SERP. Both the close() and the
+    # subsequent switch_to.window() can fail if the tab is already
+    # gone (chrome closed it itself, popup-blocker, deep_dive
+    # navigated us off-host into a closing iframe). We MUST
+    # successfully restore focus to the SERP either way — otherwise
+    # the next foreach_ad iteration runs against a dead window.
     if action.get("close_after", True) and tabs:
         try:
             driver.close()
-        finally:
+        except Exception:
+            pass
+        try:
             driver.switch_to.window(original)
+        except Exception:
+            # Last-ditch: try the first surviving handle if `original`
+            # is also gone. The watchdog will catch this and force a
+            # driver-level recovery if we can't find anything.
+            try:
+                handles = driver.window_handles
+                if handles:
+                    driver.switch_to.window(handles[0])
+            except Exception:
+                pass
 
 
 def _resolve_selector(sel: str):
@@ -911,15 +1086,248 @@ def _store_var(ctx: dict, name: str, value) -> None:
 
 def _act_open_url(driver, action: dict, ctx: dict):
     """Navigate to a URL with optional variable substitution.
-    Alias of `visit` but with a clearer name for non-ads scripts."""
+    Alias of `visit` but with a clearer name for non-ads scripts.
+
+    Supported dwell params (in priority order):
+      dwell_min/dwell_max — pick a random dwell from the range,
+        useful when the destination is a slow-loading tester or
+        single-page app that runs background work after onload.
+      wait_after          — fixed-ish dwell (legacy default 1.0s).
+    """
     url = _subst(action.get("url", ""), ctx)
     if not url:
         log.warning("    open_url: no url given")
         return
-    wait_sec = float(action.get("wait_after", 1.0))
     log.info(f"    → open_url: {url}")
     driver.get(url)
-    _random_sleep(wait_sec, wait_sec + 0.8)
+    if "dwell_min" in action or "dwell_max" in action:
+        lo = float(action.get("dwell_min", 4))
+        hi = float(action.get("dwell_max", 12))
+        if hi < lo:
+            hi = lo
+        _random_sleep(lo, hi)
+        # Optional human scroll while dwelling
+        if action.get("scroll"):
+            try:
+                steps = int(action.get("scroll_steps", 4))
+                for _ in range(max(1, steps)):
+                    driver.execute_script(
+                        "window.scrollBy(0, Math.floor("
+                        " (document.body.scrollHeight || 800) "
+                        "/ arguments[0]));", steps)
+                    time.sleep(random.uniform(0.6, 1.4))
+            except Exception as e:
+                log.debug(f"    open_url scroll failed: {e}")
+    else:
+        wait_sec = float(action.get("wait_after", 1.0))
+        _random_sleep(wait_sec, wait_sec + 0.8)
+
+
+# ──────────────────────────────────────────────────────────────
+# External fingerprint tester — visit + dwell + extract + persist.
+# One action handles all of CreepJS / Pixelscan / Sannysoft / etc.
+# Dispatches the right extractor based on the tester_id.
+# ──────────────────────────────────────────────────────────────
+
+# Per-tester JS extractors. Each returns a JSON-serialisable dict
+# with whatever stats it can pull off the page after the scan finishes.
+# Extractors run inside the browser via execute_script — keep them
+# defensive (try/catch around every selector, return null fields when
+# absent) so a future redesign of the tester page degrades gracefully.
+
+_EXTRACTOR_CREEPJS = r"""
+return (() => {
+  const out = { tester_id: "creepjs", trust: null, fp_id: null,
+                lies: [], errors: [], summary: "" };
+  try {
+    const trustEl = document.querySelector(
+      ".trusted-fingerprint, .untrusted-fingerprint, .unrustworthy-fingerprint");
+    if (trustEl) {
+      const m = trustEl.textContent.match(/([\d.]+)\s*%/);
+      if (m) out.trust = parseFloat(m[1]);
+    }
+    const fpIdEl = document.querySelector(".fingerprint-header .unblurred");
+    if (fpIdEl) out.fp_id = fpIdEl.textContent.trim().slice(0, 80);
+    document.querySelectorAll(".lies-detection").forEach(el => {
+      out.lies.push(el.textContent.trim().slice(0, 200));
+    });
+    document.querySelectorAll(".unblurred.erratic, .warn, .perf").forEach(el => {
+      const t = el.textContent.trim();
+      if (t && t.length < 500) out.errors.push(t);
+    });
+    const main = document.querySelector(".fingerprint-header");
+    out.summary = main ? main.textContent.trim().slice(0, 1000) : "";
+  } catch (e) { out.error = String(e); }
+  return out;
+})();
+"""
+
+_EXTRACTOR_SANNYSOFT = r"""
+return (() => {
+  const out = { tester_id: "sannysoft", checks: {}, fail_count: 0 };
+  try {
+    document.querySelectorAll("table tr").forEach(tr => {
+      const cells = tr.querySelectorAll("td, th");
+      if (cells.length >= 2) {
+        const k = cells[0].textContent.trim();
+        const v = cells[1].textContent.trim();
+        if (k && v) out.checks[k] = v;
+        const cls = (cells[1].className || "").toLowerCase();
+        if (cls.includes("failed") || cls.includes("not")) out.fail_count++;
+      }
+    });
+  } catch (e) { out.error = String(e); }
+  return out;
+})();
+"""
+
+_EXTRACTOR_PIXELSCAN = r"""
+return (() => {
+  const out = { tester_id: "pixelscan", verdict: null, summary: "" };
+  try {
+    const verdictEl = document.querySelector(
+      "[class*='verdict'], [class*='result'], h1, h2");
+    if (verdictEl) out.verdict = verdictEl.textContent.trim().slice(0, 200);
+    out.summary = document.body.innerText.slice(0, 800);
+  } catch (e) { out.error = String(e); }
+  return out;
+})();
+"""
+
+_EXTRACTOR_GENERIC = r"""
+return (() => {
+  return {
+    tester_id: arguments[0] || "unknown",
+    title: document.title,
+    summary: (document.body.innerText || "").slice(0, 800),
+  };
+})();
+"""
+
+_EXTRACTORS = {
+    "creepjs":      _EXTRACTOR_CREEPJS,
+    "sannysoft":    _EXTRACTOR_SANNYSOFT,
+    "pixelscan":    _EXTRACTOR_PIXELSCAN,
+    # The remaining testers don't expose a single trust score that's
+    # easy to scrape stably — fall back to title + body excerpt.
+    "amiunique":    _EXTRACTOR_GENERIC,
+    "browserleaks": _EXTRACTOR_GENERIC,
+    "fpcom":        _EXTRACTOR_GENERIC,
+}
+
+
+def _act_visit_external_fp_tester(driver, action: dict, ctx: dict):
+    """Navigate to one external fingerprint tester, dwell while it
+    scans, extract whatever stats are exposed on the page, and write
+    them to the `external_fp_results` table.
+
+    Action params:
+      tester_id     str (required) — canonical key from FP_TESTERS
+                    (creepjs / sannysoft / pixelscan / amiunique /
+                     browserleaks / fpcom)
+      url           str — override (defaults to the canonical URL
+                    embedded in the dashboard catalogue)
+      tester_label  str — pretty label for the dashboard
+      dwell_min/max — seconds to wait after navigation while the
+                    tester runs its async scan (CreepJS needs ~15-25s
+                    to compute its trust score)
+      scroll        bool — scroll while dwelling
+    """
+    import json as _json
+    tester_id    = action.get("tester_id") or "unknown"
+    tester_label = action.get("tester_label") or tester_id
+    url          = action.get("url") or ""
+    dwell_lo     = float(action.get("dwell_min", 18))
+    dwell_hi     = float(action.get("dwell_max", 32))
+
+    log.info(f"    → fp-tester: {tester_label} ({tester_id})")
+
+    if not url:
+        log.warning(f"    fp-tester '{tester_id}': no url, skipping")
+        return
+
+    extractor = _EXTRACTORS.get(tester_id, _EXTRACTOR_GENERIC)
+
+    nav_error = None
+    try:
+        driver.get(url)
+    except Exception as e:
+        nav_error = f"{type(e).__name__}: {str(e)[:200]}"
+        log.warning(f"    fp-tester '{tester_id}' navigation failed: {nav_error}")
+
+    # Dwell while the tester's JS computes scores. Some testers (CreepJS)
+    # show a partial result quickly then refine it — we still wait the
+    # full window so the saved score is the final one.
+    if not nav_error:
+        _random_sleep(dwell_lo, dwell_hi)
+        if action.get("scroll"):
+            try:
+                for _ in range(4):
+                    driver.execute_script(
+                        "window.scrollBy(0, Math.floor("
+                        "(document.body.scrollHeight || 800)/4));")
+                    time.sleep(random.uniform(0.4, 1.0))
+                driver.execute_script("window.scrollTo(0, 0);")
+            except Exception:
+                pass
+
+    payload = None
+    extract_error = None
+    if not nav_error:
+        try:
+            payload = driver.execute_script(extractor, tester_id) or {}
+        except Exception as e:
+            extract_error = f"{type(e).__name__}: {str(e)[:200]}"
+            log.warning(
+                f"    fp-tester '{tester_id}' extractor failed: {extract_error}"
+            )
+
+    # Persist regardless — even an error row is useful so the UI can
+    # show "last attempt failed at HH:MM" instead of staying blank.
+    try:
+        from ghost_shell.db.database import get_db
+        db = get_db()
+        trust = None
+        fp_id = None
+        lies_count = None
+        summary = None
+        raw_json = None
+        if payload is not None:
+            trust = payload.get("trust")
+            fp_id = payload.get("fp_id")
+            if isinstance(payload.get("lies"), list):
+                lies_count = len(payload["lies"])
+            summary = (payload.get("summary") or "")[:1000]
+            try:
+                raw_json = _json.dumps(payload, ensure_ascii=False)[:8000]
+            except Exception:
+                raw_json = None
+        db.external_fp_add(
+            run_id=ctx.get("run_id"),
+            profile_name=ctx.get("profile_name") or "unknown",
+            tester_id=tester_id,
+            tester_label=tester_label,
+            url=url,
+            trust_score=trust,
+            fingerprint_id=fp_id,
+            lies_count=lies_count,
+            summary=summary,
+            raw_json=raw_json,
+            error=nav_error or extract_error,
+        )
+        if trust is not None:
+            log.info(
+                f"    ✓ fp-tester '{tester_id}': "
+                f"trust={trust}% lies={lies_count or 0}"
+            )
+        else:
+            log.info(
+                f"    ✓ fp-tester '{tester_id}': result saved"
+                + (f" error={nav_error or extract_error}"
+                   if (nav_error or extract_error) else "")
+            )
+    except Exception as e:
+        log.warning(f"    fp-tester '{tester_id}' DB persist failed: {e}")
 
 
 def _close_extra_tabs(driver, anchor_handle: str | None = None) -> int:
@@ -1037,12 +1445,81 @@ def _act_commercial_inflate(driver, action: dict, ctx: dict):
     except Exception:
         anchor = None
 
+    # Pre-flight TCP-reachability check. Sends a quick HEAD to
+    # google.com through the same proxy via `requests` (NOT the browser),
+    # 4-second timeout. Two purposes:
+    #
+    # 1. Proxy-burned guard. If google times out / returns 5xx through
+    #    requests, the browser will hang on driver.get for 30s × N
+    #    inflate queries. We'd rather skip inflate entirely and let
+    #    search_query (with its own 15s timeout + captcha→rotation
+    #    Recovery #1-4 flow) take over.
+    # 2. Latency baseline. If google responds in < 1s through requests
+    #    but Chrome still hangs, that points to a Chrome/CDP-level issue
+    #    rather than a proxy problem.
+    try:
+        from ghost_shell.config import Config as _Cfg
+        _proxy_url = (_Cfg.load().get("proxy.url") or "").strip()
+    except Exception:
+        _proxy_url = ""
+    if _proxy_url:
+        try:
+            import requests as _rq
+            _proxies = {"http":  f"http://{_proxy_url}",
+                        "https": f"http://{_proxy_url}"}
+            _t0 = time.time()
+            _r = _rq.head("https://www.google.com/",
+                          proxies=_proxies, timeout=4,
+                          allow_redirects=False)
+            log.info(
+                f"      pre-flight google.com via proxy: "
+                f"HTTP {_r.status_code} in {time.time()-_t0:.2f}s"
+            )
+            if _r.status_code in (407, 502, 503, 504):
+                log.warning(
+                    f"      ⚠ proxy returns {_r.status_code} for google — "
+                    f"SKIPPING inflate, proceeding directly to search_query"
+                )
+                return
+        except Exception as _pe:
+            log.warning(
+                f"      ⚠ pre-flight to google.com failed via proxy "
+                f"({type(_pe).__name__}: {str(_pe)[:80]}). Skipping "
+                f"inflate so we don't hang the run; search_query will "
+                f"trigger captcha-rotation if needed."
+            )
+            return
+
+    # Per-call pageload cap. Without this, a sluggish proxy + Google
+    # captcha-state combo turns each inflate query into a 300-second
+    # block (Chrome's default page_load_timeout) and wedges the run.
+    # 15s on top of pre-flight: pre-flight already proved google is
+    # reachable; if Chrome still can't open the page in 15s, give up.
+    try:
+        driver.set_page_load_timeout(15)
+    except Exception:
+        pass
+
     import urllib.parse as _up
+    from selenium.common.exceptions import TimeoutException as _TimeoutExc
     for i, q in enumerate(queries, 1):
         try:
             url = "https://www.google.com/search?q=" + _up.quote(q)
             log.info(f"      [{i}/{n}] inflate query: {q!r}")
-            driver.get(url)
+            try:
+                driver.get(url)
+            except _TimeoutExc:
+                # Google didn't finish loading within 30s — common on
+                # captcha'd / sluggish proxies. We have SOME of the
+                # SERP rendered which is enough to look like a real
+                # commercial-intent visit. Stop further subresources
+                # so the next query starts clean, then continue.
+                log.warning(
+                    f"      [{i}/{n}] inflate query timed out after 30s "
+                    f"on slow proxy; continuing"
+                )
+                try: driver.execute_script("window.stop();")
+                except Exception: pass
             _random_sleep(dwell_min, dwell_max)
             # Soft-scroll a bit so Google sees engagement on the SERP
             try:
@@ -1564,6 +2041,13 @@ ACTION_HANDLERS: dict[str, Callable] = {
     "execute_js":         _act_execute_js,
     "screenshot":         _act_screenshot,
 
+    # Self-check / Runtime self-check — visits an external fingerprint
+    # tester (CreepJS, Pixelscan, Sannysoft, AmIUnique, BrowserLeaks,
+    # fpcom), dwells while it scans, scrapes the result, and writes it
+    # to external_fp_results. Used by the FP probe button on profile
+    # detail page.
+    "visit_external_fp_tester": _act_visit_external_fp_tester,
+
     # Health monitor (Sprint 4): visit detection sites + record scores
     "health_check_canary": _act_health_check_canary,
     "wait_for_url":       _act_wait_for_url,
@@ -1982,7 +2466,14 @@ def run_pipeline(browser, pipeline: list, context: dict = None):
                 error=error,
             )
         except Exception as e:
-            log.debug(f"action_event_add failed: {e}")
+            # Bumped from DEBUG to WARNING — silent failures here meant
+            # the Competitors page Actions column stayed at 0 even when
+            # clicks ran. If you see this in production logs, dump the
+            # underlying error and check action_events DB integrity.
+            log.warning(
+                f"action_event_add failed for "
+                f"{action_type}/{outcome}/{ad_domain or '<no-domain>'}: {e}"
+            )
 
     for i, action in enumerate(pipeline, 1):
         act_type = action.get("type") or "unknown"
@@ -2862,11 +3353,37 @@ def _eval_condition_raw(kind: str, cond: dict, ctx: RunContext) -> bool:
         return False
 
     # Ad-scope predicates (require ctx.ad)
+    #
+    # Three-way classification of an ad's domain:
+    #   • ad_is_mine        → ad.domain ∈ my_domains              (own)
+    #   • ad_is_target      → ad.is_target=true (set by parse_ads)
+    #   • ad_is_competitor  → STRICT: not-mine AND not-target
+    #                         (i.e. "pure" 3rd-party competitor)
+    #   • ad_is_external    → LOOSE: not-mine (target OR competitor)
+    #
+    # The "external" alias was added because users intuitively expect
+    # `if competitor → only_on_target=true` to click target ads. With
+    # the strict definition that combination is empty (target ads never
+    # enter the if-competitor branch). The loose `ad_is_external`
+    # matches the intuitive 2-way (mine / not-mine) split, and lets
+    # `only_on_target=true` further narrow inside that branch.
     if kind == "ad_is_competitor":
         ad = ctx.ad or {}
         if not ad.get("domain"):
             return False
         if ad.get("is_target"):
+            return False
+        my = {d.lower() for d in (ctx.loop_ctx.get("my_domains") or [])}
+        dom = (ad.get("domain") or "").lower()
+        return not any(dom == d or dom.endswith("." + d) for d in my)
+    if kind == "ad_is_external":
+        # "Anything not on my domain" — covers competitors AND targets.
+        # Use this when you want the per-action only_on_target /
+        # skip_on_target flags to do the fine-grained work inside the
+        # branch (vs. picking strict ad_is_competitor which excludes
+        # targets at the gate).
+        ad = ctx.ad or {}
+        if not ad.get("domain"):
             return False
         my = {d.lower() for d in (ctx.loop_ctx.get("my_domains") or [])}
         dom = (ad.get("domain") or "").lower()
@@ -3505,8 +4022,24 @@ CONDITION_KINDS = [
          {"name": "value", "type": "number", "default": 2,
           "label": "Minimum count"}
      ]},
-    {"kind": "ad_is_competitor", "label": "Ad is competitor",
-     "group": "ads", "needs_ad": True},
+    # Ad-classification predicates. NOTE the difference between
+    # "competitor" (strict: not mine AND not target) and "external"
+    # (loose: not mine — includes targets). Pick "external" if you
+    # plan to use only_on_target / skip_on_target inside the branch
+    # to fine-tune which ads to act on; pick "competitor" if you want
+    # the gate to exclude targets up-front.
+    {"kind": "ad_is_competitor", "label": "Ad is pure competitor (not mine, not target)",
+     "group": "ads", "needs_ad": True,
+     "hint": "Strict: excludes target-domain ads from this branch. "
+             "If you intend to also act on target-domain ads here, "
+             "use 'Ad is external' instead — that branch lets the "
+             "click_ad's only_on_target / skip_on_target flags decide."},
+    {"kind": "ad_is_external",   "label": "Ad is external (not mine — incl. targets)",
+     "group": "ads", "needs_ad": True,
+     "hint": "Loose: any ad not on your domain — covers competitors "
+             "AND target-domain ads. Use this when you want the per-"
+             "action only_on_target / skip_on_target flags to fine-"
+             "tune which ads to click inside the branch."},
     {"kind": "ad_is_target",     "label": "Ad is target-domain",
      "group": "ads", "needs_ad": True},
     {"kind": "ad_is_mine",       "label": "Ad is my-domain",

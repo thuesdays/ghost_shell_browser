@@ -163,6 +163,15 @@ class RotatingProxyTracker:
 
         self.db = get_db()
 
+        # Recovery #1 — cache the last successfully-resolved exit IP
+        # so force_rotate_ip() has a baseline even if a stray captcha
+        # hits before any explicit get_current_ip call had succeeded
+        # (the "old_ip = None" pathology in run #88's log).
+        # Updated on every fresh probe; consulted as a fallback when
+        # the live probe fails. Single-value, single-process — no
+        # cross-process locking needed.
+        self._last_known_ip: Optional[str] = None
+
     # ──────────────────────────────────────────────────────────
     # IP discovery
     # ──────────────────────────────────────────────────────────
@@ -191,10 +200,22 @@ class RotatingProxyTracker:
                 "https": f"http://{self.proxy_url}",
             }
             r = requests.get(IP_CHECK_URL, proxies=proxies, timeout=15)
-            return r.json().get("ip")
+            ip = r.json().get("ip")
+            # Recovery #1 — remember the last successful probe so a
+            # later transient failure (which previously left old_ip=None
+            # blocking force_rotate_ip's wait loop) can fall back here.
+            if ip:
+                self._last_known_ip = ip
+            return ip
         except Exception as e:
             logging.debug(f"[RotatingProxy] get_current_ip: {e}")
             return None
+
+    def get_last_known_ip(self) -> Optional[str]:
+        """Recovery #1 — last successfully-probed exit IP. Lifetime is
+        the lifetime of this tracker / browser launch. Used as a
+        baseline by force_rotate_ip() when a fresh probe fails."""
+        return self._last_known_ip
 
     def enrich_ip(self, ip: str, driver=None):
         """Look up country / city / ASN / ISP and store them in

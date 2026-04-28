@@ -1048,6 +1048,98 @@ const ScriptsPage = {
       </div>`;
   },
 
+  /**
+   * Lint a container step for known impossible-intersection patterns.
+   * Returns an array of warning strings (HTML-safe). Currently catches:
+   *
+   *   • if(ad_is_competitor) + click_ad{only_on_target:true}
+   *     → empty intersection: ad_is_competitor excludes target ads at
+   *       the gate, and only_on_target requires them. Result: never
+   *       clicks. Suggest ad_is_external (loose: not-mine, allows
+   *       targets) so the inner only_on_target can fine-tune.
+   *
+   *   • if(ad_is_target) + click_ad{skip_on_target:true}
+   *     → mirror of the above. Skip flag cancels the gate.
+   *
+   * Warnings render as an inline banner above the then-region so the
+   * user sees them at edit time, not at run time.
+   */
+  _lintContainer(step) {
+    const warnings = [];
+    if (step.type !== "if") return warnings;
+    const kind = step?.condition?.kind || "always";
+    const negate = !!step?.condition?.negate;
+    const collectClicks = (list) => {
+      const out = [];
+      for (const s of (list || [])) {
+        if (!s) continue;
+        if (s.type === "click_ad") out.push(s);
+        // Don't recurse into nested if/foreach inside then_steps —
+        // those have their own lint banner.
+      }
+      return out;
+    };
+    const clicks = collectClicks(step.then_steps);
+    if (!clicks.length) return warnings;
+
+    if (kind === "ad_is_competitor" && !negate) {
+      for (const c of clicks) {
+        if (c.only_on_target) {
+          warnings.push(
+            "<b>Empty intersection:</b> outer condition is " +
+            "<code>ad_is_competitor</code> (excludes target-domain ads), " +
+            "but <code>click_ad</code> has <code>only_on_target</code> ✓ " +
+            "(requires target-domain ads). This <code>click_ad</code> " +
+            "will <b>never fire</b>. " +
+            "Fix: switch outer condition to <code>ad_is_external</code> " +
+            "(loose: any non-own ad), or uncheck <code>only_on_target</code>."
+          );
+          break; // one warning per container is enough
+        }
+      }
+    }
+    if (kind === "ad_is_target" && !negate) {
+      for (const c of clicks) {
+        if (c.skip_on_target) {
+          warnings.push(
+            "<b>Empty intersection:</b> outer condition is " +
+            "<code>ad_is_target</code> but <code>click_ad</code> has " +
+            "<code>skip_on_target</code> ✓ — every iteration of this " +
+            "branch will be skipped. Uncheck <code>skip_on_target</code> " +
+            "or change the outer condition."
+          );
+          break;
+        }
+      }
+    }
+    if (kind === "ad_is_mine" && !negate) {
+      for (const c of clicks) {
+        if (c.skip_on_my_domain) {
+          warnings.push(
+            "<b>Empty intersection:</b> outer condition is " +
+            "<code>ad_is_mine</code> but <code>click_ad</code> has " +
+            "<code>skip_on_my_domain</code> ✓ — every click here will " +
+            "be silently skipped. Either remove the skip flag or use " +
+            "a different outer condition."
+          );
+          break;
+        }
+      }
+    }
+    return warnings;
+  },
+
+  _renderContainerLintBanner(step) {
+    const warnings = this._lintContainer(step);
+    if (!warnings.length) return "";
+    return warnings.map(w =>
+      `<div class="flow-lint-warning" role="alert">
+         <span class="flow-lint-warning-icon">⚠</span>
+         <span class="flow-lint-warning-text">${w}</span>
+       </div>`
+    ).join("");
+  },
+
   _renderContainer(step, path, meta) {
     const label = meta ? (meta.label || step.type) : step.type;
     const idx   = path[path.length - 1].idx;
@@ -1056,9 +1148,11 @@ const ScriptsPage = {
 
     let bodyHtml;
     if (step.type === "if") {
+      const lintBanner = this._renderContainerLintBanner(step);
       bodyHtml = `
         <div class="flow-container-body ${(step.then_steps || []).length === 0 ? 'is-empty' : ''}"
              data-container-path="${this._encodePath(path)}:then_steps">
+          ${lintBanner}
           <div class="container-subregion-label then-label">Then</div>
           ${this._renderStepList(step.then_steps || [], path, "then_steps")
             || this._renderEmptyBodyMarker("then")}

@@ -4487,6 +4487,42 @@ a:hover { text-decoration: underline; }
 .flow-container-body.is-empty {
   padding: 12px;
 }
+
+/* Inline lint warning banner — surfaces logic mistakes at edit time
+   (e.g. ad_is_competitor + only_on_target → empty intersection). */
+.flow-lint-warning {
+  display: flex;
+  gap: 8px;
+  align-items: flex-start;
+  padding: 8px 10px;
+  margin: 0 0 4px 0;
+  border: 1px solid rgba(245, 158, 11, 0.45);
+  border-left: 3px solid rgba(245, 158, 11, 1);
+  background: rgba(245, 158, 11, 0.08);
+  border-radius: 3px;
+  color: #fcd34d;
+  font-size: 11.5px;
+  line-height: 1.5;
+}
+.flow-lint-warning-icon {
+  flex: 0 0 auto;
+  font-size: 14px;
+  line-height: 1.3;
+  color: #fbbf24;
+}
+.flow-lint-warning-text { flex: 1 1 auto; }
+.flow-lint-warning code {
+  background: rgba(0, 0, 0, 0.25);
+  padding: 1px 4px;
+  border-radius: 2px;
+  font-size: 11px;
+  color: #fde68a;
+}
+.flow-lint-warning b {
+  color: #fde68a;
+  font-weight: 600;
+}
+
 .container-body-empty {
   padding: 14px;
   border: 1px dashed rgba(148, 163, 184, 0.18);

@@ -261,6 +261,33 @@ POST_AD_ACTIONS          = CFG.get("actions.post_ad_actions",
 ON_TARGET_DOMAIN_ACTIONS = CFG.get("actions.on_target_domain_actions",
                                    CFG.get("actions.on_target_domain", []))
 
+# Diagnostic: surface pipeline configuration at startup so empty
+# pipelines (the cause of "Actions=0 across the board" on the
+# Competitors page) are visible. Only warn when there's a clear
+# mismatch — user has TARGET_DOMAINS set (i.e. expects to act on ads)
+# but no pipeline at all → nothing will be clicked.
+if not POST_AD_ACTIONS and not ON_TARGET_DOMAIN_ACTIONS and TARGET_DOMAINS:
+    logging.warning(
+        "  ⚠ pipeline empty: actions.post_ad_actions=[] AND "
+        "actions.on_target_domain_actions=[] but search.target_domains "
+        "is set — every ad will be tagged 'no_pipeline' / skipped. "
+        "Open Dashboard → Scripts to configure click_ad / scroll / "
+        "read steps."
+    )
+elif not POST_AD_ACTIONS and ON_TARGET_DOMAIN_ACTIONS:
+    logging.info(
+        f"  ⓘ pipeline: legacy on_target only "
+        f"({len(ON_TARGET_DOMAIN_ACTIONS)} step(s)) — "
+        f"competitor ads will be logged as 'no_pipeline' (visible on "
+        f"Competitors page → Actions column). Migrate via Scripts page "
+        f"to enable click_ad on competitors too."
+    )
+else:
+    logging.info(
+        f"  ⓘ pipeline: post_ad={len(POST_AD_ACTIONS)} step(s), "
+        f"on_target={len(ON_TARGET_DOMAIN_ACTIONS)} step(s)"
+    )
+
 # run_id passed via env from dashboard, or created standalone
 RUN_ID = int(os.environ.get("GHOST_SHELL_RUN_ID", "0")) or None
 if RUN_ID is None:
@@ -482,6 +509,161 @@ def _browser_dead(exc: Exception = None) -> bool:
             ))
         return True
     return False
+
+
+def _post_rotation_warmup(driver, browser=None, count: int = None) -> None:
+    """Recovery #3 — visit a few neutral domains after IP rotation
+    before retrying the captcha-causing search.
+
+    Why: Google fingerprints "cold IP, no browsing context, fires
+    search query" as a strong bot signal. Real users land on a fresh
+    IP via DHCP / VPN switch / mobile-tower handoff and typically have
+    minutes of unrelated browsing under that IP before they search for
+    a brand. We mimic that by visiting 2-3 high-traffic, non-Google
+    domains for 4-8s each with realistic dwell + scroll, building up
+    a plausible Referer chain and HTTP/2 connection history before
+    we go back to the SERP.
+
+    Choices are deliberately:
+      - non-Google (so the SERP feels organic, not search-funnel)
+      - high-traffic (won't itself flag captcha on a clean exit)
+      - localised mix (works for UA/RU/EN profiles without forcing locale)
+      - HTTPS-only (no mixed-content side effects)
+    Recovery #3 default count: 3. Override via env / config if needed.
+
+    The browser arg is accepted but unused; kept so callers can pass
+    it without checking for it.
+    """
+    if count is None:
+        try:
+            count = int(CFG.get("captcha.warmup_count", 3))
+        except Exception:
+            count = 3
+    if count <= 0:
+        return
+
+    # Curated list — high-traffic, fast TLS, varied geo so the IP/locale
+    # doesn't immediately leak its preferences.
+    _WARMUP_POOL = [
+        "https://en.wikipedia.org/wiki/Special:Random",
+        "https://uk.wikipedia.org/wiki/Спеціальна:Random",
+        "https://www.bbc.com/news",
+        "https://www.reuters.com/",
+        "https://news.ycombinator.com/",
+        "https://www.weather.com/",
+        "https://www.yahoo.com/",
+    ]
+    picks = random.sample(_WARMUP_POOL, min(count, len(_WARMUP_POOL)))
+    logging.info(f"  ⏳ post-rotation warmup: visiting {len(picks)} site(s) "
+                 f"to break the cold-IP+immediate-search pattern")
+    for i, url in enumerate(picks, 1):
+        try:
+            t0 = time.time()
+            driver.get(url)
+            # 4-8s dwell + slow scroll. Tune via captcha.warmup_min/max.
+            lo = float(CFG.get("captcha.warmup_dwell_min", 4))
+            hi = float(CFG.get("captcha.warmup_dwell_max", 8))
+            time.sleep(random.uniform(lo, hi))
+            try:
+                # Three small scrolls — looks like a glance-and-leave.
+                for _ in range(3):
+                    driver.execute_script(
+                        "window.scrollBy(0, Math.floor("
+                        "(document.body.scrollHeight || 800)/4));"
+                    )
+                    time.sleep(random.uniform(0.4, 1.0))
+            except Exception:
+                pass
+            logging.info(f"     [{i}/{len(picks)}] {url[:60]} "
+                         f"({time.time()-t0:.1f}s)")
+        except Exception as e:
+            # Warmup is best-effort — if one site fails we keep going.
+            logging.debug(f"     warmup site failed ({url}): {e}")
+    logging.info(f"  ✓ warmup complete — retrying SERP")
+
+
+def _auto_regenerate_fingerprint(profile_name: str, reason: str) -> bool:
+    """Recovery #4 — replace the profile's current fingerprint with a
+    fresh, randomly-templated one so the next run comes back as a
+    different identity. Called when IP rotation + session restart both
+    failed to clear captcha — a strong signal that Google flagged the
+    fingerprint, not the IP.
+
+    Why "next run" not "this run": regenerating mid-run would require
+    a full browser teardown + relaunch with the new --ghost-shell-payload,
+    which is what happens on the NEXT scheduled run anyway (the
+    scheduler reads fingerprint_current() at launch). Forcing it here
+    risks racing with the current process's open Chrome and producing
+    weird state. Cleaner: persist the new FP, end the run, let the
+    scheduler pick up the change.
+
+    Returns True if a new fingerprint was saved, False otherwise.
+    """
+    try:
+        from ghost_shell.fingerprint.generator import generate as _gen_fp
+        from ghost_shell.fingerprint.templates import get_template
+        from ghost_shell.fingerprint.validator import validate
+        from ghost_shell.dashboard.server import _flat_fp_to_runtime_shape  # type: ignore
+    except Exception as e:
+        # Fallback when running outside the dashboard import graph
+        logging.warning(
+            f"  fp-regen: helper imports failed: {e} — "
+            f"using minimal regen path"
+        )
+        try:
+            from ghost_shell.fingerprint.generator import generate as _gen_fp
+            from ghost_shell.fingerprint.validator import validate
+        except Exception as e2:
+            logging.error(f"  fp-regen aborted: {e2}")
+            return False
+        get_template = None
+        _flat_fp_to_runtime_shape = None  # type: ignore
+
+    try:
+        # New random template — explicitly ask for a fresh one (not the
+        # current one) so the new FP can't accidentally be reshuffled
+        # noise on the same identity.
+        new_fp = _gen_fp(
+            profile_name=profile_name,
+            template_id=None,
+        )
+    except Exception as e:
+        logging.error(f"  fp-regen generate() failed: {e}")
+        return False
+
+    coherence = None
+    if get_template and _flat_fp_to_runtime_shape:
+        try:
+            tmpl = get_template(new_fp.get("template_id"))
+            shape = _flat_fp_to_runtime_shape(new_fp)
+            coherence = validate(shape, tmpl)
+        except Exception as e:
+            logging.debug(f"  fp-regen validate skipped: {e}")
+
+    try:
+        from ghost_shell.db.database import get_db
+        fp_id = get_db().fingerprint_save(
+            profile_name,
+            new_fp,
+            coherence_score=(coherence or {}).get("score"),
+            coherence_report=coherence,
+            source="auto_regen_after_captcha",
+            reason=reason,
+        )
+    except Exception as e:
+        logging.error(f"  fp-regen DB save failed: {e}")
+        return False
+
+    new_template = (
+        new_fp.get("template_label") or new_fp.get("template_name")
+        or new_fp.get("template_id") or "?"
+    )
+    logging.warning(
+        f"  🔄 FINGERPRINT AUTO-REGENERATED for '{profile_name}' "
+        f"(fp_id={fp_id}, template={new_template}, reason={reason!r}). "
+        f"Next run will launch with the new identity."
+    )
+    return True
 
 
 def _try_recover_browser(browser, reason: str = "") -> bool:
@@ -1285,6 +1467,33 @@ def run_post_ad_pipeline(browser, ad: dict, query: str = None):
         pipeline = ON_TARGET_DOMAIN_ACTIONS
 
     if not pipeline:
+        # Sentinel: write one skipped event per ad even when pipeline is
+        # empty so the Competitors page truthfully reflects "we saw the
+        # ad, but no action was configured" (otherwise actions_ran AND
+        # actions_skipped both stay 0 and the user can't tell the
+        # difference between "never ran" and "config missing").
+        try:
+            from ghost_shell.db.database import get_db
+            ad_domain = (ad.get("domain") or "").lower().strip()
+            if ad_domain:
+                if ad.get("is_target"):
+                    ad_class = "target"
+                elif any((ad_domain == d.lower() or
+                          ad_domain.endswith("." + d.lower()))
+                         for d in MY_DOMAINS):
+                    ad_class = "my_domain"
+                else:
+                    ad_class = "competitor"
+                get_db().action_event_add(
+                    run_id=RUN_ID, profile_name=PROFILE_NAME,
+                    query=query or "", ad_domain=ad_domain,
+                    ad_class=ad_class,
+                    action_type="(no_pipeline)",
+                    outcome="skipped",
+                    skip_reason="empty_pipeline",
+                )
+        except Exception as e:
+            logging.warning(f"  action_event_add (empty pipeline): {e}")
         return
 
     run_pipeline(browser, pipeline, context={
@@ -1410,8 +1619,20 @@ def search_query(browser, query: str, sqm: SessionQualityMonitor,
                 sqm.record("captcha_rotated", query=query, url=driver.current_url)
                 new_ip = browser.force_rotate_ip()
                 if new_ip and new_ip != current_ip:
-                    logging.info(f"  → rotated {current_ip} → {new_ip}, reloading")
+                    logging.info(f"  → rotated {current_ip} → {new_ip}, warming up")
                     current_ip = new_ip
+                    # Recovery #3 — DON'T immediately retry Google with
+                    # the new IP. Real users don't switch ISPs and
+                    # immediately fire a search query — that's the
+                    # exact pattern Google flags as suspicious. Visit
+                    # 2-3 neutral domains first so the new IP picks up
+                    # plausible browsing context (referer chain,
+                    # cookies, request volume) before we go back to
+                    # the SERP.
+                    try:
+                        _post_rotation_warmup(driver, browser=browser)
+                    except Exception as e:
+                        logging.debug(f"  warmup error (non-fatal): {e}")
                     try:
                         driver.get(search_url)
                         time.sleep(random.uniform(1.5, 3.0))
@@ -1479,9 +1700,18 @@ def search_query(browser, query: str, sqm: SessionQualityMonitor,
                             logging.info(
                                 f"  ✓ session-restart rotated "
                                 f"{current_ip} → {post_restart_ip}, "
-                                f"reloading SERP"
+                                f"warming up before SERP retry"
                             )
                             current_ip = post_restart_ip
+                            # Recovery #3 — warmup also after the full
+                            # restart path. Doubly important here since
+                            # we just nuked all session context.
+                            try:
+                                _post_rotation_warmup(
+                                    browser.driver, browser=browser)
+                            except Exception as e:
+                                logging.debug(
+                                    f"  warmup after restart: {e}")
                             try:
                                 browser.driver.get(search_url)
                                 time.sleep(random.uniform(2.0, 4.0))
@@ -1511,6 +1741,30 @@ def search_query(browser, query: str, sqm: SessionQualityMonitor,
                     + (" + 1 session restart" if auto_restart else "") +
                     f", Google still flags us. Burning this IP."
                 )
+                # Recovery #4 — exhausted IP rotation + session restart
+                # both didn't recover. The signal Google's flagging is
+                # almost certainly NOT just the IP at this point — it's
+                # the fingerprint (UA / canvas / JA3 / WebGL combo).
+                # Regenerate the fingerprint so the NEXT scheduled run
+                # comes back as a different identity. This doesn't
+                # rescue the current run (we already burned 3 rotations
+                # on it) but it stops the same FP getting hammered on
+                # every retry. Gated by config so users on tight FP
+                # budgets can opt out.
+                if bool(CFG.get("captcha.auto_regenerate_fp", True)):
+                    try:
+                        _auto_regenerate_fingerprint(
+                            PROFILE_NAME,
+                            reason=(
+                                f"persistent captcha after "
+                                f"{captcha_rotations_used} rotations"
+                                + (" + restart" if auto_restart else "")
+                            ),
+                        )
+                    except Exception as e:
+                        logging.warning(
+                            f"  fp-regen failed (non-fatal): {e}"
+                        )
             sqm.record("captcha", query=query, url=driver.current_url)
             RUN_COUNTERS["total_captchas"] += 1
             if current_ip:
@@ -1861,6 +2115,24 @@ def run_monitor():
             rotate_every == 1 or profile_run_n % rotate_every == 1
         )
 
+        # Override the throttle when the profile is health-burned. Without
+        # this, a profile that hits 100% captcha rate sits on the same
+        # dead IP for up to N-1 more runs, every step times out, and the
+        # user watches the browser hang on the init page indefinitely.
+        # Trigger the early rotation regardless of the rotate_every cadence.
+        try:
+            from ghost_shell.session.quality_monitor import SessionQualityMonitor as _SQM
+            _sqm_early = _SQM(browser.user_data_path)
+            _abort, _reason = _sqm_early.should_abort()
+            if _abort and not should_rotate and IS_ROTATING_PROXY and auto_rotate:
+                logging.warning(
+                    f"  ⚠ profile burned ({_reason}) — overriding "
+                    f"rotate-throttle to force rotation NOW"
+                )
+                should_rotate = True
+        except Exception as _e:
+            logging.debug(f"  burn-aware rotation override skipped: {_e}")
+
         if IS_ROTATING_PROXY:
             if should_rotate:
                 try:
@@ -1909,11 +2181,40 @@ def run_monitor():
         if selfcheck_every < 1:
             selfcheck_every = 1
 
+        # Force-flag for ad-hoc verification (e.g. after a C++ patch
+        # rebuild — we want to see the selfcheck immediately, not wait
+        # for the next run-modulo-10 hit). Two ways to trigger:
+        #   • env GHOST_SHELL_FORCE_SELFCHECK=1   (one-shot, set in
+        #     dashboard launch env or in PowerShell before manual run)
+        #   • config browser.force_selfcheck_next=1 (DB-stored, gets
+        #     consumed and reset by this same code path so it fires
+        #     ONCE then auto-clears)
+        # Both are checked here so either path works. The env wins —
+        # explicit env flag should never be silently dropped.
+        force_env  = os.environ.get("GHOST_SHELL_FORCE_SELFCHECK") in ("1", "true", "yes")
+        force_db   = bool(CFG.get("browser.force_selfcheck_next", False))
+        force_once = force_env or force_db
+        if force_db:
+            # Consume the DB flag so it's truly one-shot. If consumption
+            # fails (db locked etc.) the worst case is one extra forced
+            # selfcheck on the very next run — harmless.
+            try:
+                CFG.set("browser.force_selfcheck_next", False)
+            except Exception:
+                pass
+
         should_selfcheck = (
+            force_once or                              # ad-hoc force
             should_rotate or                           # always after rotation
             profile_run_n == 1 or                      # always on first run
             profile_run_n % selfcheck_every == 1       # every N runs
         )
+        if force_once:
+            logging.info(
+                f"  ⚡ selfcheck forced this run "
+                f"(via {'env' if force_env else 'config'}); "
+                f"normal cadence still every {selfcheck_every} runs"
+            )
 
         # 1. Profile health sanity check (soft: never aborts on first runs)
         sqm = SessionQualityMonitor(browser.user_data_path)

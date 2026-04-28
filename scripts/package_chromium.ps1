@@ -28,14 +28,30 @@
 #  Usage:
 #    .\scripts\package_chromium.ps1
 #    .\scripts\package_chromium.ps1 -Version "0.2.0.3"
+#    .\scripts\package_chromium.ps1 -Version "0.2.0.3" -ChromeVersion "149.0.7805.0"
 #    .\scripts\package_chromium.ps1 -SourceDir "F:\chromium\out\GhostShell"
+#
+#  Versions
+#  --------
+#  -Version        Ghost Shell release version (e.g. 0.2.0.5). Drives
+#                  the zip filename. If not passed, auto-resolved from
+#                  installer/.iss + installer/.build_number; if those
+#                  also fail, prompted for interactively.
+#
+#  -ChromeVersion  Chromium build version (e.g. 149.0.7805.0). Embedded
+#                  into the zip filename so devs can see at a glance
+#                  which Chromium was packaged. If not passed, auto-
+#                  detected from chrome.exe's file-version metadata.
+#                  Pass "auto" or "" to force auto-detection.
 # ================================================================
 
 [CmdletBinding()]
 param(
     [string]$Version = "",
+    [string]$ChromeVersion = "",
     [string]$SourceDir = "",
-    [string]$OutDir = ""
+    [string]$OutDir = "",
+    [switch]$NonInteractive   # CI: skip prompts, fail instead
 )
 
 $ErrorActionPreference = "Stop"
@@ -47,10 +63,11 @@ $repoRoot = Split-Path -Parent $here
 if (-not $SourceDir) { $SourceDir = Join-Path $repoRoot "chrome_win64" }
 if (-not $OutDir)    { $OutDir    = Join-Path $repoRoot "dist" }
 
-# Auto-resolve version from installer's build number + .iss constants
-# if the caller did not pass one. Falls back to "dev" when neither
-# source is present (e.g. running outside a checkout).
-if (-not $Version) {
+# Auto-resolve release version from installer's build number + .iss
+# constants if the caller did not pass one. Falls back to "0.0.0.0"
+# when neither source is present, then prompts interactively unless
+# -NonInteractive (CI) is set.
+function Resolve-Version-FromInstaller {
     $issPath  = Join-Path $repoRoot "installer\ghost_shell_installer.iss"
     $bnPath   = Join-Path $repoRoot "installer\.build_number"
     $major = "0"; $minor = "0"; $patch = "0"; $build = "0"
@@ -64,12 +81,71 @@ if (-not $Version) {
         $raw = (Get-Content -Raw -Path $bnPath) -replace '[^0-9]', ''
         if ($raw) { $build = $raw.Trim() }
     }
-    $Version = "$major.$minor.$patch.$build"
+    return "$major.$minor.$patch.$build"
+}
+
+if (-not $Version) {
+    $autoVer = Resolve-Version-FromInstaller
+    if ($autoVer -ne "0.0.0.0") {
+        $Version = $autoVer
+        Write-Host "[package] auto-resolved release version: $Version" `
+                   -ForegroundColor DarkGray
+    } elseif (-not $NonInteractive) {
+        # Last-resort interactive prompt — common when packaging from
+        # a fresh clone where the build_number file isn't initialised
+        # yet. Validate the entered value at least matches X.Y.Z.W.
+        Write-Host ""
+        Write-Host "Could not auto-detect Ghost Shell release version."
+        Write-Host "Expected format: X.Y.Z.W (e.g. 0.2.0.5)" -ForegroundColor DarkGray
+        do {
+            $entered = Read-Host "[package] Enter release version"
+            $entered = $entered.Trim()
+        } while (-not ($entered -match '^\d+\.\d+\.\d+\.\d+$'))
+        $Version = $entered
+    } else {
+        Write-Error "[package] -Version not given and auto-detect failed; -NonInteractive set"
+        exit 1
+    }
 }
 
 if (-not (Test-Path $SourceDir)) {
     Write-Error "[package] source not found: $SourceDir"
     exit 1
+}
+
+# Auto-detect Chromium build version from chrome.exe metadata.
+# Triggered when -ChromeVersion is not provided OR is "auto"/"detect".
+# We probe chrome.exe's PE FileVersion field — that's the same value
+# you see when right-click -> Properties -> Details on the file.
+function Get-ChromeVersionFromBinary($binDir) {
+    $exe = Join-Path $binDir "chrome.exe"
+    if (-not (Test-Path $exe)) { return $null }
+    try {
+        $info = (Get-Item $exe).VersionInfo
+        $v = $info.ProductVersion
+        if (-not $v) { $v = $info.FileVersion }
+        if ($v) { return $v.Trim() }
+    } catch {
+        return $null
+    }
+    return $null
+}
+
+if (-not $ChromeVersion -or
+    $ChromeVersion -eq "auto" -or $ChromeVersion -eq "detect") {
+    $detected = Get-ChromeVersionFromBinary $SourceDir
+    if ($detected) {
+        $ChromeVersion = $detected
+        Write-Host "[package] auto-detected Chromium version from chrome.exe: $ChromeVersion" `
+                   -ForegroundColor DarkGray
+    } elseif (-not $NonInteractive) {
+        Write-Host ""
+        Write-Host "Could not auto-detect Chromium build version from chrome.exe."
+        Write-Host "Expected format: X.Y.Z.W (e.g. 149.0.7805.0)" -ForegroundColor DarkGray
+        Write-Host "Press Enter to skip embedding it in the zip name." -ForegroundColor DarkGray
+        $entered = (Read-Host "[package] Enter Chromium version (or blank to skip)").Trim()
+        if ($entered) { $ChromeVersion = $entered }
+    }
 }
 
 # Sanity-check it really IS a Chromium build dir, not a half-empty
@@ -87,7 +163,17 @@ if (-not (Test-Path $OutDir)) {
     New-Item -ItemType Directory -Path $OutDir -Force | Out-Null
 }
 
-$zipName    = "chrome_win64-v$Version.zip"
+# Filename embeds release version; if a Chromium build version is
+# known (auto-detected or explicitly passed) it gets embedded too,
+# producing names like:
+#   chrome_win64-v0.2.0.5-chromium-149.0.7805.0.zip
+# When ChromeVersion is empty (skipped at prompt), keep the legacy
+# layout for backwards-compat with existing release-asset URLs.
+if ($ChromeVersion) {
+    $zipName = "chrome_win64-v$Version-chromium-$ChromeVersion.zip"
+} else {
+    $zipName = "chrome_win64-v$Version.zip"
+}
 $zipPath    = Join-Path $OutDir $zipName
 $shaPath    = "$zipPath.sha256"
 
@@ -96,8 +182,15 @@ $shaPath    = "$zipPath.sha256"
 if (Test-Path $zipPath) { Remove-Item $zipPath -Force }
 if (Test-Path $shaPath) { Remove-Item $shaPath -Force }
 
-Write-Host "[package] source:  $SourceDir"
-Write-Host "[package] target:  $zipPath"
+Write-Host "[package] source:    $SourceDir"
+Write-Host "[package] target:    $zipPath"
+Write-Host "[package] release:   $Version"
+if ($ChromeVersion) {
+    Write-Host "[package] chromium:  $ChromeVersion"
+} else {
+    Write-Host "[package] chromium:  (not embedded — pass -ChromeVersion to include)" `
+               -ForegroundColor DarkGray
+}
 Write-Host "[package] zipping... (takes ~30-60s for ~600 MB at Optimal level)"
 
 Add-Type -AssemblyName System.IO.Compression.FileSystem

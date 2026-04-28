@@ -528,21 +528,68 @@ ScriptPromise<IDLSequence<MediaDeviceInfo>> MediaDevices::enumerateDevices(
   const auto promise = result_tracker->Promise();
 
   // === GHOST SHELL: Spoof media devices list early ===
-  if (GhostShellConfig::GetInstance().IsActive()) {
+  //
+  // VLOG instrumentation:
+  //   --enable-logging=stderr --v=1 in chrome flags or
+  //   GHOST_SHELL_VERBOSE_CHROME=1 env (which adds them automatically)
+  // surfaces all [GhostShellMedia] log lines to chrome_debug.log.
+  // We log:
+  //   - whether GhostShellConfig is Active (and bails if not)
+  //   - the raw JSON length of each list (0 = empty payload)
+  //   - whether each list parsed as a JSON array
+  //   - how many devices made it into the spoofed list per kind
+  //   - the final resolve count
+  // Pulls together "patch ran but produced 0" vs. "patch never ran"
+  // vs. "JSON malformed" vs. "selfcheck saw something else".
+  bool gs_active = GhostShellConfig::GetInstance().IsActive();
+  VLOG(1) << "[GhostShellMedia] enumerateDevices() entered, IsActive="
+          << gs_active;
+  if (gs_active) {
     HeapVector<Member<MediaDeviceInfo>> spoofed_devices;
+    int per_kind_count[3] = {0, 0, 0};  // ai, vi, ao — for diagnostic log
 
-    auto parse_list = [&spoofed_devices](const String& json_str,
-                                         mojom::blink::MediaDeviceType type) {
+    auto parse_list = [&spoofed_devices, &per_kind_count](
+                          const String& json_str,
+                          mojom::blink::MediaDeviceType type,
+                          const char* kind_label,
+                          int slot) {
       std::string json = json_str.Utf8();
-      auto parsed = base::JSONReader::Read(json, 0); 
-      if (!parsed || !parsed->is_list()) return;
+      VLOG(1) << "[GhostShellMedia]   " << kind_label
+              << " json_len=" << json.size()
+              << (json.empty() ? " (EMPTY — payload missing 'media."
+                                 : " head='")
+              << (json.empty() ? "" : json.substr(0, 80))
+              << (json.empty() ? "" : "'");
+      auto parsed = base::JSONReader::Read(json, 0);
+      if (!parsed) {
+        VLOG(1) << "[GhostShellMedia]     ✗ JSONReader::Read returned null";
+        return;
+      }
+      if (!parsed->is_list()) {
+        VLOG(1) << "[GhostShellMedia]     ✗ parsed value is not a list, "
+                   "type=" << static_cast<int>(parsed->type());
+        return;
+      }
+      int items_seen = 0;
+      int items_added = 0;
       for (const auto& item : parsed->GetList()) {
-        if (!item.is_dict()) continue;
+        ++items_seen;
+        if (!item.is_dict()) {
+          VLOG(1) << "[GhostShellMedia]     ✗ item " << items_seen
+                  << " is not a dict";
+          continue;
+        }
         const auto& d = item.GetDict();
         const std::string* d_id = d.FindString("deviceId");
         const std::string* lbl = d.FindString("label");
         const std::string* grp = d.FindString("groupId");
-        if (!d_id || !lbl) continue;
+        if (!d_id || !lbl) {
+          VLOG(1) << "[GhostShellMedia]     ✗ item " << items_seen
+                  << " missing deviceId or label "
+                  << "(deviceId=" << (d_id ? "yes" : "no")
+                  << " label="    << (lbl  ? "yes" : "no") << ")";
+          continue;
+        }
 
         auto to_blink_str = [](const std::string& s) {
           return String::FromUtf8(base::span<const uint8_t>(
@@ -555,21 +602,37 @@ ScriptPromise<IDLSequence<MediaDeviceInfo>> MediaDevices::enumerateDevices(
                 to_blink_str(*lbl),
                 grp ? to_blink_str(*grp) : String(),
                 type));
+        ++items_added;
       }
+      per_kind_count[slot] = items_added;
+      VLOG(1) << "[GhostShellMedia]     " << kind_label
+              << ": " << items_added << "/" << items_seen
+              << " device(s) added";
     };
 
     auto& cfg = GhostShellConfig::GetInstance();
     parse_list(cfg.GetAudioInputsJSON(),
-               mojom::blink::MediaDeviceType::kMediaAudioInput);
+               mojom::blink::MediaDeviceType::kMediaAudioInput,
+               "audio_inputs",  0);
     parse_list(cfg.GetVideoInputsJSON(),
-               mojom::blink::MediaDeviceType::kMediaVideoInput);
+               mojom::blink::MediaDeviceType::kMediaVideoInput,
+               "video_inputs",  1);
     parse_list(cfg.GetAudioOutputsJSON(),
-               mojom::blink::MediaDeviceType::kMediaAudioOutput);
+               mojom::blink::MediaDeviceType::kMediaAudioOutput,
+               "audio_outputs", 2);
+
+    VLOG(1) << "[GhostShellMedia] resolving with "
+            << spoofed_devices.size()
+            << " devices total (ai=" << per_kind_count[0]
+            << " vi=" << per_kind_count[1]
+            << " ao=" << per_kind_count[2] << ")";
 
     result_tracker->Resolve(spoofed_devices);
     tracer->End();
     return promise;
   }
+  VLOG(1) << "[GhostShellMedia] IsActive=false, falling through to native "
+             "enumerateDevices() — selfcheck will see real-hardware list";
   // === END GHOST SHELL ===
 
   SendLogMessage(base::StringPrintf(
@@ -1735,76 +1798,4 @@ void MediaDevices::ResolveCropTargetPromise(Element* element,
   const base::Token token = SubCaptureTargetIdToToken(id);
   if (token.is_zero()) {
     resolver->Reject();
-    RecordUma(SubCaptureTarget::Type::kCropTarget,
-              ProduceTargetPromiseResult::kPromiseRejected);
-    return;
-  }
-
-  element->SetRegionCaptureCropId(std::make_unique<RegionCaptureCropId>(token));
-  resolver->Resolve(MakeGarbageCollected<CropTarget>(id));
-  RecordUma(SubCaptureTarget::Type::kCropTarget,
-            ProduceTargetPromiseResult::kPromiseResolved);
-}
-
-void MediaDevices::ReportSuccessfulGetUserMedia() {
-  DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
-  if (first_gum_state_ != FirstGetUserMediaState::kNoGetUserMedia) {
-    return;
-  }
-
-  switch (first_ed_state_) {
-    case FirstEnumerateDevicesState::kNoEnumeration:
-      first_gum_state_ = FirstGetUserMediaState::kBeforeEnumerateDevices;
-      RecordUma(EnumerateDevicesGetUserMediaInteraction::kGetUserMediaFirst);
-      break;
-    case FirstEnumerateDevicesState::kFailed:
-      first_gum_state_ = FirstGetUserMediaState::kAfterEnumerateDevices;
-      RecordUma(EnumerateDevicesGetUserMediaInteraction::
-                    kFailedEnumerateDevicesThenGetUserMedia);
-      break;
-    case FirstEnumerateDevicesState::kSuccessful:
-      first_gum_state_ = FirstGetUserMediaState::kAfterEnumerateDevices;
-      RecordUma(EnumerateDevicesGetUserMediaInteraction::
-                    kSuccessfulEnumerateDevicesThenGetUserMedia);
-      break;
-  }
-}
-
-void MediaDevices::ReportCompletedEnumerateDevices(bool is_successful) {
-  DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
-  if (first_ed_state_ != FirstEnumerateDevicesState::kNoEnumeration) {
-    return;
-  }
-
-  if (is_successful) {
-    first_ed_state_ = FirstEnumerateDevicesState::kSuccessful;
-    switch (first_gum_state_) {
-      case FirstGetUserMediaState::kNoGetUserMedia:
-        RecordUma(EnumerateDevicesGetUserMediaInteraction::
-                      kSuccessfulEnumerateDevicesFirst);
-        break;
-      case FirstGetUserMediaState::kBeforeEnumerateDevices:
-        RecordUma(EnumerateDevicesGetUserMediaInteraction::
-                      kGetUserMediaThenSuccessfulEnumerateDevices);
-        break;
-      case FirstGetUserMediaState::kAfterEnumerateDevices:
-        NOTREACHED();
-    }
-  } else {
-    first_ed_state_ = FirstEnumerateDevicesState::kFailed;
-    switch (first_gum_state_) {
-      case FirstGetUserMediaState::kNoGetUserMedia:
-        RecordUma(EnumerateDevicesGetUserMediaInteraction::
-                      kFailedEnumerateDevicesFirst);
-        break;
-      case FirstGetUserMediaState::kBeforeEnumerateDevices:
-        RecordUma(EnumerateDevicesGetUserMediaInteraction::
-                      kGetUserMediaThenFailedEnumerateDevices);
-        break;
-      case FirstGetUserMediaState::kAfterEnumerateDevices:
-        NOTREACHED();
-    }
-  }
-}
-
-}  // namespace blink
+    

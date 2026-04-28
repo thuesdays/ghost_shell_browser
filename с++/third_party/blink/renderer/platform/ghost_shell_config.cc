@@ -2,15 +2,20 @@
 
 #include "third_party/blink/renderer/platform/ghost_shell_config.h"
 
+#include <mutex>
 #include <optional>
+#include <string>
+#include <vector>
 
 #include "base/base64.h"
 #include "base/command_line.h"
 #include "base/json/json_reader.h"
 #include "base/json/json_writer.h"
 #include "base/logging.h"
+#include "base/no_destructor.h"
 #include "base/values.h"
 #include "base/containers/span.h"
+#include "third_party/blink/renderer/platform/allow_discouraged_type.h"
 
 namespace blink {
 
@@ -106,7 +111,19 @@ void GhostShellConfig::Initialize() {
   // ─── Hardware ──────────────────────────────────────────
   if (const auto* hw = dict.FindDict("hardware")) {
     hardware_concurrency_ = hw->FindInt("hardware_concurrency").value_or(hardware_concurrency_);
-    device_memory_        = hw->FindDouble("device_memory").value_or(device_memory_);
+    // device_memory: builder writes Python int 8, JSON encodes as "8"
+    // (no decimal). base::Value::FindDouble matches ONLY double-typed
+    // values, returning nullopt for ints. This caused device_memory_
+    // to stay at 0, the Blink patch fell through to native, and the
+    // selfcheck device_memory_matches always read native Chrome value
+    // instead of payload value. Try FindInt first as the common case
+    // (W3C clamps deviceMemory to {0.25, 0.5, 1, 2, 4, 8}, so usual
+    // values are integer), then FindDouble for fractional payloads.
+    if (auto i = hw->FindInt("device_memory")) {
+      device_memory_ = static_cast<double>(*i);
+    } else {
+      device_memory_ = hw->FindDouble("device_memory").value_or(device_memory_);
+    }
     platform_             = ToBlinkString(hw->FindString("platform"));
     user_agent_           = ToBlinkString(hw->FindString("user_agent"));
     max_touch_points_     = hw->FindInt("max_touch_points").value_or(max_touch_points_);
@@ -360,40 +377,81 @@ bool GhostShellConfig::GetCodecPowerEfficient(const String& key) const {
 
 }  // namespace blink
 
-extern "C" {
-bool GhostShell_IsActive() {
-  return blink::GhostShellConfig::GetInstance().IsActive();
-}
-int GhostShell_GetRandomSeed() {
-  return blink::GhostShellConfig::GetInstance().GetRandomSeed();
+// ────────────────────────────────────────────────────────────────────
+// C-BRIDGE STANDALONE STORE
+//
+// CRITICAL: the extern "C" GhostShell_* functions below are called from
+// non-Blink processes — most importantly, the **network service process**
+// via net/socket/ssl_client_socket_impl.cc and the **BoringSSL** library
+// via third_party/boringssl/src/ssl/extensions.cc.
+//
+// The network service process does NOT initialize Blink's WTF Partitions
+// allocator. The original implementation forwarded these bridge calls to
+// `blink::GhostShellConfig::GetInstance()` which used `WTF::Vector` /
+// `WTF::String` internally — those allocate via WTF Partitions. First
+// call from network service triggered:
+//
+//   FATAL: third_party/blink/renderer/platform/wtf/allocator/partitions.h:72
+//          DCHECK failed: initialized_.
+//
+// The network service then crash-restarted in a tight loop (~1s cadence),
+// breaking ALL outgoing connections. Symptom: Chrome session OK, init
+// data:text/html OK, but every HTTPS / HTTP navigation hangs ~120s and
+// is killed by selenium's watchdog.
+//
+// FIX: keep all C-bridge state in a separate, WTF-free, std::-based
+// store. Bridge functions parse the CLI flag directly via base::* APIs
+// (CommandLine, JSONReader, Base64Decode) which work in every process.
+// Blink-side `GhostShellConfig` is kept untouched for Blink consumers
+// (the renderer-side patches that need WTF::Vector<WTF::String>).
+// ────────────────────────────────────────────────────────────────────
+
+namespace {
+
+struct GhostShellBridgeData {
+  bool          active        = false;
+  int           random_seed   = 0;
+  // ALLOW_DISCOURAGED_TYPE: must be std::vector, not WTF::Vector — this
+  // struct lives behind extern "C" bridge functions called from network
+  // service / BoringSSL where Blink's WTF Partitions allocator is NOT
+  // initialized. Using WTF::Vector here triggered FATAL DCHECK in
+  // partitions.h:72 ("initialized_") and crash-restart loop on the
+  // network service, which broke every HTTPS navigation.
+  std::vector<unsigned short> tls_cipher_suites
+      ALLOW_DISCOURAGED_TYPE("non-Blink-process bridge: WTF unavailable");
+  std::vector<unsigned short> tls_supported_groups
+      ALLOW_DISCOURAGED_TYPE("non-Blink-process bridge: WTF unavailable");
+};
+
+// Returns a process-local singleton. base::NoDestructor doesn't pull WTF.
+GhostShellBridgeData& GhostShellBridge() {
+  static base::NoDestructor<GhostShellBridgeData> d;
+  return *d;
 }
 
-// Tier 1 #4 — JA3 cipher suites bridge.
-// Copies up to `max` u16 values from the per-profile cipher list into
-// `out`. Returns the count actually written (or 0 if inactive / list
-// empty / out null). BoringSSL uses the count to decide whether to
-// override its default cipher selection.
-int GhostShell_GetTLSCipherSuites(unsigned short* out, int max) {
-  auto& cfg = blink::GhostShellConfig::GetInstance();
-  if (!cfg.IsActive() || !out || max <= 0) return 0;
-  const auto& list = cfg.GetTLSCipherSuites();
-  int n = 0;
-  for (int v : list) {
-    if (n >= max) break;
-    out[n++] = static_cast<unsigned short>(v & 0xFFFF);
-  }
-  return n;
-}
+// One-shot initializer. Idempotent + thread-safe via std::call_once.
+void EnsureBridgeInitialized() {
+  static std::once_flag init_flag;
+  std::call_once(init_flag, []() {
+    auto& d = GhostShellBridge();
+    base::CommandLine* cl = base::CommandLine::ForCurrentProcess();
+    if (!cl || !cl->HasSwitch("ghost-shell-payload")) return;
 
-int GhostShell_GetTLSSupportedGroups(unsigned short* out, int max) {
-  auto& cfg = blink::GhostShellConfig::GetInstance();
-  if (!cfg.IsActive() || !out || max <= 0) return 0;
-  const auto& list = cfg.GetTLSSupportedGroups();
-  int n = 0;
-  for (int v : list) {
-    if (n >= max) break;
-    out[n++] = static_cast<unsigned short>(v & 0xFFFF);
-  }
-  return n;
-}
-}
+    std::string b64 = cl->GetSwitchValueASCII("ghost-shell-payload");
+    std::string json;
+    if (!base::Base64Decode(b64, &json)) return;
+
+    auto root = base::JSONReader::Read(json, 0);
+    if (!root || !root->is_dict()) return;
+    const auto& dict = root->GetDict();
+
+    d.active = true;
+    if (const auto* noise = dict.FindDict("noise")) {
+      d.random_seed = noise->FindInt("seed").value_or(0);
+    }
+    if (const auto* tls = dict.FindDict("tls")) {
+      if (const auto* ciphers = tls->FindList("cipher_suites")) {
+        for (const auto& v : *ciphers) {
+          if (v.is_int()) {
+            d.tls_cipher_suites.push_back(
+    

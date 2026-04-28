@@ -210,11 +210,53 @@ class ChromeImporter:
             cutoff_ts = self._chrome_ts(
                 datetime.now() - timedelta(days=days))
 
-            # Open read-only. If Chrome held an exclusive lock for a
-            # moment during our copy, sqlite will return SQLITE_BUSY
-            # here — busy_timeout lets it retry for 3 seconds.
-            src_conn = sqlite3.connect(f"file:{tmp_src}?mode=ro", uri=True)
-            src_conn.execute("PRAGMA busy_timeout=3000")
+            # Open read-only. We need TWO modifiers beyond `mode=ro`:
+            #   • immutable=1  — promises SQLite the file won't change
+            #     while open, which lets it skip WAL recovery and any
+            #     locking entirely. Without this, the freshly copied
+            #     -wal sidecar (which can carry in-progress write-ahead
+            #     entries from the live source) makes SQLite try to
+            #     recover the journal, which needs a write lock — and
+            #     mode=ro forbids that → "database is locked" on the
+            #     very first SELECT. immutable=1 short-circuits all of
+            #     that.
+            #   • nolock=1     — secondary belt-and-suspenders for the
+            #     edge case where immutable isn't honoured (older sqlite
+            #     builds, mixed VFS).
+            # If even that fails, we tear off the -wal / -shm sidecars
+            # from the copy (so SQLite sees a clean closed DB) and
+            # reconnect. We accept losing the last few seconds of host
+            # Chrome's writes — they're irrelevant for an enrichment
+            # sample of "recent browsing".
+            uri = f"file:{tmp_src}?mode=ro&immutable=1&nolock=1"
+            try:
+                src_conn = sqlite3.connect(uri, uri=True)
+                src_conn.execute("PRAGMA busy_timeout=3000")
+                # Probe the schema once so a deferred lock surfaces here,
+                # not in the middle of fetching rows.
+                src_conn.execute("SELECT 1 FROM sqlite_master LIMIT 1").fetchone()
+            except sqlite3.OperationalError as _lock_err:
+                logging.warning(
+                    f"[import] read-only open failed ({_lock_err}); "
+                    f"retrying after stripping -wal/-shm sidecars"
+                )
+                try:
+                    src_conn.close()
+                except Exception:
+                    pass
+                for _suffix in ("-wal", "-shm"):
+                    _side = tmp_src + _suffix
+                    try:
+                        if os.path.exists(_side):
+                            os.remove(_side)
+                    except OSError:
+                        pass
+                # Now the copy is a clean main-file-only DB. Open again.
+                src_conn = sqlite3.connect(
+                    f"file:{tmp_src}?mode=ro&immutable=1&nolock=1",
+                    uri=True,
+                )
+                src_conn.execute("PRAGMA busy_timeout=3000")
             src_conn.row_factory = sqlite3.Row
 
             rows = src_conn.execute(f"""

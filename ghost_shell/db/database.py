@@ -122,6 +122,39 @@ CREATE TABLE IF NOT EXISTS action_events (
 CREATE INDEX IF NOT EXISTS idx_aev_run       ON action_events(run_id);
 CREATE INDEX IF NOT EXISTS idx_aev_domain_ts ON action_events(ad_domain, timestamp DESC);
 CREATE INDEX IF NOT EXISTS idx_aev_profile_ts ON action_events(profile_name, timestamp DESC);
+
+-- Per-tester scores from external fingerprint testers (CreepJS,
+-- Pixelscan, Sannysoft, AmIUnique, BrowserLeaks, FP-com BotD).
+-- Populated by the FP-probe pipeline after the dwell on each tester
+-- page, via the `extract_external_fp` action type in actions/runner.py.
+-- Drives the "Last result" badge on each tester card in the Profile
+-- Editor → Runtime self-check → External fingerprint testers section.
+--   tester_id    canonical key matching FP_TESTERS in profile-detail.js
+--                ("creepjs" | "pixelscan" | "sannysoft" | "amiunique"
+--                 | "browserleaks" | "fpcom")
+--   trust_score  numeric 0-100 where applicable, NULL for testers that
+--                don't expose a single score
+--   raw_json     full extracted payload for debugging
+CREATE TABLE IF NOT EXISTS external_fp_results (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id        INTEGER,
+    profile_name  TEXT NOT NULL,
+    timestamp     TEXT NOT NULL,
+    tester_id     TEXT NOT NULL,
+    tester_label  TEXT,
+    url           TEXT,
+    trust_score   REAL,
+    fingerprint_id TEXT,
+    lies_count    INTEGER,
+    summary       TEXT,
+    raw_json      TEXT,
+    error         TEXT,
+    FOREIGN KEY (run_id) REFERENCES runs(id) ON DELETE SET NULL
+);
+CREATE INDEX IF NOT EXISTS idx_extfp_profile_ts
+    ON external_fp_results(profile_name, timestamp DESC);
+CREATE INDEX IF NOT EXISTS idx_extfp_tester
+    ON external_fp_results(tester_id, timestamp DESC);
 CREATE INDEX IF NOT EXISTS idx_aev_outcome   ON action_events(outcome, timestamp DESC);
 
 CREATE TABLE IF NOT EXISTS ip_history (
@@ -2681,6 +2714,71 @@ class DB:
         return [dict(r) for r in rows]
 
     # ──────────────────────────────────────────────────────────
+    # EXTERNAL FINGERPRINT TESTERS (CreepJS, Pixelscan, etc.)
+    # ──────────────────────────────────────────────────────────
+
+    def external_fp_add(self, *, run_id: Optional[int], profile_name: str,
+                        tester_id: str, tester_label: str = None,
+                        url: str = None,
+                        trust_score: float = None,
+                        fingerprint_id: str = None,
+                        lies_count: int = None,
+                        summary: str = None,
+                        raw_json: str = None,
+                        error: str = None):
+        """Persist one external fingerprint tester result. Called by the
+        runner after the `extract_external_fp` action runs on the
+        tester page."""
+        self._get_conn().execute("""
+            INSERT INTO external_fp_results
+                (run_id, profile_name, timestamp, tester_id, tester_label,
+                 url, trust_score, fingerprint_id, lies_count, summary,
+                 raw_json, error)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            run_id, profile_name,
+            datetime.now().isoformat(timespec="seconds"),
+            tester_id, tester_label, url,
+            trust_score, fingerprint_id, lies_count, summary,
+            raw_json, error,
+        ))
+        self._get_conn().commit()
+
+    def external_fp_latest(self, profile_name: str) -> dict:
+        """Return the latest result PER tester for one profile.
+        Shape: {"creepjs": {...row...}, "pixelscan": {...}, ...}
+        Empty dict if profile never ran a probe.
+        """
+        rows = self._get_conn().execute("""
+            SELECT * FROM external_fp_results e
+            WHERE profile_name = ?
+              AND timestamp = (
+                  SELECT MAX(timestamp) FROM external_fp_results
+                  WHERE profile_name = e.profile_name
+                    AND tester_id    = e.tester_id
+              )
+        """, (profile_name,)).fetchall()
+        return {r["tester_id"]: dict(r) for r in rows}
+
+    def external_fp_history(self, profile_name: str,
+                            tester_id: str = None,
+                            limit: int = 50) -> list[dict]:
+        """Full history for a profile, optionally filtered to one tester."""
+        if tester_id:
+            rows = self._get_conn().execute("""
+                SELECT * FROM external_fp_results
+                WHERE profile_name = ? AND tester_id = ?
+                ORDER BY timestamp DESC LIMIT ?
+            """, (profile_name, tester_id, limit)).fetchall()
+        else:
+            rows = self._get_conn().execute("""
+                SELECT * FROM external_fp_results
+                WHERE profile_name = ?
+                ORDER BY timestamp DESC LIMIT ?
+            """, (profile_name, limit)).fetchall()
+        return [dict(r) for r in rows]
+
+    # ──────────────────────────────────────────────────────────
     # IP HISTORY
     # ──────────────────────────────────────────────────────────
 
@@ -2880,7 +2978,40 @@ class DB:
                          source: str = "generated",
                          reason: str = None) -> int:
         """Save a new fingerprint snapshot. Previous ones stay in the
-        table as history; only is_current flag moves."""
+        table as history; only is_current flag moves.
+
+        SCHEMA AUDIT GUARD (#119): two payload shapes coexist —
+        DeviceTemplateBuilder (NESTED, runtime-compatible) and the
+        legacy generator.py (FLAT). The C++ side only reads NESTED.
+        We log a warning when a legacy-shaped payload lands here so
+        the operator can see at write-time which path produced an
+        incompatible row, instead of discovering it at next launch
+        when runtime's payload-shape guard discards the row and
+        regenerates. We do NOT outright reject because a few
+        non-runtime callers (history snapshot from external import,
+        legacy CLI test tooling) still pass flat payloads.
+        """
+        if isinstance(payload, dict):
+            hw = payload.get("hardware")
+            looks_runtime = (
+                isinstance(hw, dict) and
+                (hw.get("user_agent") is not None or
+                 hw.get("device_memory") is not None or
+                 hw.get("hardware_concurrency") is not None)
+            )
+            if not looks_runtime:
+                # legacy / unknown shape — surface in logs so root cause is visible
+                logging.warning(
+                    f"[fingerprint_save] payload for profile "
+                    f"{profile_name!r} is in LEGACY (flat) shape — "
+                    f"ghost_shell_config.cc on the C++ side reads the "
+                    f"NESTED shape, so a payload saved like this is "
+                    f"effectively ignored at runtime (the runtime "
+                    f"payload-shape guard will discard and regenerate). "
+                    f"Source: {source!r}, reason: {reason!r}. Top-level "
+                    f"keys: {list(payload.keys())[:10]}"
+                )
+
         conn = self._get_conn()
         with conn:
             # Demote previous current
@@ -2931,6 +3062,33 @@ class DB:
             except Exception:
                 d["locked_fields"] = []
         return d
+
+    def fingerprint_update_scoring(self, profile_name: str, *,
+                                   coherence_score: int = None,
+                                   coherence_report: dict = None) -> bool:
+        """Update ONLY the coherence_score and coherence_report on the
+        currently-active fingerprint row, without touching template /
+        payload / source / is_current. Used by the runtime when
+        reusing a saved fingerprint: we want fresh validator output
+        on every launch, but we mustn't demote+re-insert the row
+        (that would clobber the user's regen).
+
+        Returns True if a row was updated, False if no current FP.
+        """
+        conn = self._get_conn()
+        with conn:
+            cur = conn.execute(
+                "UPDATE fingerprints SET coherence_score = ?, "
+                "coherence_report = ? "
+                "WHERE profile_name = ? AND is_current = 1",
+                (
+                    coherence_score,
+                    json.dumps(coherence_report, ensure_ascii=False)
+                        if coherence_report else None,
+                    profile_name,
+                ),
+            )
+            return (cur.rowcount or 0) > 0
 
     def fingerprint_get(self, fingerprint_id: int) -> Optional[dict]:
         """Get a specific fingerprint by id (for history restoration)."""
@@ -4647,9 +4805,19 @@ class DB:
             return (cur.rowcount or 0) > 0
 
     def profile_is_ready(self, name: str) -> bool:
-        """True if the profile has a non-NULL ready_at (or doesn't
-        track readiness — legacy rows). False only when the column
-        exists AND the row's value is NULL (mid-bulk-create)."""
+        """True if the profile has a non-NULL ready_at, OR doesn't
+        track readiness (legacy rows), OR has no DB row at all
+        (implicit profile — exists only on filesystem, never touched
+        the dashboard's bulk-create pipeline). False only when the
+        row exists AND its ready_at is explicitly NULL (mid-bulk-create
+        in progress).
+
+        The previous version returned False when no row existed,
+        which broke legitimate workflows: filesystem-copied backups,
+        externally-imported user-data-dirs, and any profile created
+        before the readiness column was introduced. Those are all
+        ready to launch — they just predate the readiness tracking.
+        """
         try:
             row = self._get_conn().execute(
                 "SELECT ready_at FROM profiles WHERE name = ?", (name,)
@@ -4659,7 +4827,10 @@ class DB:
             # to preserve legacy behaviour.
             return True
         if not row:
-            return False
+            # Implicit profile (no DB row, but disk dir exists). Pre-
+            # dates the bulk-create pipeline and was never queued for
+            # async setup, so it has nothing to wait on.
+            return True
         # If the column doesn't exist, sqlite returns the row but
         # ready_at access fails. dict-row access returns None for
         # missing columns; we treat None as not-ready.

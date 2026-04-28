@@ -440,6 +440,8 @@ const ProfileDetail = {
                      color: inherit; cursor: pointer; transition: border-color .15s;">
         <div style="font-weight:600;">${t.icon} ${escapeHtml(t.label)}</div>
         <div class="muted" style="font-size:11px;">${escapeHtml(t.tagline)}</div>
+        <div class="fp-tester-result" data-result-for="${id}"
+             style="margin-top:6px; font-size:11px;"></div>
       </button>
     `).join("");
     grid.querySelectorAll("[data-tester-id]").forEach(btn => {
@@ -453,6 +455,92 @@ const ProfileDetail = {
       c.addEventListener("mouseleave",
         () => c.style.borderColor = "var(--border,#2a3142)");
     });
+    // Show last results immediately on first render so users coming
+    // back to the page see history without re-running the probe.
+    this._loadAndRenderExternalFpResults();
+  },
+
+  // Fetch latest results once and paint each tester card.
+  async _loadAndRenderExternalFpResults() {
+    if (!this.currentProfile) return;
+    try {
+      const r = await api(
+        `/api/profiles/${encodeURIComponent(this.currentProfile)}` +
+        `/fingerprint/external-results`);
+      if (r && r.ok && r.latest) this._renderExternalFpResults(r.latest);
+    } catch (e) {
+      // Non-fatal: cards just stay blank. Don't toast here — users
+      // shouldn't get a popup just because they opened the page.
+    }
+  },
+
+  _renderExternalFpResults(latest) {
+    const grid = document.getElementById("fp-tester-grid");
+    if (!grid) return;
+    grid.querySelectorAll("[data-result-for]").forEach(el => {
+      const tid = el.dataset.resultFor;
+      const r = latest[tid];
+      if (!r) {
+        el.innerHTML = `<span class="muted">no result yet — click 🚀 below</span>`;
+        return;
+      }
+      const ts = r.timestamp ? timeAgo(r.timestamp) : "";
+      if (r.error) {
+        el.innerHTML =
+          `<span style="color:#fca5a5;">✗ ${escapeHtml(r.error.slice(0,80))}</span>` +
+          ` <span class="muted">${escapeHtml(ts)}</span>`;
+        return;
+      }
+      const parts = [];
+      if (typeof r.trust_score === "number") {
+        const c = r.trust_score >= 70 ? "#6ee7b7"
+                : r.trust_score >= 40 ? "#fcd34d"
+                : "#fca5a5";
+        parts.push(`<span style="color:${c}; font-weight:600;">` +
+                   `trust ${r.trust_score}%</span>`);
+      }
+      if (typeof r.lies_count === "number" && r.lies_count > 0) {
+        parts.push(`<span style="color:#fca5a5;">${r.lies_count} lies</span>`);
+      }
+      if (r.fingerprint_id) {
+        parts.push(`<span class="muted" ` +
+                   `style="font-family:ui-monospace,monospace;">` +
+                   `${escapeHtml(r.fingerprint_id.slice(0,12))}</span>`);
+      }
+      if (!parts.length) parts.push(`<span class="muted">recorded</span>`);
+      parts.push(`<span class="muted">${escapeHtml(ts)}</span>`);
+      el.innerHTML = parts.join(" · ");
+    });
+  },
+
+  // After a probe run is spawned, poll the external-results endpoint
+  // every 8s until we see fresh results for all expected testers (or
+  // we hit the timeout). Updates the per-tester result line in place.
+  async _pollExternalFpResults(expectedCount, singleTesterId) {
+    if (!this.currentProfile) return;
+    const startTs = new Date().toISOString();   // anything newer than this is "fresh"
+    const endAt   = Date.now() + 4 * 60 * 1000;  // up to 4 minutes
+    const seen    = new Set();
+    while (Date.now() < endAt) {
+      await new Promise(r => setTimeout(r, 8000));
+      try {
+        const r = await api(
+          `/api/profiles/${encodeURIComponent(this.currentProfile)}` +
+          `/fingerprint/external-results`);
+        if (r && r.ok && r.latest) {
+          // Mark testers whose latest timestamp is newer than the
+          // probe start as "seen this run".
+          for (const [tid, row] of Object.entries(r.latest)) {
+            if (row.timestamp && row.timestamp >= startTs) seen.add(tid);
+          }
+          this._renderExternalFpResults(r.latest);
+          // If user picked a single tester, stop as soon as it reports.
+          if (singleTesterId && seen.has(singleTesterId)) break;
+          // Multi-tester probe: stop when we've seen all expected.
+          if (!singleTesterId && seen.size >= expectedCount) break;
+        }
+      } catch (e) { /* keep polling */ }
+    }
   },
 
   // Open the modal for one tester. Pulls coherence data from the
@@ -640,10 +728,11 @@ const ProfileDetail = {
         toast(`Probe failed: ${r.error || "unknown"}`, true);
         if (status) status.textContent = `✗ ${r.error || "failed"}`;
       } else {
-        toast(`✓ Probe run #${r.run_id} started — open Logs to watch`);
+        toast(`✓ Probe run #${r.run_id} started — results in ~${r.tester_count*30}s`);
         if (status) {
           status.textContent =
-            `Run #${r.run_id} started — visiting ${r.tester_count} tester(s)`;
+            `Run #${r.run_id} started — visiting ${r.tester_count} tester(s) ` +
+            `(results will appear under each tester card when ready)`;
           status.style.color = "#6ee7b7";
         }
         // Auto-close the per-tester modal so user sees the toast +
@@ -652,6 +741,10 @@ const ProfileDetail = {
           const m = document.getElementById("fp-tester-modal");
           if (m) m.style.display = "none";
         }
+        // Start polling for results — each tester takes ~30-40s
+        // including dwell + extract, so we poll every 8s for up to
+        // 4 minutes and stop early once all expected testers report.
+        this._pollExternalFpResults(r.tester_count || 1, opts.testerId);
       }
     } catch (e) {
       toast(`Probe failed: ${e.message || e}`, true);

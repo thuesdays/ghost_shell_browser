@@ -11,7 +11,7 @@ setlocal EnableDelayedExpansion
 REM --- Config ---
 set "CHROMIUM_SRC=F:\projects\chromium\src"
 set "BUILD_DIR=out\GhostShell"
-set "DEPLOY_DIR=F:\projects\goodmedika\chrome_win64"
+set "DEPLOY_DIR=f:\projects\ghost_shell_browser\chrome_win64"
 
 set "SRC=%CHROMIUM_SRC%\%BUILD_DIR%"
 

@@ -866,35 +866,58 @@ class DeviceTemplateBuilder:
     # ──────────────────────────────────────────────────────────
 
     def generate_payload_dict(self) -> Dict[str, Any]:
-        logger.info(f"Building payload for '{self.profile_name}' (template={self.template['name']})")
-        return {
-            "version":       self.VERSION,
-            "profile_name":  self.profile_name,
-            "template_name": self.template["name"],
-            "hardware":      self._build_hardware(),
-            "languages":     self._build_languages(),
-            "screen":        self._build_screen(),
-            "graphics":      self._build_graphics(),
-            "audio":         self._build_audio(),
-            "timezone":      self._build_timezone(),
-            "battery":       self._build_battery(),
-            "connection":    self._build_connection(),
-            "media":         self._build_media_devices(),
-            "noise":         self._build_noise(),
-            "fonts":         self._build_fonts(),
-            "ua_metadata":   self._build_ua_metadata(),
-            "plugins":       STANDARD_CHROME_PLUGINS,
-            "permissions":   self._build_permissions(),
-            # New for Feature #8 — WebGL/WebGPU consistency + per-tier
-            # codec matrix. Consumed by:
-            #   - ghost_shell_config.cc GPU parser (unmasked_vendor/renderer)
-            #   - ghost_shell_config.cc codecs parser (codec map)
-            #   - patches 6 + 7 in CHROMIUM_PATCHES_4.md
-            "gpu":           self._build_gpu(),
-            "codecs":        self._build_codecs(),
-        }
+        """
+        Returns the per-profile fingerprint payload.
+
+        CRITICAL: this used to call all the _build_* helpers on EVERY
+        invocation, which advanced self.rnd's state and produced a
+        DIFFERENT dict each time. Downstream consumers ended up out of
+        sync — `_apply_cdp_overrides(payload)` got dict A while
+        `get_cli_flag()` (used to assemble --ghost-shell-payload for
+        the C++ core) got dict B. So the JS-shim layer and the Chromium
+        C++ layer disagreed on noise values. Symptom in chromedriver
+        log: timezone shim injected with J=1 while the C++ payload
+        carried timezone_offset_jitter=0.
+        Fix: memoise the result. First call computes; later calls
+        return the same dict.
+        """
+        if getattr(self, "_cached_payload", None) is None:
+            logger.info(
+                f"Building payload for '{self.profile_name}' "
+                f"(template={self.template['name']})"
+            )
+            self._cached_payload = {
+                "version":       self.VERSION,
+                "profile_name":  self.profile_name,
+                "template_name": self.template["name"],
+                "hardware":      self._build_hardware(),
+                "languages":     self._build_languages(),
+                "screen":        self._build_screen(),
+                "graphics":      self._build_graphics(),
+                "audio":         self._build_audio(),
+                "timezone":      self._build_timezone(),
+                "battery":       self._build_battery(),
+                "connection":    self._build_connection(),
+                "media":         self._build_media_devices(),
+                "noise":         self._build_noise(),
+                "fonts":         self._build_fonts(),
+                "ua_metadata":   self._build_ua_metadata(),
+                "plugins":       STANDARD_CHROME_PLUGINS,
+                "permissions":   self._build_permissions(),
+                # New for Feature #8 — WebGL/WebGPU consistency + per-tier
+                # codec matrix. Consumed by:
+                #   - ghost_shell_config.cc GPU parser (unmasked_vendor/renderer)
+                #   - ghost_shell_config.cc codecs parser (codec map)
+                #   - patches 6 + 7 in CHROMIUM_PATCHES_4.md
+                "gpu":           self._build_gpu(),
+                "codecs":        self._build_codecs(),
+            }
+        return self._cached_payload
 
     def get_cli_flag(self) -> str:
+        # Use the cached payload so the CLI flag is byte-for-byte
+        # identical to what the Python side passes via CDP. This is
+        # required for fingerprint coherence — see generate_payload_dict.
         payload_dict = self.generate_payload_dict()
         json_str = json.dumps(payload_dict, separators=(',', ':'), ensure_ascii=False)
         b64_encoded = base64.b64encode(json_str.encode('utf-8')).decode('ascii')

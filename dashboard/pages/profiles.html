@@ -259,13 +259,19 @@
       </div>
 
       <div class="form-group">
-        <label class="form-label">Proxy URL <span class="form-label-optional">(optional)</span></label>
+        <label class="form-label">Proxy <span class="form-label-optional">(optional)</span></label>
+        <select class="select" id="np-proxy-select">
+          <option value="">— inherit global proxy —</option>
+          <option value="__custom__">Custom URL…</option>
+        </select>
         <input type="text" class="input" id="np-proxy"
                placeholder="http://user:pass@host:port"
-               autocomplete="off" spellcheck="false">
+               autocomplete="off" spellcheck="false"
+               style="display: none; margin-top: 8px;">
         <div class="form-hint">
-          Sets a per-profile proxy override on creation. Leave empty to inherit
-          the global proxy from the Proxy page. Supports HTTP, HTTPS, SOCKS5.
+          Pick from your proxy library, or choose <em>Custom URL…</em> to type a
+          one-off override. Leave on <em>inherit global proxy</em> to use the
+          global proxy from the Proxy page. Supports HTTP, HTTPS, SOCKS5.
         </div>
       </div>
 

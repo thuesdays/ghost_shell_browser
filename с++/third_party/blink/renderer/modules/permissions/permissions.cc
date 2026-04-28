@@ -117,39 +117,83 @@ ScriptPromise<PermissionStatus> Permissions::query(
   // === GHOST SHELL: Permissions API spoofing ===
   // Return templated permission state before going to the browser process.
   // This prevents bot detectors from seeing "denied" for all permissions.
+  //
+  // VLOG instrumentation:
+  //   IsActive false              → skipped, native chrome handles
+  //   PermissionNameToString empty → enum -> string mapping incomplete
+  //                                  for this permission (e.g. clipboard-write
+  //                                  may map to "clipboard_write" with an
+  //                                  underscore where payload uses dash)
+  //   state_str empty              → mapping returned a key, but payload's
+  //                                  permissions dict has no entry for it
+  //   state_str "granted"/"denied"/anything else → final spoofed status
+  // Pulls together "selfcheck reads X but JS sees Y" debugging.
   {
     auto& gs = GhostShellConfig::GetInstance();
-    if (gs.IsActive()) {
-      String perm_name = PermissionNameToString(descriptor->name);
-      if (!perm_name.empty()) {
-        String state_str = gs.GetPermissionState(perm_name);
-        if (!state_str.empty()) {
-          mojom::blink::PermissionStatus fake_status;
-          if (state_str == "granted") {
-            fake_status = mojom::blink::PermissionStatus::GRANTED;
-          } else if (state_str == "denied") {
-            fake_status = mojom::blink::PermissionStatus::DENIED;
-          } else {
-            fake_status = mojom::blink::PermissionStatus::ASK;  // "prompt"
-          }
-
-          auto fake_result = mojom::blink::PermissionStatusWithDetails::New();
-          fake_result->status = fake_status;
-
-          PermissionStatusListener* listener =
-              GetOrCreatePermissionStatusListener(
-                  std::move(fake_result), descriptor->Clone());
-
-          auto* resolver = MakeGarbageCollected<
-              ScriptPromiseResolver<PermissionStatus>>(
-              script_state, exception_state.GetContext());
-          auto promise = resolver->Promise();
-          if (listener) {
-            resolver->Resolve(PermissionStatus::Take(listener, resolver));
-          }
-          return promise;
-        }
+    bool gs_active = gs.IsActive();
+    String perm_name = gs_active
+                           ? PermissionNameToString(descriptor->name)
+                           : String();
+    // Normalize to W3C spec form: PermissionNameToString returns
+    // inconsistent strings — some with dashes ("storage-access",
+    // "window-management"), some with underscores ("clipboard_write",
+    // "screen_wake_lock"). The JS API and our payload use the dash
+    // form (W3C spec). Without this normalization,
+    // GetPermissionState("clipboard_write") missed the payload entry
+    // "clipboard-write" and the patch silently fell through to native,
+    // making perm_clipboard_write_matches always fail.
+    // See chromium TODO crbug.com/1395451.
+    String perm_name_normalized = perm_name;
+    if (!perm_name_normalized.empty()) {
+      // WTF::String::Replace mutates in place — same idiom used in
+      // language.cc:41 and locale_to_script_mapping.cc:446.
+      perm_name_normalized.Replace('_', '-');
+    }
+    String state_str = (gs_active && !perm_name_normalized.empty())
+                           ? gs.GetPermissionState(perm_name_normalized)
+                           : String();
+    VLOG(1) << "[GhostShellPerm] query enum="
+            << static_cast<int>(descriptor->name)
+            << " IsActive=" << gs_active
+            << " perm_name_raw='"
+            << (perm_name.empty() ? String("<empty>") : perm_name).Utf8()
+            << "' perm_name_norm='"
+            << (perm_name_normalized.empty() ? String("<empty>")
+                                              : perm_name_normalized).Utf8()
+            << "' state='"
+            << (state_str.empty() ? String("<empty>") : state_str).Utf8()
+            << "'";
+    if (gs_active && !perm_name_normalized.empty() && !state_str.empty()) {
+      mojom::blink::PermissionStatus fake_status;
+      if (state_str == "granted") {
+        fake_status = mojom::blink::PermissionStatus::GRANTED;
+      } else if (state_str == "denied") {
+        fake_status = mojom::blink::PermissionStatus::DENIED;
+      } else {
+        fake_status = mojom::blink::PermissionStatus::ASK;  // "prompt"
       }
+      VLOG(1) << "[GhostShellPerm]   ✓ resolving with fake_status="
+              << static_cast<int>(fake_status);
+
+      auto fake_result = mojom::blink::PermissionStatusWithDetails::New();
+      fake_result->status = fake_status;
+
+      PermissionStatusListener* listener =
+          GetOrCreatePermissionStatusListener(
+              std::move(fake_result), descriptor->Clone());
+
+      auto* resolver = MakeGarbageCollected<
+          ScriptPromiseResolver<PermissionStatus>>(
+          script_state, exception_state.GetContext());
+      auto promise = resolver->Promise();
+      if (listener) {
+        resolver->Resolve(PermissionStatus::Take(listener, resolver));
+      }
+      return promise;
+    }
+    if (gs_active) {
+      VLOG(1) << "[GhostShellPerm]   → falling through to native "
+                 "(perm_name or state was empty)";
     }
   }
   // === END GHOST SHELL ===
@@ -405,61 +449,4 @@ void Permissions::PermissionVerificationComplete(
     mojom::blink::PermissionDescriptorPtr verification_descriptor,
     int internal_index_to_verify,
     bool is_bulk_request,
-    mojom::blink::PermissionStatusWithDetailsPtr verification_result) {
-  if (verification_result->status !=
-      results[internal_index_to_verify]->status) {
-    // The permission actually came from the verification descriptor, so use
-    // that descriptor when returning the permission status.
-    descriptors[internal_index_to_verify] = std::move(verification_descriptor);
-  }
-
-  VerifyPermissionsAndReturnStatus(resolver, std::move(descriptors),
-                                   std::move(caller_index_to_internal_index),
-                                   internal_index_to_verify, is_bulk_request,
-                                   std::move(results));
-}
-
-PermissionStatusListener* Permissions::GetOrCreatePermissionStatusListener(
-    mojom::blink::PermissionStatusWithDetailsPtr status,
-    mojom::blink::PermissionDescriptorPtr descriptor) {
-  auto type = GetPermissionType(*descriptor);
-  if (!type)
-    return nullptr;
-
-  if (!listeners_.Contains(*type)) {
-    listeners_.insert(*type, PermissionStatusListener::Create(
-                                 GetExecutionContext(), std::move(status),
-                                 std::move(descriptor)));
-  } else {
-    listeners_.at(*type)->SetStatus(std::move(status));
-  }
-
-  return listeners_.at(*type);
-}
-
-std::optional<PermissionType> Permissions::GetPermissionType(
-    const mojom::blink::PermissionDescriptor& descriptor) {
-  return PermissionDescriptorInfoToPermissionType(
-      descriptor.name,
-      descriptor.extension && descriptor.extension->is_midi() &&
-          descriptor.extension->get_midi()->sysex,
-      descriptor.extension && descriptor.extension->is_camera_device() &&
-          descriptor.extension->get_camera_device()->panTiltZoom,
-      descriptor.extension && descriptor.extension->is_clipboard() &&
-          descriptor.extension->get_clipboard()->will_be_sanitized,
-      descriptor.extension && descriptor.extension->is_clipboard() &&
-          descriptor.extension->get_clipboard()->has_user_gesture,
-      descriptor.extension && descriptor.extension->is_fullscreen() &&
-          descriptor.extension->get_fullscreen()->allow_without_user_gesture);
-}
-
-mojom::blink::PermissionDescriptorPtr
-Permissions::CreatePermissionVerificationDescriptor(
-    PermissionType descriptor_type) {
-  if (descriptor_type == PermissionType::CAMERA_PAN_TILT_ZOOM) {
-    return CreateVideoCapturePermissionDescriptor(false /* pan_tilt_zoom */);
-  }
-  return nullptr;
-}
-
-}  // namespace blink
+    mojom::blink::

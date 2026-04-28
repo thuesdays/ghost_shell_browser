@@ -153,17 +153,84 @@ class SessionManager:
         return data
 
     def import_storage(self, filepath: str, navigate_first: bool = True) -> int:
+        """Restore localStorage/sessionStorage from a previous session.
+
+        Two important guards added after the run #90 hang:
+
+        1. Skip the pre-navigation entirely when there's nothing to
+           restore. Loading google.com just to setItem zero keys
+           wastes proxy bytes and risks tripping captcha on launch.
+
+        2. Cap the navigation pageload at a short timeout (default 12s)
+           and swallow TimeoutException. The previous-session URL is
+           often google.com, which on a fresh launch with a sticky
+           proxy or a captcha-bound IP can hang up to Chrome's default
+           300s pageload limit — this manifested as the browser sitting
+           on the init data:text/html page indefinitely while the user
+           waited for "Imported X storage entries" to log.
+        """
         if not os.path.exists(filepath):
             return 0
         with open(filepath, "r", encoding="utf-8") as f:
             data = json.load(f)
 
+        local_kv   = data.get("localStorage") or {}
+        session_kv = data.get("sessionStorage") or {}
+
+        if not local_kv and not session_kv:
+            # Nothing to restore — don't burn a navigation just to log "0".
+            logging.debug(
+                "[Session] Storage import skipped: empty localStorage AND "
+                "sessionStorage in saved session"
+            )
+            return 0
+
         if navigate_first and data.get("url"):
-            self.driver.get(data["url"])
+            from selenium.common.exceptions import TimeoutException
+            url = data["url"]
+            old_timeout = None
+            try:
+                # Save current pageload timeout so we can restore it.
+                # set_page_load_timeout has no getter, so we rely on
+                # Chrome's default (300s) being the value to restore to.
+                self.driver.set_page_load_timeout(12)
+            except Exception:
+                pass
+            try:
+                self.driver.get(url)
+            except TimeoutException:
+                # Common case: the storage-origin URL (often google.com)
+                # hangs on the first load with a fresh proxy. We have
+                # SOME of the page by now — that's enough for setItem
+                # to land in the right origin scope.
+                logging.warning(
+                    f"[Session] storage-restore navigation timed out at "
+                    f"{url[:80]} — proceeding with whatever loaded"
+                )
+                try:
+                    self.driver.execute_script("window.stop();")
+                except Exception:
+                    pass
+            except Exception as e:
+                logging.warning(
+                    f"[Session] storage-restore navigation failed: {e} "
+                    f"— skipping storage import"
+                )
+                # Restore default timeout before bailing
+                try:
+                    self.driver.set_page_load_timeout(300)
+                except Exception:
+                    pass
+                return 0
+            finally:
+                try:
+                    self.driver.set_page_load_timeout(300)
+                except Exception:
+                    pass
             time.sleep(1)
 
         count = 0
-        for key, value in (data.get("localStorage") or {}).items():
+        for key, value in local_kv.items():
             try:
                 self.driver.execute_script(
                     "localStorage.setItem(arguments[0], arguments[1]);",
@@ -172,7 +239,7 @@ class SessionManager:
                 count += 1
             except Exception:
                 pass
-        for key, value in (data.get("sessionStorage") or {}).items():
+        for key, value in session_kv.items():
             try:
                 self.driver.execute_script(
                     "sessionStorage.setItem(arguments[0], arguments[1]);",

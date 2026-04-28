@@ -11,6 +11,7 @@ __author__ = "Mykola Kovhanko"
 __email__ = "thuesdays@gmail.com"
 
 import os
+import base64
 import json
 import random
 import logging
@@ -377,6 +378,14 @@ class GhostShellBrowser:
         self._watchdog_thread      = None
         self._watchdog_stop        = threading.Event()
         self._watchdog_fail_count  = 0
+        # Recovery #2 — when the main thread legitimately blocks for
+        # tens of seconds (force_rotate_ip's wait_for_rotation, IP
+        # geo-enrichment, full session restart), the watchdog's title
+        # probe would otherwise time out and kill the browser. Setting
+        # this event makes the loop skip probes — must be cleared via
+        # watchdog_resume() once the blocking work is done.
+        self._watchdog_pause       = threading.Event()
+        self._watchdog_pause_reason = ""
         self._gs_lock_path          = None
         # Lock heartbeat thread (RC-33 fix): refreshes
         # .ghost_shell.lock periodically so other ghost_shell processes
@@ -823,42 +832,207 @@ class GhostShellBrowser:
                 without them; the loud warning in logs tells the user
                 their extensions are the culprit and need attention.
         """
-        # 1. Generate Deterministic C++ Payload
-        builder = DeviceTemplateBuilder(profile_name=self.profile_name,
-                                        preferred_language=self.preferred_language)
-        payload = builder.generate_payload_dict()
+        # 1. Resolve the C++ Payload — saved-fingerprint-first strategy.
+        #
+        # Previously this block UNCONDITIONALLY built a fresh payload
+        # via DeviceTemplateBuilder(profile_name, language) and then
+        # saved it via fingerprint_save(), which DEMOTED any prior row
+        # (incl. the row a user just produced with "Regenerate
+        # fingerprint" in the dashboard).
+        #
+        # Net effect of the old behaviour: every regen got silently
+        # overwritten on the very next launch by the deterministic
+        # profile-name-hash result, and the dashboard's regen action
+        # was effectively a no-op for any profile that ran again.
+        # Symptom in the user's log: header showed
+        # template='enthusiast_nvidia_4090_4k' (the regen) but builder
+        # said template=gaming_nvidia_mid (the deterministic default).
+        #
+        # New strategy:
+        #   1. If a saved fingerprint exists in DB → reuse its payload
+        #      verbatim. Build the CLI flag from THAT payload (same
+        #      json+base64 codec the builder uses). NO save — saved
+        #      version is already canonical.
+        #   2. Otherwise (first run, no row) → build a fresh payload
+        #      via DeviceTemplateBuilder, save it for future runs.
+        #
+        # Side-benefit: header (read by main.py from fingerprint_current
+        # before launch starts) and the actual runtime payload now
+        # always agree.
+        from ghost_shell.db.database import get_db as _get_db
+        payload = None
+        stealth_flag = None
+        used_saved_fp = False
+        try:
+            _db = _get_db()
+            _saved = _db.fingerprint_current(self.profile_name) \
+                     if hasattr(_db, "fingerprint_current") else None
+        except Exception as _fp_read_err:
+            logging.debug(f"[GhostShellBrowser] FP read failed: {_fp_read_err}")
+            _saved = None
+
+        # Payload shape guard. There are two historical generators in
+        # this codebase:
+        #   • DeviceTemplateBuilder (this file → device_templates.py)
+        #     produces a NESTED payload — hardware.*, media.*, gpu.*,
+        #     codecs.*, ua_metadata.*, etc. This is the shape
+        #     ghost_shell_config.cc expects (its FindDict calls reach
+        #     in via "hardware", "media", "gpu", …).
+        #   • generator.py + templates.py produces a FLAT payload —
+        #     hardware_concurrency / device_memory / screen / webgl /
+        #     ua_client_hints all at the top level. C++ side never
+        #     parses this shape; every FindDict returns nullopt and
+        #     stealth silently disables.
+        # Both paths feed the same fingerprint_save() column, so a
+        # mixed-mode profile can end up with the wrong shape persisted.
+        # Detect via presence of the nested "hardware" dict — the
+        # DeviceTemplateBuilder always emits it; the legacy generator
+        # never does. If the saved row is the wrong shape, we abandon
+        # it and regenerate so the runtime/C++ side stays coherent.
+        def _payload_shape_is_runtime_compatible(p) -> bool:
+            if not isinstance(p, dict):
+                return False
+            hw = p.get("hardware")
+            return isinstance(hw, dict) and bool(
+                hw.get("user_agent") or
+                hw.get("device_memory") is not None or
+                hw.get("hardware_concurrency") is not None
+            )
+
+        if _saved and _saved.get("payload") and \
+           not _payload_shape_is_runtime_compatible(_saved["payload"]):
+            logging.warning(
+                "[GhostShellBrowser] saved fingerprint is in legacy "
+                "(generator.py) shape — incompatible with C++ "
+                "GhostShellConfig parser. Discarding and regenerating "
+                "via DeviceTemplateBuilder so stealth payload is "
+                "actually applied."
+            )
+            _saved = None
+
+        if _saved and _saved.get("payload"):
+            payload = _saved["payload"]
+            # Rebuild the CLI flag from the saved payload — same codec
+            # DeviceTemplateBuilder.get_cli_flag uses (compact JSON +
+            # base64). Keeps Python+C++ sides byte-identical so the
+            # GhostShellConfig parse on the C++ side sees exactly what
+            # was saved.
+            try:
+                _json_str = json.dumps(
+                    payload, separators=(',', ':'), ensure_ascii=False,
+                )
+                _b64 = base64.b64encode(
+                    _json_str.encode("utf-8")
+                ).decode("ascii")
+                stealth_flag = f"--ghost-shell-payload={_b64}"
+                used_saved_fp = True
+                logging.info(
+                    f"[GhostShellBrowser] using saved fingerprint "
+                    f"(template={(payload.get('template_name') or '?')!r}, "
+                    f"source={_saved.get('source')!r}); CLI flag length="
+                    f"{len(stealth_flag)} chars"
+                )
+            except Exception as _enc_err:
+                logging.warning(
+                    f"[GhostShellBrowser] saved FP couldn't be re-encoded "
+                    f"({_enc_err}); regenerating"
+                )
+                payload = None
+                stealth_flag = None
+
+        if payload is None:
+            # No saved FP (or saved was unusable) — build fresh.
+            builder = DeviceTemplateBuilder(
+                profile_name       = self.profile_name,
+                preferred_language = self.preferred_language,
+            )
+            payload      = builder.generate_payload_dict()
+            stealth_flag = builder.get_cli_flag()
+
         self.last_payload = payload   # exposed so main.py can log a summary
-        stealth_flag = builder.get_cli_flag()
 
         # Save a human-readable copy of the payload for C++ core loading (payload_debug.json)
         with open(os.path.join(self.user_data_path, "payload_debug.json"), "w", encoding="utf-8") as f:
             json.dump(payload, f, indent=4)
 
-        # Save also in DB for dashboard. Score via the validator before
-        # save so the score=None / grade=? black-hole goes away. The
-        # validator is fast (<10ms) and pure-Python -- no I/O -- so
-        # there's no reason to skip it on every runtime launch.
+        # Persist the fingerprint to DB ONLY when we generated a fresh
+        # one (otherwise we'd demote the saved row we just reused).
+        # Validator runs either way so the dashboard's score field is
+        # populated even on saved-FP launches that previously had None.
         try:
             from ghost_shell.db.database import get_db
             score = None
             report = None
             try:
                 from ghost_shell.fingerprint.validator import validate
-                # The validator wants the template too -- we pass through
-                # the same dict the builder used. Errors here are
-                # non-fatal: a degraded log line is better than an
-                # aborted launch.
+                # Validator expects the JS-probe / FLAT shape (navigator.*,
+                # webgl.*, ...), not our nested DeviceTemplateBuilder shape
+                # (hardware.*, graphics.*, ...). Without an adapter, half
+                # the validator checks silently see None and the score is
+                # artificially high. Build the adapter inline (small, no
+                # dashboard-side dependency).
+                hw   = (payload.get("hardware")   or {})
+                lang = (payload.get("languages")  or {})
+                scr  = (payload.get("screen")     or {})
+                gfx  = (payload.get("graphics")   or {})
+                aud  = (payload.get("audio")      or {})
+                tz   = (payload.get("timezone")   or {})
+                validator_input = {
+                    "navigator": {
+                        "userAgent":          hw.get("user_agent"),
+                        "platform":           hw.get("platform"),
+                        "hardwareConcurrency": hw.get("hardware_concurrency"),
+                        "deviceMemory":       hw.get("device_memory"),
+                        "maxTouchPoints":     hw.get("max_touch_points"),
+                        "language":           lang.get("language"),
+                        "languages":          lang.get("languages"),
+                        "vendor":             "Google Inc.",
+                        "webdriver":          False,
+                    },
+                    "screen":   {"width": scr.get("width"),
+                                 "height": scr.get("height")},
+                    "window":   {"devicePixelRatio": scr.get("pixel_ratio")},
+                    "webgl": {
+                        "vendor":     gfx.get("gl_vendor"),
+                        "renderer":   gfx.get("gl_renderer"),
+                        "extensions": gfx.get("webgl_extensions") or [],
+                    },
+                    "timezone": {"intl": tz.get("id")},
+                    "fonts":    payload.get("fonts") or [],
+                    "audio":    {"sampleRate": aud.get("sample_rate")},
+                    "_runtime_raw": payload,
+                }
                 template_for_score = self.last_payload or payload
-                v = validate(payload, template_for_score) or {}
+                v = validate(validator_input, template_for_score) or {}
                 score  = v.get("score")
                 report = v
             except Exception as ve:
                 logging.debug(f"[GhostShellBrowser] FP validator skipped: {ve}")
-            get_db().fingerprint_save(
-                self.profile_name, payload,
-                coherence_score  = score,
-                coherence_report = report,
-            )
+            if not used_saved_fp:
+                # Fresh build — store it. Subsequent launches read it
+                # back from DB and reuse.
+                get_db().fingerprint_save(
+                    self.profile_name, payload,
+                    coherence_score  = score,
+                    coherence_report = report,
+                )
+            else:
+                # Saved FP — refresh just the score/report so the
+                # dashboard isn't stuck at score=None for regen'd
+                # profiles. fingerprint_save would demote the row;
+                # we want UPDATE semantics.
+                if hasattr(get_db(), "fingerprint_update_scoring"):
+                    try:
+                        get_db().fingerprint_update_scoring(
+                            self.profile_name,
+                            coherence_score  = score,
+                            coherence_report = report,
+                        )
+                    except Exception as _us_err:
+                        logging.debug(
+                            f"[GhostShellBrowser] FP score-update skipped: "
+                            f"{_us_err}"
+                        )
         except Exception as e:
             logging.debug(f"[GhostShellBrowser] DB fingerprint save: {e}")
 
@@ -1266,8 +1440,28 @@ class GhostShellBrowser:
                         pass
         except Exception as e:
             logging.debug(f"[GhostShellBrowser] extension load skipped: {e}")
-        # --disable-blink-features=AutomationControlled REMOVED - redundant
-        # with C++ patches and is itself a detection marker.
+
+        # ── Stealth: hide Selenium / automation-toolchain markers ───────
+        # RESTORED 2026-04-28 after init-hang investigation cleared these
+        # flags. Root cause was the C++ GhostShell_* bridge crashing the
+        # network service via WTF in non-Blink processes (fixed in
+        # ghost_shell_config.cc — WTF-free bridge). The flags below are
+        # innocent and re-enabled here.
+        #
+        # --disable-blink-features=AutomationControlled disables the
+        # `navigator.webdriver === true` flag without our C++ patch
+        # touching it. Belt and suspenders: even if a future Chromium
+        # rebase drops our patch from one path, this CLI flag covers
+        # the gap. The flag is itself a moderate detection signal (some
+        # anti-bot sites enumerate enabled blink features), but
+        # navigator.webdriver=true is a much louder signal — net win.
+        options.add_argument("--disable-blink-features=AutomationControlled")
+        # Keep extension-installation surface minimal so detection scripts
+        # that probe chrome.management API see what a real user would see.
+        options.add_argument("--extensions-not-webstore")
+        # Suppress the default-app suggestion banners + first-run app
+        # syncing pings. Reduces both noise and traffic.
+        options.add_argument("--disable-default-apps")
 
         # ── Keep Chrome "active" even when not foreground ───────────
         # Without these, if the user alt-tabs away or the window gets
@@ -1335,29 +1529,19 @@ class GhostShellBrowser:
         options.add_argument("--safebrowsing-disable-auto-update")
         options.add_argument("--disable-sync")
         options.add_argument("--disable-translate")
-        # Sprint 12 / Tier 2 #5 — stealth defense-in-depth:
-        # We already have a C++ patch on navigator.webdriver (always
-        # returns false), but the AutomationControlled blink-feature
-        # also strips other webdriver-related signals (chrome.runtime
-        # presence under controlled conditions, contentscript markers).
-        # Belt-and-suspenders: kill it from CLI too. Cheap and stable.
-        options.add_argument(
-            "--disable-blink-features=AutomationControlled")
-        # Polish #3 — kill the extension-store auto-update poll
-        # (CRX manifest fetch to clients2.google.com/service/update2/crx
-        # that fires every ~5 hours per installed extension). Background
-        # traffic over a paid proxy + screams "Chrome with extensions"
-        # to traffic profilers. `--disable-component-update` already
-        # kills the broader component updater; this stops the per-
-        # extension timer specifically.
-        options.add_argument("--extensions-not-webstore")
-        options.add_argument("--disable-default-apps")
         # ONE unified --disable-features flag. Chrome overwrites duplicates,
         # so we merge WebRtcHideLocalIpsWithMdns (fingerprint hardening)
         # with traffic-saving feature disables AND any per-launch features
         # registered earlier in this method (extensions module appends
         # `DisableLoadExtensionCommandLineSwitch` here so the dev-mode
         # warning bubble is suppressed only when extensions actually load).
+        #
+        # The Tier 2 #5 / Polish #3 entries were briefly removed during
+        # the init-hang investigation; restored 2026-04-28 once the real
+        # culprit was identified (WTF-in-network-service crash in the
+        # GhostShell_* C bridge, fixed via std::vector-backed
+        # GhostShellBridgeData in ghost_shell_config.cc). The Python
+        # launch config was always innocent.
         _disable_features = [
             # Fingerprint hardening — kept from the prior WebRTC block
             "WebRtcHideLocalIpsWithMdns",
@@ -1370,28 +1554,28 @@ class GhostShellBrowser:
             "Translate",
             "AutofillServerCommunication",
             "CertificateTransparencyComponentUpdater",
-            # Sprint 12 / Tier 2 #5 — additional stealth + traffic kills.
-            # AcceptCHFrame              — server-driven Client Hints
-            #                              probe; hits even on fresh nav
-            # DialMediaRouteProvider     — Cast/DIAL discovery, mDNS leak
-            # IsolateOrigins             — when off, fewer process boundary
-            #                              ETW signals on Windows
-            # LazyFrameLoading           — small but consistent timing tell
-            # GlobalMediaControls        — UI-side, also taps a reporter
-            # DestroyProfileOnBrowserClose
-            #                            — keeps cookies stable run→run
-            # AutoExpandDetailsElement   — tiny semantic timing diff
-            # AvoidUnnecessaryBeforeUnloadCheckSync
-            #                            — async path triggers sync probe
-            # ExtensionsManifestV3UnpackerOverhead — disable manifest probe
-            "AcceptCHFrame",
+            # Tier 2 #5 stealth + Polish #3 polls — RESTORED. Each one:
+            #   DialMediaRouteProvider — kills the periodic mDNS scan for
+            #     Google Cast devices on the user's LAN; the scan emits
+            #     UDP packets that bypass the proxy and reveal LAN IPs.
+            #   LazyFrameLoading — uniform iframe loading reduces
+            #     fingerprintable timing variance between fresh / warm
+            #     pages on the same SERP.
+            #   GlobalMediaControls — disables the floating media-control
+            #     widget that probes media-session API on every page;
+            #     each probe is a marker some bot detectors flag.
+            #   DestroyProfileOnBrowserClose — keep profile state in
+            #     memory across rapid open/close cycles; otherwise a
+            #     restart triggers a full Local State rewrite that's a
+            #     timing fingerprint.
+            #   AutoExpandDetailsElement — Chrome 129+ auto-opens <details>
+            #     on Find-in-Page; this is a Chrome-only behavior that
+            #     leaks UA via DOM mutation timing.
             "DialMediaRouteProvider",
-            "IsolateOrigins",
             "LazyFrameLoading",
             "GlobalMediaControls",
             "DestroyProfileOnBrowserClose",
             "AutoExpandDetailsElement",
-            "AvoidUnnecessaryBeforeUnloadCheckSync",
         ]
         _disable_features += list(getattr(self, "_extra_disable_features", []))
         # de-dupe while preserving order (some Chrome builds care)
@@ -1618,6 +1802,17 @@ class GhostShellBrowser:
         self.driver = webdriver.Chrome(service=service, options=options)
         logging.info("[GhostShellBrowser] Chrome session established ✓")
 
+        # NOTE: a launch-time set_page_load_timeout was tried here but
+        # suspected of conflicting with the CDP overrides applied a few
+        # lines below (extension load_handler hung on subsequent
+        # CDP calls). Pageload caps are now applied PER-CALL — see
+        # search_query (15s) in main.py, _act_commercial_inflate (45s)
+        # in actions/runner.py, _act_visit_external_fp_tester
+        # (per-tester defaults), and import_storage (12s). This keeps
+        # the launch path on Chrome's default 300s which is necessary
+        # for the cookie + storage import paths that hit real domains
+        # on slow proxies.
+
         # Increase urllib3 connection pool size for Selenium's HTTP
         # channel to chromedriver. Default is 1 — which means when main
         # thread is mid-call (driver.get waiting for DOMContentLoaded),
@@ -1732,6 +1927,26 @@ class GhostShellBrowser:
 
         logging.info(f"[GhostShellBrowser] Core launched successfully. Profile: {self.profile_name}")
 
+        # Recovery #1 — seed the rotating tracker's last_known_ip
+        # cache. Without this, a captcha hitting in the first 5-10s of
+        # the run finds the tracker with old_ip=None (because no code
+        # path probed get_current_ip yet), which left wait_for_rotation
+        # comparing future probes against None and never declaring
+        # success. One probe here is invisible to the browser (uses
+        # `requests` not driver.get) and gives every later rotation a
+        # baseline.
+        try:
+            tracker = self.get_rotating_tracker()
+            if tracker:
+                ip = tracker.get_current_ip(self.driver)
+                if ip:
+                    logging.info(
+                        f"[GhostShellBrowser] seeded tracker "
+                        f"last_known_ip={ip} (rotation baseline)"
+                    )
+        except Exception as e:
+            logging.debug(f"[GhostShellBrowser] IP seed skipped: {e}")
+
         # ── AUTO-ENRICH fresh profiles ─────────────────────────────
         # Fires AFTER Chrome successfully started — Chrome's own code
         # has now created History/Preferences/etc with the correct
@@ -1830,13 +2045,19 @@ class GhostShellBrowser:
         self._maybe_apply_mobile_emulation()
 
         # Sprint 12 / Tier 2 #2: per-profile Date.getTimezoneOffset
-        # jitter. ICU returns offset in 15-minute steps (+ DST rules);
-        # there's no clean C++ way to inject ±1-minute drift without
-        # subclassing icu::TimeZone (DST handling becomes a maintenance
-        # nightmare). The pragmatic shim re-defines the JS getter so
-        # offset = real_offset - jitter (matches the V8 sign convention
-        # where getTimezoneOffset returns minutes WEST of UTC).
-        self._inject_timezone_jitter_shim(payload)
+        # jitter. TEMPORARILY DISABLED while we triage the
+        # "browser hangs on init data:text/html page" symptom. The shim
+        # is registered via Page.addScriptToEvaluateOnNewDocument and
+        # runs on every new document including the init data: URL.
+        # Suspect: the chained-shim pattern (each new doc wraps the
+        # previously-registered getter) might block Chrome's renderer
+        # from firing Page.domContentEventFired which chromedriver
+        # waits for under pageLoadStrategy=eager. Until we can confirm
+        # this isn't the root cause, hold off injecting it. Re-enable
+        # via a config flag after diagnostics finishes.
+        if bool(CFG.get("stealth.timezone_jitter_shim_enabled", False)
+                if "CFG" in globals() else False):
+            self._inject_timezone_jitter_shim(payload)
 
     def _inject_timezone_jitter_shim(self, payload: dict):
         """Page-load injection: per-profile ±1 minute jitter on
@@ -1942,13 +2163,25 @@ class GhostShellBrowser:
 
         # 4. UA override — overwrites any desktop UA the C++ stealth
         #    core may have set. Mobile UA in UA, Android platform in UA-CH.
+        #
+        # Two payload shapes coexist in this codebase (audit: see #119):
+        #   • DeviceTemplateBuilder (current runtime) writes "ua_metadata"
+        #   • Legacy generator.py writes "ua_client_hints"
+        # Read whichever is present so a mobile profile generated by
+        # either path receives proper Sec-CH-UA-* headers via CDP.
         try:
-            ua_ch = fp_data.get("ua_client_hints") or {}
+            ua_ch = (fp_data.get("ua_metadata")
+                     or fp_data.get("ua_client_hints")
+                     or {})
             params = {"userAgent": ua} if ua else {}
             if ua_ch:
                 params["userAgentMetadata"] = ua_ch
-            if fp_data.get("language"):
-                params["acceptLanguage"] = fp_data["language"]
+            # Language: System B nests it under "languages.language",
+            # System A keeps it at top-level "language". Same widening.
+            lang = (fp_data.get("language")
+                    or (fp_data.get("languages") or {}).get("language"))
+            if lang:
+                params["acceptLanguage"] = lang
             if ua:
                 self.driver.execute_cdp_cmd("Network.setUserAgentOverride", params)
         except Exception as e:
@@ -2659,6 +2892,31 @@ class GhostShellBrowser:
     WATCHDOG_PROBE_TIMEOUT = 20  # per-probe ceiling (seconds)
     WATCHDOG_KILL_AFTER  = 3     # consecutive failures before murder
 
+    def watchdog_pause(self, reason: str = ""):
+        """Recovery #2 — temporarily disable the watchdog probe loop.
+        Use when the main thread is about to block for >15s on a
+        legitimate operation (force_rotate_ip, full session restart,
+        IP enrichment) that shouldn't be interpreted as Chrome hanging.
+        Always pair with watchdog_resume() in a finally block.
+        """
+        if not self._watchdog_pause.is_set():
+            self._watchdog_pause_reason = reason
+            self._watchdog_pause.set()
+            self._watchdog_fail_count = 0   # reset so resume starts clean
+            logging.debug(
+                f"[GhostShellBrowser] watchdog paused (reason={reason!r})"
+            )
+
+    def watchdog_resume(self):
+        """Recovery #2 — re-enable the probe loop. Idempotent."""
+        if self._watchdog_pause.is_set():
+            self._watchdog_pause.clear()
+            logging.debug(
+                f"[GhostShellBrowser] watchdog resumed "
+                f"(was paused for: {self._watchdog_pause_reason!r})"
+            )
+            self._watchdog_pause_reason = ""
+
     def _watchdog_loop(self):
         """Background thread — detects frozen Chrome and force-kills it."""
         while not self._watchdog_stop.is_set():
@@ -2667,6 +2925,11 @@ class GhostShellBrowser:
                 return
             if self.driver is None:
                 return
+            # Recovery #2 — skip probes while paused. The pause flag is
+            # set during force_rotate_ip and other long-blocking ops so
+            # we don't kill the browser for legitimate waits.
+            if self._watchdog_pause.is_set():
+                continue
 
             probe_ok = self._watchdog_probe()
             if probe_ok:
@@ -2789,28 +3052,57 @@ class GhostShellBrowser:
         Unconditional proxy rotation — called when we need a new exit even if
         the current IP isn't "burned" (e.g. wrong country for our locale).
         Returns the new IP, or None if rotation is unavailable/failed.
+
+        Recovery #1: when get_current_ip() fails (transient ipify error,
+        connection-pool contention with watchdog), fall back to the
+        tracker's last known IP. Without this fallback the rotation
+        loop sat 60s comparing future probes against None and never
+        declared success — log #88 in profile_01 captured that exact
+        pathology.
+
+        Recovery #2: pause Watchdog for the duration so its 15s page-
+        title probe doesn't kill the run while wait_for_rotation
+        legitimately blocks the main thread.
         """
         tracker = self.get_rotating_tracker()
         if not tracker:
             logging.warning("[GhostShellBrowser] No rotating tracker — "
                             "cannot force_rotate_ip")
             return None
+
         old_ip = tracker.get_current_ip(self.driver)
+        if not old_ip:
+            old_ip = tracker.get_last_known_ip()
+            if old_ip:
+                logging.info(
+                    f"[GhostShellBrowser] live IP probe failed — falling "
+                    f"back to last_known_ip={old_ip} for rotation baseline"
+                )
 
-        # force_rotate() returns False when no rotation API is configured.
-        # Don't bother waiting 60s for an IP change that can't happen —
-        # log the issue clearly and return the old IP so the caller
-        # knows we're alive and working (just not rotated).
-        triggered = tracker.force_rotate()
-        if not triggered:
-            logging.warning(
-                f"[GhostShellBrowser] Rotation NOT triggered — keeping "
-                f"IP {old_ip}. Configure rotation API in Proxy page."
-            )
-            return old_ip
+        # Recovery #2: pause watchdog so wait_for_rotation (60s blocking
+        # on the main thread) isn't interpreted as a Chrome hang.
+        self.watchdog_pause(reason="force_rotate_ip")
 
-        time.sleep(random.uniform(3, 8))
-        new_ip = tracker.wait_for_rotation(self.driver, old_ip, timeout=60)
+        try:
+            # force_rotate() returns False when no rotation API is configured.
+            # Don't bother waiting 60s for an IP change that can't happen —
+            # log the issue clearly and return the old IP so the caller
+            # knows we're alive and working (just not rotated).
+            triggered = tracker.force_rotate()
+            if not triggered:
+                logging.warning(
+                    f"[GhostShellBrowser] Rotation NOT triggered — keeping "
+                    f"IP {old_ip}. Configure rotation API in Proxy page."
+                )
+                return old_ip
+
+            time.sleep(random.uniform(3, 8))
+            new_ip = tracker.wait_for_rotation(
+                self.driver, old_ip, timeout=60)
+        finally:
+            # Always resume — even on exception — so a single bad
+            # rotation can't permanently disable the watchdog.
+            self.watchdog_resume()
         if new_ip:
             tracker.enrich_ip(new_ip, self.driver)
             try:
@@ -2874,20 +3166,61 @@ class GhostShellBrowser:
         # about:blank and every secure-context API returned null/undefined,
         # giving us a false "patch broken" signal.
         #
-        # Navigate to a lightweight Google endpoint (204 No Content) which:
-        #   - is a secure (https://) context
-        #   - returns 0 bytes so nothing to render
-        #   - goes through our proxy so doesn't leak real IP
+        # IMPORTANT: do NOT use /generate_204 — Chrome treats HTTP 204
+        # No Content as "navigation cancelled" and the driver STAYS on
+        # the previous URL (about:blank on first run). about:blank is
+        # NOT a secure context, so navigator.deviceMemory /
+        # userAgentData / mediaDevices all become undefined, and the
+        # secure-context-gated selfchecks (UA-CH, deviceMemory,
+        # mediaDevices) all fail with FALSE — that is exactly the
+        # 8-failure pattern we hit and chased through 5 ineffective
+        # rebuilds before tracing the actual root cause.
+        #
+        # Use /robots.txt instead: it's HTTPS, has a real (small text)
+        # body so Chrome actually completes the navigation, and goes
+        # through our proxy so no IP leak.
+        #
+        # Timeout: cap pageload at 15s. Without this cap, if the
+        # selfcheck happens right after a proxy rotation and the new
+        # exit IP is still settling, driver.get() blocks for the
+        # selenium default 300s — selfcheck appears as a 5-minute
+        # init hang. 15s is plenty for a 3KB robots.txt over the
+        # slowest residential proxy; if it still misses, we bail out
+        # to about:blank and the secure-context selfchecks will
+        # surface "mediaDevices undefined" diagnostics so the cause
+        # is visible in the next selfcheck row instead of hidden as
+        # silent False.
         try:
-            self.driver.get("https://www.google.com/generate_204")
+            try:
+                self.driver.set_page_load_timeout(15)
+            except Exception:
+                pass
+            self.driver.get("https://www.google.com/robots.txt")
             time.sleep(0.8)
         except Exception as e:
             logging.warning(
-                f"[GhostShellBrowser] couldn't open secure context for selfcheck, "
-                f"falling back to about:blank ({e})"
+                f"[GhostShellBrowser] couldn't open secure context for selfcheck "
+                f"({type(e).__name__}: {str(e)[:100]}), falling back to about:blank "
+                f"— UA-CH / deviceMemory / mediaDevices checks will report "
+                f"\"undefined\" diagnostic strings"
             )
-            self.driver.get("about:blank")
+            try:
+                self.driver.execute_script("window.stop();")
+            except Exception:
+                pass
+            try:
+                self.driver.get("about:blank")
+            except Exception:
+                pass
             time.sleep(0.5)
+        finally:
+            # Restore default-ish pageload so subsequent code paths
+            # (commercial_inflate, search_query, etc.) don't inherit
+            # the 15s cap.
+            try:
+                self.driver.set_page_load_timeout(60)
+            except Exception:
+                pass
 
         # Ожидаемые values из afterднего сгенерированного payload
         expected = {}
@@ -2995,18 +3328,20 @@ class GhostShellBrowser:
             # removed it, the spoof is incoherent, so we keep the strict
             # check (.catch returns false). We do NOT soft-pass like the
             # desktop variant does.
+            # Same Promise-thenability fix as battery_desktop_default.
             async_tests["battery_charging_matches"] = (
                 "(typeof navigator.getBattery !== 'function' "
-                "  ? false "
+                "  ? Promise.resolve(false) "
                 "  : navigator.getBattery()"
                 f"      .then(b => b.charging === {exp_charging})"
                 "      .catch(() => false))"
             )
             if "level" in exp_battery and exp_battery["level"] is not None:
                 lvl = float(exp_battery["level"])
+                # Same Promise-thenability fix as battery_desktop_default.
                 async_tests["battery_level_matches"] = (
                     "(typeof navigator.getBattery !== 'function' "
-                    "  ? false "
+                    "  ? Promise.resolve(false) "
                     "  : navigator.getBattery().then(b => {"
                     f"      const actual = b.level;"
                     f"      const ok = Math.abs(actual - {lvl}) < 0.02;"
@@ -3022,9 +3357,15 @@ class GhostShellBrowser:
             # is actually the most realistic signal a real desktop
             # would expose — so treat the missing method as a SOFT
             # pass. We still verify shape if it IS present.
+            # Both branches MUST return a Promise — the async wrapper
+            # below does `(EXPRESSION).then(cb)`, and a plain boolean
+            # in the "no getBattery" branch fails with
+            # "(intermediate value).then is not a function".
+            # Wrap the soft-pass in Promise.resolve to keep both arms
+            # thenable.
             async_tests["battery_desktop_default"] = (
                 "(typeof navigator.getBattery !== 'function' "
-                "  ? true "
+                "  ? Promise.resolve(true) "
                 "  : navigator.getBattery()"
                 "      .then(b => b.charging === true && b.level === 1)"
                 "      .catch(() => true))"
@@ -3081,29 +3422,46 @@ class GhostShellBrowser:
         exp_ao = exp_media.get("audio_outputs") or []
         exp_total = len(exp_ai) + len(exp_vi) + len(exp_ao)
         if exp_total > 0:
-            # Expected counts per kind
-            # Same defensive pattern as UA-CH. enumerateDevices() can
-            # be undefined on builds without the patch applied, can
-            # throw a NotAllowedError if permissions are restricted, or
-            # return an empty array. We swallow all of those into a
-            # plain false so the selfcheck row is meaningful.
+            # DIAGNOSTIC variant: instead of returning plain `false`
+            # when something doesn't behave, return a SHORT string
+            # describing what went wrong. The downstream result-handler
+            # already coerces non-bool returns to a 60-char display
+            # string, so a row like `media_devices_count_matches:
+            # mediaDevices undefined` will appear in the log instead
+            # of a silent False. Lets us see if:
+            #   • mediaDevices is undefined (secure-context / origin issue)
+            #   • enumerateDevices() throws (permissions, isolation)
+            #   • enumerateDevices() returns wrong shape (counts mismatch)
             async_tests["media_devices_count_matches"] = (
-                "((navigator.mediaDevices && navigator.mediaDevices.enumerateDevices) "
-                "  ? navigator.mediaDevices.enumerateDevices().then(d => {"
-                f"      const ai = d.filter(x => x.kind === 'audioinput').length;"
-                f"      const vi = d.filter(x => x.kind === 'videoinput').length;"
-                f"      const ao = d.filter(x => x.kind === 'audiooutput').length;"
-                f"      return ai === {len(exp_ai)} && vi === {len(exp_vi)}"
-                f"          && ao === {len(exp_ao)};"
-                "    }).catch(() => false)"
-                "  : Promise.resolve(false))"
+                "(async () => {"
+                "  if (!navigator.mediaDevices) return 'mediaDevices undefined';"
+                "  if (!navigator.mediaDevices.enumerateDevices) "
+                "    return 'enumerateDevices undefined';"
+                "  try {"
+                "    const d = await navigator.mediaDevices.enumerateDevices();"
+                "    const ai = d.filter(x => x.kind === 'audioinput').length;"
+                "    const vi = d.filter(x => x.kind === 'videoinput').length;"
+                "    const ao = d.filter(x => x.kind === 'audiooutput').length;"
+                f"    if (ai === {len(exp_ai)} && vi === {len(exp_vi)} "
+                f"        && ao === {len(exp_ao)}) return true;"
+                f"    return `got ai=${{ai}} vi=${{vi}} ao=${{ao}} "
+                f"             expected {len(exp_ai)}/{len(exp_vi)}/{len(exp_ao)}`;"
+                "  } catch (e) { return 'threw: ' + (e.name || e.message); }"
+                "})()"
             )
             async_tests["media_devices_have_ids"] = (
-                "((navigator.mediaDevices && navigator.mediaDevices.enumerateDevices) "
-                "  ? navigator.mediaDevices.enumerateDevices()"
-                "      .then(d => d.length > 0 && d.every(x => x.deviceId && x.deviceId.length > 0))"
-                "      .catch(() => false)"
-                "  : Promise.resolve(false))"
+                "(async () => {"
+                "  if (!navigator.mediaDevices) return 'mediaDevices undefined';"
+                "  if (!navigator.mediaDevices.enumerateDevices) "
+                "    return 'enumerateDevices undefined';"
+                "  try {"
+                "    const d = await navigator.mediaDevices.enumerateDevices();"
+                "    if (d.length === 0) return 'empty list';"
+                "    const missing = d.filter(x => !x.deviceId || x.deviceId.length === 0);"
+                "    if (missing.length === 0) return true;"
+                "    return `${missing.length}/${d.length} have empty deviceId`;"
+                "  } catch (e) { return 'threw: ' + (e.name || e.message); }"
+                "})()"
             )
 
         # ── SpeechSynthesis getVoices (Patch 1.2) ─────────────────

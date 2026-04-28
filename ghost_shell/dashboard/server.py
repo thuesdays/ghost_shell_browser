@@ -1737,23 +1737,40 @@ def api_profile_fp_probe(name: str):
     if isinstance(requested, str):
         requested = [requested]
     if requested:
-        PROBE_TESTERS = [(ALL_TESTERS[t][0], ALL_TESTERS[t][1])
-                         for t in requested if t in ALL_TESTERS]
+        PROBE_TESTERS = [(tid, ALL_TESTERS[tid][0], ALL_TESTERS[tid][1])
+                         for tid in requested if tid in ALL_TESTERS]
         if not PROBE_TESTERS:
             return jsonify({"ok": False,
                             "error": f"unknown tester ids; valid: {list(ALL_TESTERS)}"}), 400
     else:
-        PROBE_TESTERS = list(ALL_TESTERS.values())
+        PROBE_TESTERS = [(k, v[0], v[1]) for k, v in ALL_TESTERS.items()]
 
+    # Use the dedicated `visit_external_fp_tester` action — it does
+    # navigate + dwell + scrape result + persist to external_fp_results
+    # in one shot. Per-tester dwell tuned for what each scanner needs:
+    # CreepJS computes its score asynchronously so it needs ≥18s to
+    # stabilise; faster sites (Sannysoft) finish in ~6s. Tuned values
+    # are a defensive lower bound on each.
+    DWELL_BY_TESTER = {
+        "creepjs":      (20, 32),  # async scan, slow finalize
+        "pixelscan":    (15, 25),
+        "sannysoft":    (8,  14),  # sync, fast
+        "amiunique":    (12, 20),
+        "browserleaks": (10, 18),
+        "fpcom":        (8,  14),
+    }
     probe_flow = []
-    for label, url in PROBE_TESTERS:
+    for tester_id, label, url in PROBE_TESTERS:
+        dwell_lo, dwell_hi = DWELL_BY_TESTER.get(tester_id, (18, 32))
         probe_flow.append({
-            "type":        "open_url",
-            "url":         url,
-            "dwell_min":   25,
-            "dwell_max":   40,
-            "scroll":      True,
-            "_label":      f"FP-tester: {label}",
+            "type":         "visit_external_fp_tester",
+            "tester_id":    tester_id,
+            "tester_label": label,
+            "url":          url,
+            "dwell_min":    dwell_lo,
+            "dwell_max":    dwell_hi,
+            "scroll":       True,
+            "_label":       f"FP-tester: {label}",
         })
     # Final pause so the user has time to see the results before the
     # browser auto-closes (matches the natural feel of "I'm reviewing
@@ -1815,6 +1832,46 @@ def api_profile_fp_probe(name: str):
     except Exception as e:
         logging.exception("[fp-probe] spawn failed")
         return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@app.route("/api/profiles/<name>/fingerprint/external-results",
+           methods=["GET"])
+def api_profile_external_fp_results(name: str):
+    """Latest result per external tester for this profile, plus optional
+    per-tester history. Used by the Profile Editor → Runtime self-check
+    section to render trust scores under each tester card after a probe
+    run completes.
+
+    Query params:
+      tester_id     restrict to one tester
+      history       1 → also return last 20 results for that tester
+
+    Response:
+      {
+        "ok": True,
+        "latest": { "creepjs": {...row...}, "pixelscan": {...}, ... },
+        "history": [...]   // present only when ?history=1&tester_id=…
+      }
+    """
+    db = get_db()
+    tester_id = request.args.get("tester_id", "").strip() or None
+    want_history = request.args.get("history", "0") in ("1", "true", "yes")
+
+    try:
+        latest = db.external_fp_latest(name)
+    except Exception as e:
+        return jsonify({"ok": False, "error": f"db: {e}"}), 500
+
+    out = {"ok": True, "latest": latest}
+
+    if want_history:
+        try:
+            out["history"] = db.external_fp_history(
+                name, tester_id=tester_id, limit=20)
+        except Exception as e:
+            out["history_error"] = str(e)
+
+    return jsonify(out)
 
 
 @app.route("/api/profiles/<name>/quality", methods=["GET"])
@@ -4057,19 +4114,57 @@ def api_profile_create():
     template  = data.get("template") or None
     language  = data.get("language") or "uk-UA"
     enrich    = bool(data.get("enrich", True))
-    # Optional per-profile proxy override accepted on creation. Empty
-    # string / None = no override (inherit global). The format is the
-    # same string that the Proxy page accepts. We do a coarse client-side
-    # check then a stricter scheme check here.
+    # Optional per-profile proxy override accepted on creation. Two
+    # forms — UI sends either:
+    #   • proxy_id  → reference to an existing row in the proxies table
+    #                 (Create Profile dropdown → "library" pick). We
+    #                 resolve it to a URL via proxy_get(); if the row
+    #                 is missing we fail loudly so the UI surfaces it
+    #                 instead of silently falling back to inherit.
+    #   • proxy_url → raw URL string (Create Profile dropdown → "Custom
+    #                 URL…", or any external/programmatic caller). We
+    #                 keep the same scheme regex as before.
+    # If both are provided, proxy_id wins (UI never sends both, but the
+    # backend should still be deterministic against a buggy caller).
+    # Empty string / None for both = inherit global.
     proxy_url = (data.get("proxy_url") or "").strip()
+    proxy_id  = data.get("proxy_id")
 
     if not name or not re.match(r"^[A-Za-z0-9_\-]+$", name):
         return jsonify({"error": "invalid name (letters, digits, _ and - only)"}), 400
 
+    db = get_db()
+
+    if proxy_id is not None and proxy_id != "":
+        try:
+            proxy_id_int = int(proxy_id)
+        except (TypeError, ValueError):
+            return jsonify({"error": "proxy_id must be an integer"}), 400
+        if not hasattr(db, "proxy_get"):
+            return jsonify({"error": "proxy library not available in this build"}), 500
+        proxy_row = db.proxy_get(proxy_id_int)
+        if not proxy_row:
+            return jsonify({
+                "error": f"proxy_id {proxy_id_int} not found in library"
+            }), 404
+        # Take the URL from the library row. This means subsequent edits
+        # to the proxy in the library DO carry over to the profile via
+        # its stored proxy_url string. If we wanted "snapshot at creation",
+        # we'd freeze the URL — but the user expectation here matches the
+        # bulk-create behaviour (proxy_pool also stores URLs by reference).
+        proxy_url = (proxy_row.get("url") or "").strip()
+        if not proxy_url:
+            return jsonify({
+                "error": f"proxy_id {proxy_id_int} has no URL"
+            }), 422
+
     if proxy_url and not re.match(r"^(https?|socks5)://", proxy_url, re.IGNORECASE):
         return jsonify({"error": "proxy URL must use http://, https:// or socks5://"}), 400
 
-    db = get_db()
+    # `db` was already obtained above to resolve proxy_id; reuse the
+    # same instance for the rest of the create flow. get_db() returns
+    # a singleton, so even a re-call would be safe — this is just a
+    # tiny tidiness fix.
     existing = db.profile_get(name) if hasattr(db, "profile_get") else None
     if existing:
         return jsonify({"error": f"profile '{name}' already exists"}), 409
@@ -4145,6 +4240,25 @@ def api_profile_create():
             except Exception as e:
                 logging.debug(f"[profile-create] pool inject skipped: {e}")
                 pool_summary = {"ok": False, "error": str(e)}
+
+        # Mark the profile ready — symmetric with the bulk-create flow
+        # (server.py ~4069). Without this stamp, profile_is_ready()
+        # returns False for any profile whose row exists in the
+        # `profiles` table with ready_at = NULL — and that's the row
+        # shape we get whenever profile_meta_upsert was called (which
+        # happens whenever a proxy is assigned, either at create time
+        # or later via Edit Profile). Symptom: "Failed to start:
+        # profile X is not ready yet (setup pipeline incomplete —
+        # likely a bulk-create in progress)" on the very first launch
+        # of a freshly created profile.
+        # Idempotent — re-marking a ready profile just refreshes the
+        # timestamp. Best-effort: any DB error here doesn't fail the
+        # creation, since the row + fingerprint + dir are all in place.
+        try:
+            if hasattr(db, "profile_mark_ready"):
+                db.profile_mark_ready(name)
+        except Exception as _mr:
+            logging.debug(f"[profile-create] mark-ready failed: {_mr}")
 
         return jsonify({
             "ok":          True,
@@ -6641,23 +6755,35 @@ def api_fp_generate(name):
     """Generate a new fingerprint for a profile. Body options:
         {
           "template_id":    "macbook_pro_14_m2_2023"  // or null = auto
-          "locked_fields":  {"timezone": "Europe/Kyiv"}
+          "locked_fields":  {"timezone": "Europe/Kyiv"}      // legacy modes only
           "mode":           "full" | "template_only" | "reshuffle"
           "reason":         "user clicked regenerate"
         }
     Saves the result + runs validation, returns full report.
 
     mode semantics:
-      full          — fresh generation, ignores current fp
-      template_only — change only template, keep locked fields
-      reshuffle     — same template, different values (for same template
-                      but different screen/GPU option)
+      full          — fresh generation via DeviceTemplateBuilder (RUNTIME-COMPATIBLE)
+      template_only — change only template, keep locked fields (LEGACY shape)
+      reshuffle     — same template, different values (LEGACY shape)
+
+    SCHEMA FIX (audit #119): two parallel generators existed in this
+    codebase — the legacy generator.py (FLAT shape) and the runtime
+    DeviceTemplateBuilder (NESTED shape). Only the latter is read by
+    the C++ side (ghost_shell_config.cc). When the dashboard "Generate"
+    button hit this endpoint with mode=full, it used the legacy flat
+    generator → saved an incompatible payload → runtime would see it,
+    detect the mismatch via the payload-shape guard added to runtime.py,
+    DISCARD the saved fp and regenerate. Net effect: the user's regen
+    button was effectively a no-op for the most common mode.
+    Fix: route mode=full through DeviceTemplateBuilder so DB stores the
+    runtime shape directly and reuse-on-launch works. Legacy modes
+    (template_only / reshuffle) still go through generator.py — they
+    rely on lock-preservation logic that's tied to the flat schema.
     """
-    from ghost_shell.fingerprint.generator import (
-        generate, regenerate_preserving_locks
-    )
+    from ghost_shell.fingerprint.generator import regenerate_preserving_locks
     from ghost_shell.fingerprint.templates import get_template
     from ghost_shell.fingerprint.validator import validate
+    from ghost_shell.fingerprint.device_templates import DeviceTemplateBuilder
 
     data = request.get_json(silent=True) or {}
     template_id = data.get("template_id")
@@ -6677,7 +6803,22 @@ def api_fp_generate(name):
             locked_paths=locked_paths,
             new_template_id=None,   # keep template
         )
-    elif mode == "template_only":
+        # Validate via legacy path (flat shape)
+        template = get_template(new_fp["template_id"])
+        runtime_shape = _flat_fp_to_runtime_shape(new_fp)
+        validation = validate(runtime_shape, template)
+        fp_id = db.fingerprint_save(
+            name, new_fp,
+            coherence_score=validation["score"],
+            coherence_report=validation,
+            locked_fields=list(locked_fields.keys()),
+            source="generated",
+            reason=reason,
+        )
+        return jsonify({"ok": True, "id": fp_id,
+                        "fingerprint": new_fp, "validation": validation})
+
+    if mode == "template_only":
         if not template_id:
             return jsonify({"error": "mode=template_only requires template_id"}), 400
         current = db.fingerprint_current(name)
@@ -6687,34 +6828,71 @@ def api_fp_generate(name):
             locked_paths=locked_paths,
             new_template_id=template_id,
         )
-    else:
-        # full mode — clean slate
-        new_fp = generate(
-            profile_name=name,
-            template_id=template_id,
-            locked_fields=locked_fields,
+        template = get_template(new_fp["template_id"])
+        runtime_shape = _flat_fp_to_runtime_shape(new_fp)
+        validation = validate(runtime_shape, template)
+        fp_id = db.fingerprint_save(
+            name, new_fp,
+            coherence_score=validation["score"],
+            coherence_report=validation,
+            locked_fields=list(locked_fields.keys()),
+            source="generated",
+            reason=reason,
         )
+        return jsonify({"ok": True, "id": fp_id,
+                        "fingerprint": new_fp, "validation": validation})
 
-    # Validate
-    template = get_template(new_fp["template_id"])
-    runtime_shape = _flat_fp_to_runtime_shape(new_fp)
-    validation = validate(runtime_shape, template)
-
-    # Save
+    # mode=full — use DeviceTemplateBuilder so the saved payload is in
+    # the schema the C++ runtime side actually reads (hardware.*,
+    # media.*, gpu.*, ua_metadata.*). Same code path as
+    # api_profile_regenerate_fingerprint and the runtime fresh-build.
+    prof = db.profile_get(name) if hasattr(db, "profile_get") else {}
+    language = (prof or {}).get("preferred_language") or "uk-UA"
+    seed_name = name
+    import time as _t
+    seed_name = f"{name}#{int(_t.time())}"
+    forced_template = template_id if template_id and template_id != "auto" else None
+    builder = DeviceTemplateBuilder(
+        profile_name       = seed_name,
+        preferred_language = language,
+        force_template     = forced_template,
+    )
+    payload = builder.generate_payload_dict()
+    payload["profile_name"] = name  # save under the original name
+    # Validator expects the FLAT/JS-probe shape (navigator.userAgent,
+    # webgl.vendor, ...), not the runtime NESTED shape (hardware.*,
+    # graphics.*, ...). Use the dedicated NESTED→VALIDATOR adapter so
+    # the score badge is accurate instead of artificially inflated by
+    # silently-skipped checks.
+    template_meta = None
+    try:
+        template_meta = get_template(payload.get("template_name") or "")
+    except Exception:
+        template_meta = None
+    try:
+        validator_input = _runtime_payload_to_validator_shape(payload)
+        validation = validate(validator_input, template_meta or {})
+    except Exception:
+        validation = {"score": None, "grade": "?", "checks": []}
     fp_id = db.fingerprint_save(
-        name, new_fp,
-        coherence_score=validation["score"],
+        name, payload,
+        coherence_score=validation.get("score"),
         coherence_report=validation,
         locked_fields=list(locked_fields.keys()),
         source="generated",
         reason=reason,
     )
-
+    if hasattr(db, "reset_profile_health"):
+        try:
+            db.reset_profile_health(name)
+        except Exception:
+            pass
     return jsonify({
         "ok":         True,
         "id":         fp_id,
-        "fingerprint": new_fp,
+        "fingerprint": payload,
         "validation": validation,
+        "schema":     "runtime_v1",   # signal to UI: this fp will be reused as-is
     })
 
 
@@ -6956,6 +7134,61 @@ def _flat_fp_to_runtime_shape(fp: dict) -> dict:
         "timezone": {"intl": fp.get("timezone")},
         "fonts":   fp.get("fonts", []),
         "audio":   {"sampleRate": fp.get("audio_sample_rate")},
+    }
+
+
+def _runtime_payload_to_validator_shape(payload: dict) -> dict:
+    """Convert DeviceTemplateBuilder's NESTED payload (hardware.*,
+    languages.*, screen.*, graphics.*, ua_metadata.*, ...) into the
+    same shape `_flat_fp_to_runtime_shape` produces for the legacy
+    flat schema, so validator.validate() can score either source on
+    equal footing.
+
+    Without this, validator called against a DeviceTemplateBuilder
+    payload reads `_get(fp, "navigator", "userAgent")` — which is at
+    `payload.hardware.user_agent` in the nested form — gets None,
+    silently treats the field as "missing, no penalty", and the
+    score badge displayed in the dashboard ends up artificially
+    inflated. This is what produced score=89/100 on profiles where
+    several validator checks were actually no-ops.
+    """
+    if not isinstance(payload, dict):
+        return {}
+    hw   = payload.get("hardware")   or {}
+    lang = payload.get("languages")  or {}
+    scr  = payload.get("screen")     or {}
+    gfx  = payload.get("graphics")   or {}
+    aud  = payload.get("audio")      or {}
+    tz   = payload.get("timezone")   or {}
+    return {
+        "navigator": {
+            "userAgent":          hw.get("user_agent"),
+            "platform":           hw.get("platform"),
+            "hardwareConcurrency": hw.get("hardware_concurrency"),
+            "deviceMemory":       hw.get("device_memory"),
+            "maxTouchPoints":     hw.get("max_touch_points"),
+            "language":           lang.get("language"),
+            "languages":          lang.get("languages"),
+            "vendor":             "Google Inc.",
+            "webdriver":          False,
+        },
+        "screen": {
+            "width":   scr.get("width"),
+            "height":  scr.get("height"),
+        },
+        "window":   {"devicePixelRatio": scr.get("pixel_ratio")},
+        "webgl": {
+            "vendor":     gfx.get("gl_vendor"),
+            "renderer":   gfx.get("gl_renderer"),
+            "extensions": gfx.get("webgl_extensions") or [],
+        },
+        "timezone": {"intl": tz.get("id")},
+        "fonts":    payload.get("fonts") or [],
+        "audio":    {"sampleRate": aud.get("sample_rate")},
+        # Pass through the raw payload too so checks that need
+        # nested-only fields (gpu.unmasked_*, codecs.*, ua_metadata.*)
+        # can dig in via _get(fp, "_runtime_raw", ...).
+        "_runtime_raw": payload,
     }
 
 

@@ -1,0 +1,88 @@
+{
+  "_meta": {
+    "format": "ghost-shell-flow",
+    "version": 1,
+    "name": "GoodMedika",
+    "description": "Brand SERP rotation. Each iteration: (1) commercial_inflate warms Google's commercial-intent context (2 generic queries, 30% chance per iteration); (2) search_query fires the brand search — search_query has its own internal retry-on-no-ads (handles soft-blocks), so we DON'T add a manual refresh layer on top; (3) foreach_ad walks every ad on the SERP, and inside the loop the if(ad_is_external) gate filters to non-own ads (covers both competitors AND target-domain ads). The click_ad inside that gate uses skip_on_my_domain as a safety net. To click ONLY targets, flip only_on_target=true on click_ad — the outer ad_is_external still lets target ads through. To click ONLY pure competitors, switch the outer condition to ad_is_competitor instead of ad_is_external.",
+    "exported_at": "2026-04-28T20:35:00.000Z"
+  },
+  "name": "GoodMedika",
+  "description": "Brand SERP rotation with commercial pre-warm. Click any non-own ad (competitors + targets). For target-only behaviour set only_on_target=true on click_ad — the ad_is_external outer condition is permissive enough to let it filter inside.",
+  "tags": [],
+  "flow": [
+    {
+      "enabled": true,
+      "item_var": "item",
+      "items": "goodmedika\nгудмедика\nгудмедіка",
+      "shuffle": true,
+      "steps": [
+        {
+          "_comment": "Pre-warm Google's commercial-intent context. probability=0.3 means ~30% of iterations get the warm-up (rest fire the brand search cold — variation looks more natural). click_organic=true gives a stronger signal at +~10s per pre-query.",
+          "brand": "{item}",
+          "click_organic": true,
+          "dwell_max": 10,
+          "dwell_min": 4,
+          "locale": "UA",
+          "n": 2,
+          "probability": 0.3,
+          "type": "commercial_inflate"
+        },
+        {
+          "_comment": "search_query has BUILT-IN refresh-on-no-ads (4 attempts with 13-15s gaps). No external `if no_ads -> refresh` block needed — it would just duplicate the work and wastes 7+ refreshes per empty SERP.",
+          "enabled": true,
+          "fail_on_empty": false,
+          "query": "{item}",
+          "type": "search_query"
+        },
+        {
+          "_comment": "Walk every ad. Shuffle so we don't always click the top slot first (more natural).",
+          "enabled": true,
+          "shuffle": true,
+          "steps": [
+            {
+              "_comment": "ad_is_external = 'any ad NOT on my domain' (covers competitors AND target-domain ads). Use this when you want flexibility inside via only_on_target / skip_on_target. To click ONLY pure competitors (excluding targets), switch kind to ad_is_competitor.",
+              "condition": {
+                "kind": "ad_is_external"
+              },
+              "else_steps": [],
+              "enabled": true,
+              "then_steps": [
+                {
+                  "_comment": "skip_on_my_domain stays as a paranoid safety net (the outer ad_is_external already excludes own domain — but if my_domains list is misconfigured at run-time, this is the second line of defense). only_on_target=false -> click both competitors and targets. Flip to true if you want target-only.",
+                  "close_after": true,
+                  "deep_dive": false,
+                  "dwell_max": 18,
+                  "dwell_min": 6,
+                  "enabled": true,
+                  "only_on_target": false,
+                  "scroll_after_click": true,
+                  "skip_on_my_domain": true,
+                  "skip_on_target": false,
+                  "type": "click_ad"
+                },
+                {
+                  "_comment": "Short between-click pause inside foreach_ad. probability=0.6 means most of the time we pause — but not always (foreach_ad already has a built-in scan-pause between iterations).",
+                  "enabled": true,
+                  "max_sec": 5,
+                  "min_sec": 2,
+                  "probability": 0.6,
+                  "type": "pause"
+                }
+              ],
+              "type": "if"
+            }
+          ],
+          "type": "foreach_ad"
+        },
+        {
+          "_comment": "Cool-down between query-loop iterations. Real users don't run searches back-to-back without breathing room.",
+          "enabled": true,
+          "max_sec": 12,
+          "min_sec": 5,
+          "type": "pause"
+        }
+      ],
+      "type": "loop"
+    }
+  ]
+}
