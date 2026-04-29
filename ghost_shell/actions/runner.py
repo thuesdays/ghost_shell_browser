@@ -203,6 +203,55 @@ def _random_sleep(lo: float, hi: float):
 
 
 # ──────────────────────────────────────────────────────────────
+# Phase E (Apr 2026): Behavioral persona helper
+# ──────────────────────────────────────────────────────────────
+# Fetch the per-profile persona once per ctx and cache it on the
+# context object so multiple actions in the same run reuse the same
+# samples context (still independent samples, but same persona seed).
+# Defensive: returns None if behavior module isn't importable or
+# profile_name is missing — callers fall back to legacy random ranges.
+
+def _get_persona(ctx) -> dict:
+    """Resolve the behavioral persona for the run's profile.
+    Returns {} on any failure so callers can use `.get(key, default)`
+    without crashing legacy code paths."""
+    # ctx may be RunContext (attribute access) or legacy dict
+    cached = None
+    try:
+        cached = getattr(ctx, "_persona_cache", None)
+    except Exception:
+        pass
+    if isinstance(ctx, dict):
+        cached = ctx.get("_persona_cache")
+    if cached is not None:
+        return cached
+    profile_name = None
+    try:
+        profile_name = (getattr(ctx, "profile_name", None)
+                        or (isinstance(ctx, dict) and ctx.get("profile_name"))
+                        or (isinstance(ctx, dict) and ctx.get("loop_ctx", {}).get("profile_name")))
+    except Exception:
+        pass
+    if not profile_name:
+        return {}
+    try:
+        from ghost_shell.behavior import get_persona
+        persona = get_persona(str(profile_name)) or {}
+    except Exception as _e:
+        log.debug(f"_get_persona: behavior module unavailable: {_e}")
+        persona = {}
+    # Cache on ctx for the rest of the run
+    try:
+        if isinstance(ctx, dict):
+            ctx["_persona_cache"] = persona
+        else:
+            setattr(ctx, "_persona_cache", persona)
+    except Exception:
+        pass
+    return persona
+
+
+# ──────────────────────────────────────────────────────────────
 # Watchdog interlock — protect long blocking ops
 # ──────────────────────────────────────────────────────────────
 #
@@ -704,6 +753,39 @@ def _act_click_ad(driver, action: dict, ctx: dict):
                 f"ctx.flags['captcha_present']=True so subsequent "
                 f"`if captcha_present -> rotate_ip` steps will fire"
             )
+            # Phase B (Apr 2026): if captcha provider is configured,
+            # try to solve in-place instead of bailing on the run.
+            # Solver injects the token; the page form may auto-submit
+            # via callback or need a manual click — script's next
+            # step (often `back` or `wait_for_url`) handles the
+            # post-solve flow. Failure here is soft: we already
+            # logged the captcha and set the flag; the script can
+            # still rotate via `if captcha_present`.
+            try:
+                from ghost_shell.captcha import solve_on_page, ProviderError
+                token = solve_on_page(driver)
+                log.info(
+                    f"    click_ad: ✓ captcha solved (token len={len(token)})"
+                )
+                if isinstance(flags, dict):
+                    flags["captcha_solved"] = True
+                    flags["captcha_present"] = False
+            except ProviderError as _pe:
+                # Common reasons: no_credentials → solver disabled,
+                # treat as silent skip. Other reasons → log and
+                # continue (the rotate-on-captcha rule still fires).
+                if _pe.reason == "no_credentials":
+                    log.debug(
+                        "    click_ad: captcha solver not configured — "
+                        "skipping auto-solve"
+                    )
+                else:
+                    log.warning(
+                        f"    click_ad: captcha solver failed "
+                        f"({_pe.reason}): {_pe}"
+                    )
+            except Exception as _se:
+                log.debug(f"    click_ad: solver branch failed: {_se}")
     except Exception as _cf_err:
         log.debug(f"    click_ad: captcha refresh skipped: {_cf_err}")
 
@@ -923,7 +1005,16 @@ def _resolve_selector(sel: str):
 
 
 def _act_click_selector(driver, action: dict, ctx: dict):
-    """Click any element by CSS selector with human mouse movement."""
+    """Click any element by CSS selector with human mouse movement.
+
+    Phase E (Apr 2026): the post-hover pre-click pause is now drawn
+    from the profile's behavioral persona instead of a fixed 0.1-0.3
+    range. Fast-clicker personas tap quickly; deliberate-clicker
+    personas sit on the target for ~1s before firing. Keeps each
+    profile's click cadence consistent across runs and distinct
+    between profiles — a key behavioral fingerprint signal Google
+    Ads anti-fraud weights heavily.
+    """
     sel = action.get("selector")
     if not sel:
         log.warning("    click_selector: no selector given")
@@ -941,7 +1032,20 @@ def _act_click_selector(driver, action: dict, ctx: dict):
     )
     _random_sleep(0.3, 1.0)
     _human_move_to(driver, el)
-    _random_sleep(0.1, 0.3)
+
+    # Phase E: persona-shaped pre-click hover. If no persona is
+    # available (legacy ctx without profile_name), fall back to the
+    # original 0.1-0.3 range so existing scripts behave unchanged.
+    persona = _get_persona(ctx)
+    if persona:
+        try:
+            from ghost_shell.behavior import profile_pre_click_dwell
+            time.sleep(profile_pre_click_dwell(persona))
+        except Exception as _be:
+            log.debug(f"    persona dwell skipped: {_be}")
+            _random_sleep(0.1, 0.3)
+    else:
+        _random_sleep(0.1, 0.3)
 
     new_tab = bool(action.get("new_tab", False))
     try:
@@ -1109,7 +1213,15 @@ def _act_read(driver, action: dict, ctx: dict):
 
 
 def _act_type(driver, action: dict, ctx: dict):
-    """Type text char-by-char with realistic per-key delay."""
+    """Type text char-by-char with realistic per-key delay.
+
+    Phase E (Apr 2026): per-char timing now derives from the profile's
+    typing_wpm + reading_speed_cps persona dimensions. Slow typists
+    show 60+ ms per char with bigger pauses around punctuation; fast
+    typists ~25-40 ms. Punctuation is 1.6× slower regardless (every
+    real typist hesitates briefly on commas / spaces). Per-profile
+    determinism makes this a stable behavioural fingerprint axis.
+    """
     sel  = action.get("selector")
     text = action.get("text", "")
     if not sel or not text: return
@@ -1122,13 +1234,27 @@ def _act_type(driver, action: dict, ctx: dict):
     _human_move_to(driver, el)
     el.click()
     _random_sleep(0.2, 0.6)
-    for ch in text:
+
+    # Phase E: precompute per-char delays from persona. Falls back
+    # to the legacy random range if behavior module unavailable.
+    persona = _get_persona(ctx)
+    intervals_ms = None
+    if persona:
+        try:
+            from ghost_shell.behavior import profile_typing_intervals
+            intervals_ms = profile_typing_intervals(persona, text)
+        except Exception as _be:
+            log.debug(f"    persona typing intervals skipped: {_be}")
+            intervals_ms = None
+
+    for i, ch in enumerate(text):
         el.send_keys(ch)
-        # Realistic typing cadence — 40-180 ms between chars,
-        # occasional longer pause for "thinking"
-        delay = random.uniform(0.04, 0.18)
-        if random.random() < 0.08:
-            delay += random.uniform(0.25, 0.7)
+        if intervals_ms is not None and i < len(intervals_ms):
+            delay = intervals_ms[i] / 1000.0
+        else:
+            delay = random.uniform(0.04, 0.18)
+            if random.random() < 0.08:
+                delay += random.uniform(0.25, 0.7)
         time.sleep(delay)
     log.info(f"    → typed: {text[:40]}...")
 

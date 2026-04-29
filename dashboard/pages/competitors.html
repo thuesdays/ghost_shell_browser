@@ -89,7 +89,15 @@
 
   <!-- ═══ Tabs ════════════════════════════════════════════ -->
   <div class="fp-tabs" id="cmp-tabs">
-    <div class="fp-tab active" data-tab="by-domain">
+    <!-- Phase 2 (Apr 2026): Leaderboard tab. New first because it
+         answers the most common business question ("who is taking
+         my clicks?") in one glance — sortable, with WoW trend arrows
+         and click counters. -->
+    <div class="fp-tab active" data-tab="leaderboard">
+      <span class="fp-tab-label">🏆 Leaderboard</span>
+      <span class="fp-tab-badge" id="cmp-tab-leaderboard-badge">—</span>
+    </div>
+    <div class="fp-tab" data-tab="by-domain">
       <span class="fp-tab-label">By domain</span>
       <span class="fp-tab-badge" id="cmp-tab-domain-badge">—</span>
     </div>
@@ -103,8 +111,60 @@
     </div>
   </div>
 
+  <!-- ═══ Tab: Leaderboard (Phase 2) ══════════════════════ -->
+  <!-- Sortable rich table — top competitors with WoW trend arrows.
+       Columns: rank, domain, mentions (now / prev), trend, queries,
+       clicks (from action_events), last seen, quick "add to list".
+       Sort header click toggles asc/desc; the header cell shows ▲▼
+       indicators. Search box at the top is shared with the period
+       filter — both reload the table. -->
+  <div class="fp-tabpane active" data-tabpane="leaderboard">
+    <div class="dense-panel">
+      <div class="dense-panel-header">
+        <div class="dense-panel-title">🏆 Top competitors
+          <span class="dense-panel-hint" id="cmp-lb-hint">
+            ranked by mentions in the selected period
+          </span>
+        </div>
+        <div class="cmp-lb-actions">
+          <span class="muted" id="cmp-lb-as-of" style="font-size:11px;"></span>
+        </div>
+      </div>
+      <div class="dense-table-wrap">
+        <table class="dense-table cmp-leaderboard-table"
+               id="cmp-leaderboard-table">
+          <thead>
+            <tr>
+              <th class="col-rank" style="width: 40px;">#</th>
+              <th class="col-domain"
+                  data-sort="domain">Domain</th>
+              <th class="col-num num"
+                  data-sort="mentions_now">Mentions</th>
+              <th class="col-trend"
+                  data-sort="delta_pct"
+                  style="width: 130px;">Trend (vs prev)</th>
+              <th class="col-num num"
+                  data-sort="queries_count"
+                  style="width: 80px;">Queries</th>
+              <th class="col-num num"
+                  data-sort="actions_ran"
+                  style="width: 80px;">Clicks</th>
+              <th class="col-when"
+                  data-sort="last_seen"
+                  style="width: 130px;">Last seen</th>
+              <th class="col-actions" style="width: 200px;">Add to list</th>
+            </tr>
+          </thead>
+          <tbody id="cmp-leaderboard-tbody">
+            <tr><td colspan="8" class="dense-empty-cell">Loading…</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+
   <!-- ═══ Tab: By domain ══════════════════════════════════ -->
-  <div class="fp-tabpane active" data-tabpane="by-domain">
+  <div class="fp-tabpane" data-tabpane="by-domain">
     <div class="dense-panel">
       <div class="dense-table-wrap">
         <table class="dense-table cmp-table">

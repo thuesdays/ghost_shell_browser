@@ -171,6 +171,201 @@ const ProfileDetail = {
   /** Fill the page header's "Edit profile: <name>" label.
    *  Called once on init — the page reloads (different name) come via
    *  navigation from the Profiles page, not via in-page state. */
+  /** Phase C / FU-2: cleanup recorder polling on page nav.
+   *  Called by app.js when leaving the profile page. */
+  teardown() {
+    this._stopRecorderPoll?.();
+  },
+
+  // ═══════════════════════════════════════════════════════════════
+  // Phase C / FU-2 (Apr 2026): Session Recorder UI
+  // ═══════════════════════════════════════════════════════════════
+  // Wires Record / Stop buttons to /api/profiles/<name>/recorder/*
+  // endpoints. While recording, polls /status every 2s to update the
+  // event count badge. On Stop, shows a result panel with step count
+  // and a Save-as-Script button.
+
+  _wireRecorder(name) {
+    const startBtn  = document.getElementById("pp-recorder-start-btn");
+    const stopBtn   = document.getElementById("pp-recorder-stop-btn");
+    const dot       = document.getElementById("pp-recorder-dot");
+    const statusLbl = document.getElementById("pp-recorder-status-label");
+    const eventsLbl = document.getElementById("pp-recorder-events-label");
+    const resultEl  = document.getElementById("pp-recorder-result");
+    if (!startBtn || !stopBtn) return;
+
+    // Idempotent re-wire — clear previous handlers if any
+    startBtn.onclick = async () => {
+      startBtn.disabled = true;
+      startBtn.textContent = "⏳ Starting…";
+      try {
+        const r = await api(
+          `/api/profiles/${encodeURIComponent(name)}/recorder/start`,
+          { method: "POST" }
+        );
+        if (r.ok) {
+          this._setRecorderActive(name, true);
+          toast("● Recording started");
+          this._startRecorderPoll(name);
+        } else {
+          toast(r.error || "could not start", true);
+        }
+      } catch (e) {
+        toast("Recorder start failed: " + (e?.message || e), true);
+      } finally {
+        startBtn.disabled = false;
+        startBtn.textContent = "● Record";
+      }
+    };
+
+    stopBtn.onclick = async () => {
+      stopBtn.disabled = true;
+      stopBtn.textContent = "⏳ Saving…";
+      try {
+        const r = await api(
+          `/api/profiles/${encodeURIComponent(name)}/recorder/stop`,
+          { method: "POST" }
+        );
+        if (r.ok) {
+          this._setRecorderActive(name, false);
+          this._stopRecorderPoll();
+          // Show result panel with translated flow preview
+          if (resultEl) {
+            const flowSteps = r.flow_steps || 0;
+            const flow = r.flow || [];
+            const examples = flow.slice(0, 5).map(s => {
+              const t = s.type || "?";
+              const detail = s.selector || s.url || s.text || s.key || "";
+              return `· ${t}${detail ? ": " + String(detail).slice(0, 60) : ""}`;
+            }).join("<br>");
+            resultEl.style.display = "";
+            resultEl.innerHTML = `
+              <div style="display:flex; justify-content:space-between; align-items:center; gap:10px;">
+                <div>
+                  <strong>${r.events_count} events</strong> captured →
+                  <strong>${flowSteps}</strong> script steps
+                  <div class="muted" style="font-size:11px; margin-top:4px;">
+                    saved to <code>${escapeHtml(r.saved_path || "")}</code>
+                  </div>
+                </div>
+                <button class="btn btn-primary btn-small"
+                        id="pp-recorder-save-script-btn">
+                  💾 Save as Script
+                </button>
+              </div>
+              ${flowSteps ? `
+                <details style="margin-top:8px;">
+                  <summary class="muted" style="cursor:pointer; font-size:11px;">preview first ${Math.min(5, flowSteps)} steps</summary>
+                  <div style="margin-top: 6px; font-family: var(--mono, monospace); font-size: 11px;">${examples}</div>
+                </details>` : ""}
+            `;
+            const saveBtn = document.getElementById("pp-recorder-save-script-btn");
+            if (saveBtn) {
+              saveBtn.addEventListener("click", () => {
+                this._saveRecordingAsScript(name, r.saved_path);
+              });
+            }
+          }
+          toast(`✓ ${r.events_count} events → ${r.flow_steps} steps`);
+        } else {
+          toast(r.error || "stop failed", true);
+        }
+      } catch (e) {
+        toast("Recorder stop failed: " + (e?.message || e), true);
+      } finally {
+        stopBtn.disabled = false;
+        stopBtn.textContent = "■ Stop & Save";
+      }
+    };
+
+    // Initial status check on load — we may already be recording
+    // from a previous session.
+    this._checkRecorderStatus(name);
+  },
+
+  /** Toggle visual state between idle / active. */
+  _setRecorderActive(name, active) {
+    const dot = document.getElementById("pp-recorder-dot");
+    const lbl = document.getElementById("pp-recorder-status-label");
+    const startBtn = document.getElementById("pp-recorder-start-btn");
+    const stopBtn  = document.getElementById("pp-recorder-stop-btn");
+    if (dot) {
+      dot.style.background = active ? "var(--critical)" : "var(--text-muted)";
+      dot.style.animation = active ? "live-ops-pulse 1.6s ease-in-out infinite" : "";
+    }
+    if (lbl) lbl.textContent = active ? "RECORDING" : "idle";
+    if (startBtn) startBtn.style.display = active ? "none" : "";
+    if (stopBtn)  stopBtn.style.display  = active ? "" : "none";
+  },
+
+  async _checkRecorderStatus(name) {
+    try {
+      const r = await api(
+        `/api/profiles/${encodeURIComponent(name)}/recorder/status`
+      );
+      if (r.active) {
+        this._setRecorderActive(name, true);
+        this._startRecorderPoll(name);
+      }
+    } catch (e) { /* silent */ }
+  },
+
+  _startRecorderPoll(name) {
+    this._stopRecorderPoll();
+    this._recorderPoll = setInterval(async () => {
+      try {
+        const r = await api(
+          `/api/profiles/${encodeURIComponent(name)}/recorder/status`
+        );
+        const evLbl = document.getElementById("pp-recorder-events-label");
+        if (!r.active) {
+          this._stopRecorderPoll();
+          this._setRecorderActive(name, false);
+        } else if (evLbl) {
+          evLbl.textContent = `${r.events} events captured`;
+        }
+      } catch (e) { /* silent */ }
+    }, 2000);
+  },
+
+  _stopRecorderPoll() {
+    if (this._recorderPoll) {
+      clearInterval(this._recorderPoll);
+      this._recorderPoll = null;
+    }
+  },
+
+  async _saveRecordingAsScript(name, eventsPath) {
+    if (!eventsPath) {
+      toast("no events file path", true);
+      return;
+    }
+    const label = prompt(
+      "Save recording as Script. Label?",
+      `Recorded ${name} ${new Date().toLocaleString()}`
+    );
+    if (!label) return;
+    try {
+      const r = await api(
+        `/api/profiles/${encodeURIComponent(name)}/recorder/save-as-script`,
+        {
+          method: "POST",
+          body: JSON.stringify({
+            events_path: eventsPath,
+            label,
+          }),
+        }
+      );
+      if (r.ok) {
+        toast(`✓ Saved as Script #${r.script_id} (${r.steps} steps)`);
+      } else {
+        toast(r.error || "save failed", true);
+      }
+    } catch (e) {
+      toast("save failed: " + (e?.message || e), true);
+    }
+  },
+
   _renderHeader(name) {
     const sep = document.getElementById("profile-name-sep");
     const lbl = document.getElementById("profile-name-display");
@@ -1768,28 +1963,48 @@ const ProfileDetail = {
       toast("No profile selected", true);
       return;
     }
-    if (!await confirmDialog({
-      title: "🎲 Regenerate fingerprint?",
-      message: `The fingerprint for "${this.currentProfile}" will be ` +
-        `replaced with a freshly-generated one (new UA, screen, GPU, fonts, etc.). ` +
-        `The self-check cache will be cleared. The profile's user-data-dir ` +
-        `(cookies, history) is NOT touched.\n\n` +
-        `Use this when the current fingerprint is getting flagged.`,
-      confirmText: "Regenerate",
-      confirmStyle: "primary",
-    })) return;
 
+    // Phase 4 (Apr 2026): preview-first flow.
+    // Build the new FP as a non-persistent preview so the user sees
+    // exactly what changes BEFORE committing. Cancel = no DB write.
+    // Apply  = POST regenerate-fingerprint with the same seed_suffix
+    // so the committed FP is byte-identical to the preview.
     const btn = document.getElementById("regen-fp-btn");
-    if (btn) {
-      btn.disabled = true;
-      btn.textContent = "⏳ Rolling…";
+    if (btn) { btn.disabled = true; btn.textContent = "⏳ Building preview…"; }
+
+    let preview;
+    try {
+      preview = await api(
+        `/api/profiles/${encodeURIComponent(this.currentProfile)}`
+        + `/regenerate-fingerprint/preview`,
+        { method: "POST", body: JSON.stringify({}) }
+      );
+    } catch (e) {
+      toast(e.message || "preview failed", true);
+      if (btn) { btn.disabled = false; btn.textContent = "🎲 Regenerate fingerprint"; }
+      return;
     }
 
+    if (btn) { btn.disabled = false; btn.textContent = "🎲 Regenerate fingerprint"; }
+
+    // Show modal with diff and Apply / Cancel buttons. _showFpDiffModal
+    // resolves true if the user clicked Apply.
+    const apply = await this._showFpDiffModal(preview);
+    if (!apply) return;
+
+    if (btn) { btn.disabled = true; btn.textContent = "⏳ Rolling…"; }
     try {
       const r = await api(
         `/api/profiles/${encodeURIComponent(this.currentProfile)}`
         + `/regenerate-fingerprint`,
-        { method: "POST", body: JSON.stringify({}) }
+        {
+          method: "POST",
+          body: JSON.stringify({
+            // Pin to the previewed FP so the commit is exactly what
+            // the user just looked at.
+            seed_suffix: preview.preview_seed,
+          }),
+        }
       );
       if (r.ok) {
         toast(`✓ New fingerprint: ${r.template} (Chrome ${r.chrome_version})`);
@@ -1800,11 +2015,126 @@ const ProfileDetail = {
     } catch (e) {
       toast(e.message || "regeneration failed", true);
     } finally {
-      if (btn) {
-        btn.disabled = false;
-        btn.textContent = "🎲 Regenerate fingerprint";
-      }
+      if (btn) { btn.disabled = false; btn.textContent = "🎲 Regenerate fingerprint"; }
     }
+  },
+
+  /**
+   * Phase 4 (Apr 2026): Show old vs new fingerprint diff modal.
+   * Resolves true if the user clicks Apply, false on Cancel / Esc /
+   * backdrop click.
+   *
+   * preview shape:
+   *   { old, new, diff: [{field, old, new, changed}], changed_count,
+   *     preview_seed }
+   */
+  _showFpDiffModal(preview) {
+    return new Promise((resolve) => {
+      // Build modal once; subsequent calls reuse + repopulate.
+      let backdrop = document.getElementById("fp-diff-backdrop");
+      let modal = document.getElementById("fp-diff-modal");
+      if (!backdrop) {
+        backdrop = document.createElement("div");
+        backdrop.id = "fp-diff-backdrop";
+        backdrop.className = "fp-diff-backdrop";
+        document.body.appendChild(backdrop);
+      }
+      if (!modal) {
+        modal = document.createElement("div");
+        modal.id = "fp-diff-modal";
+        modal.className = "fp-diff-modal";
+        modal.setAttribute("role", "dialog");
+        document.body.appendChild(modal);
+      }
+
+      const rows = (preview.diff || []).map(d => {
+        const cls = d.changed ? "fp-diff-row-changed" : "fp-diff-row-same";
+        const oldVal = d.old == null || d.old === ""
+          ? `<span class="muted">—</span>`
+          : `<span class="fp-diff-value">${escapeHtml(String(d.old))}</span>`;
+        const newVal = d.new == null || d.new === ""
+          ? `<span class="muted">—</span>`
+          : `<span class="fp-diff-value ${d.changed ? 'is-new' : ''}">${escapeHtml(String(d.new))}</span>`;
+        const arrow = d.changed
+          ? `<span class="fp-diff-arrow">→</span>`
+          : `<span class="fp-diff-arrow muted">=</span>`;
+        return `
+          <tr class="${cls}">
+            <td class="fp-diff-field">${escapeHtml(d.field)}</td>
+            <td class="fp-diff-old">${oldVal}</td>
+            <td class="fp-diff-arrow-cell">${arrow}</td>
+            <td class="fp-diff-new">${newVal}</td>
+          </tr>`;
+      }).join("");
+
+      const changed = preview.changed_count || 0;
+      const total = (preview.diff || []).length;
+
+      modal.innerHTML = `
+        <div class="fp-diff-modal-header">
+          <div>
+            <div class="fp-diff-modal-title">🎲 Fingerprint regeneration preview</div>
+            <div class="fp-diff-modal-sub">
+              <strong>${changed}</strong> of ${total} fields will change
+            </div>
+          </div>
+          <button class="btn-icon" id="fp-diff-close-btn" title="Cancel">×</button>
+        </div>
+        <div class="fp-diff-modal-body">
+          <div class="fp-diff-modal-hint">
+            Review what will change. Cancel to keep the current fingerprint;
+            Apply to commit this exact preview to the database.
+          </div>
+          <table class="fp-diff-table">
+            <thead>
+              <tr>
+                <th>Field</th>
+                <th>Current</th>
+                <th></th>
+                <th>New</th>
+              </tr>
+            </thead>
+            <tbody>${rows}</tbody>
+          </table>
+        </div>
+        <div class="fp-diff-modal-footer">
+          <label class="fp-diff-changed-only" style="margin-right:auto;">
+            <input type="checkbox" id="fp-diff-changed-only-cb">
+            <span style="font-size:12px;">show changed only</span>
+          </label>
+          <button class="btn btn-secondary" id="fp-diff-cancel-btn">Cancel</button>
+          <button class="btn btn-primary" id="fp-diff-apply-btn">
+            Apply (${changed} change${changed === 1 ? "" : "s"})
+          </button>
+        </div>`;
+
+      backdrop.style.display = "";
+      modal.classList.add("is-open");
+
+      const cleanup = (result) => {
+        modal.classList.remove("is-open");
+        backdrop.style.display = "none";
+        document.removeEventListener("keydown", onKey);
+        backdrop.removeEventListener("click", onBackdrop);
+        resolve(result);
+      };
+      const onKey = (e) => { if (e.key === "Escape") cleanup(false); };
+      const onBackdrop = () => cleanup(false);
+
+      document.addEventListener("keydown", onKey);
+      backdrop.addEventListener("click", onBackdrop);
+      modal.querySelector("#fp-diff-close-btn")
+           .addEventListener("click", () => cleanup(false));
+      modal.querySelector("#fp-diff-cancel-btn")
+           .addEventListener("click", () => cleanup(false));
+      modal.querySelector("#fp-diff-apply-btn")
+           .addEventListener("click", () => cleanup(true));
+      // "Show changed only" filter — toggle .is-hidden on identical rows
+      modal.querySelector("#fp-diff-changed-only-cb")
+           .addEventListener("change", (e) => {
+             modal.classList.toggle("show-changed-only", e.target.checked);
+           });
+    });
   },
 
   // ─── CHROME HISTORY IMPORT ───────────────────────────────────
@@ -1981,6 +2311,9 @@ const ProfileDetail = {
       // burned") + when it happened + a button to clear the flag.
       // Hidden when needs_attention=0/null.
       this._renderAttentionBanner(name, meta);
+
+      // FU-2: Wire recorder Start/Stop buttons + initial status check.
+      this._wireRecorder(name);
 
       // Restore the "rotating proxy" checkbox state — was missing entirely,
       // so the toggle visually reset to OFF after every reload regardless

@@ -2561,12 +2561,28 @@ def run_monitor():
             browser.health_check(verbose=True)
 
             # 3. Proxy diagnostics with geo-mismatch detection.
-            diag = ProxyDiagnostics(driver, proxy_url=PROXY)
-            report = diag.full_check(
-                expected_timezone = EXPECTED_TIMEZONE,
-                expected_country  = EXPECTED_COUNTRY,
-            )
-            diag.print_report(report)
+            #    Apr 2026 hotfix: any failure inside the diagnostic block
+            #    must NOT abort the run — the rest of run_monitor doesn't
+            #    depend on the report (only ip_info is read for
+            #    ip_record_start, which has its own fallback). Wrap so a
+            #    surprise (e.g. ipapi returning unexpected types) gets
+            #    logged but the run proceeds.
+            try:
+                diag = ProxyDiagnostics(driver, proxy_url=PROXY)
+                report = diag.full_check(
+                    expected_timezone = EXPECTED_TIMEZONE,
+                    expected_country  = EXPECTED_COUNTRY,
+                )
+                try:
+                    diag.print_report(report)
+                except Exception as _e:
+                    logging.debug(f"  diag print_report skipped: {_e}")
+            except Exception as _e:
+                logging.warning(
+                    f"  proxy diagnostics failed: "
+                    f"{type(_e).__name__}: {_e} — continuing without report"
+                )
+                report = {"ip_info": {"ip": current_ip}}
         else:
             wait = selfcheck_every - (profile_run_n % selfcheck_every)
             logging.info(
@@ -2636,10 +2652,17 @@ def run_monitor():
                         logging.warning(f"    rotate failed: {e}")
                         break
                     _sleep("post_rotate")
-                    report2 = diag.full_check(
-                        expected_timezone = EXPECTED_TIMEZONE,
-                        expected_country  = EXPECTED_COUNTRY,
-                    )
+                    try:
+                        report2 = diag.full_check(
+                            expected_timezone = EXPECTED_TIMEZONE,
+                            expected_country  = EXPECTED_COUNTRY,
+                        )
+                    except Exception as _e:
+                        logging.warning(
+                            f"    re-check after rotate failed: "
+                            f"{type(_e).__name__}: {_e}"
+                        )
+                        break
                     if not report2.get("geo_mismatch"):
                         rotated_to_country = report2.get("actual_country")
                         logging.info(f"  ✓ rotated into {rotated_to_country}")

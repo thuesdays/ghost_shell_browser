@@ -1,0 +1,111 @@
+<!--
+  pages/cookie-packs.html — Phase D / FU-3 (Apr 2026).
+  Cookie Pool Marketplace. Browse pre-warmed cookie + localStorage
+  packs, apply to running profiles, export current profile state as
+  a new pack.
+
+  Each pack card shows: label, domains, age (days), captcha-rate
+  (success metric — lower = better), cookies count, storage count.
+  Sorted by quality (lowest captcha rate first).
+-->
+<section class="cookie-packs-page">
+  <div class="page-header">
+    <div>
+      <div class="page-title">🍪 Cookie Pool Marketplace</div>
+      <div class="page-subtitle">
+        Pre-warmed cookie + localStorage packs. Apply to a running
+        profile for an instant "I've been here before" signal.
+      </div>
+    </div>
+    <div style="display: flex; gap: 8px;">
+      <button class="btn btn-secondary" id="cp-reload-btn">↻ Reload</button>
+      <button class="btn btn-primary" id="cp-export-btn"
+              title="Capture current state of a running profile as a new pack">
+        ⬇ Export from running profile
+      </button>
+    </div>
+  </div>
+
+  <div class="cookie-packs-grid" id="cp-grid">
+    <div class="empty-state" style="padding: 60px; text-align: center; grid-column: 1 / -1;">
+      Loading…
+    </div>
+  </div>
+
+  <!-- Apply modal — profile picker + apply confirmation -->
+  <div class="profile-modal" id="cp-apply-modal" style="display:none;">
+    <div class="profile-modal-backdrop" data-close="cp-apply-modal"></div>
+    <div class="profile-modal-content" style="max-width: 520px;">
+      <div class="profile-modal-header">
+        <div class="profile-modal-title">Apply pack to profile</div>
+        <button class="profile-modal-close" data-close="cp-apply-modal">×</button>
+      </div>
+      <div class="profile-modal-body">
+        <div class="form-hint" id="cp-apply-pack-info"
+             style="margin-bottom: 12px;"></div>
+        <div class="form-group">
+          <label class="form-label">Target profile (must be running)</label>
+          <select class="select" id="cp-apply-profile-select">
+            <option value="">(loading…)</option>
+          </select>
+          <div class="form-hint">
+            Only profiles with an active run are listed. Pack cookies
+            are CDP-injected before any navigation; localStorage is
+            written per-origin via short visits.
+          </div>
+        </div>
+      </div>
+      <div class="profile-modal-footer" style="display:flex; gap:8px; padding: 14px 18px; border-top: 1px solid var(--border); justify-content: flex-end;">
+        <button class="btn btn-secondary" data-close="cp-apply-modal">Cancel</button>
+        <button class="btn btn-primary" id="cp-apply-confirm-btn">Apply</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Export modal — pick profile + label + domains -->
+  <div class="profile-modal" id="cp-export-modal" style="display:none;">
+    <div class="profile-modal-backdrop" data-close="cp-export-modal"></div>
+    <div class="profile-modal-content" style="max-width: 560px;">
+      <div class="profile-modal-header">
+        <div class="profile-modal-title">Export pack from profile</div>
+        <button class="profile-modal-close" data-close="cp-export-modal">×</button>
+      </div>
+      <div class="profile-modal-body">
+        <div class="form-group">
+          <label class="form-label">Source profile (must be running)</label>
+          <select class="select" id="cp-export-profile-select">
+            <option value="">(loading…)</option>
+          </select>
+        </div>
+        <div class="form-group">
+          <label class="form-label">Pack label</label>
+          <input type="text" class="input" id="cp-export-label"
+                 placeholder="Google UK · 30-day aged">
+        </div>
+        <div class="form-group">
+          <label class="form-label">Domains (one per line)</label>
+          <textarea class="textarea" id="cp-export-domains" rows="4"
+                    placeholder="google.com&#10;youtube.com&#10;...">google.com
+youtube.com</textarea>
+          <div class="form-hint">
+            Domains where localStorage is captured. Cookies for ALL
+            domains are captured automatically (CDP getAllCookies).
+          </div>
+        </div>
+        <div class="form-group">
+          <label class="form-label">Approximate age (days)</label>
+          <input type="number" class="input" id="cp-export-age-days"
+                 min="0" max="365" value="0">
+          <div class="form-hint">
+            How long this profile has been active — for marketplace
+            sorting. 0 = brand new, 30+ = well-aged.
+          </div>
+        </div>
+      </div>
+      <div class="profile-modal-footer" style="display:flex; gap:8px; padding: 14px 18px; border-top: 1px solid var(--border); justify-content: flex-end;">
+        <button class="btn btn-secondary" data-close="cp-export-modal">Cancel</button>
+        <button class="btn btn-primary" id="cp-export-confirm-btn">Export</button>
+      </div>
+    </div>
+  </div>
+</section>

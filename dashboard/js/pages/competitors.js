@@ -21,7 +21,11 @@ const Competitors = (() => {
     sparklines: {},          // { domain: [counts...] }
     chart:      null,        // Chart.js instance
     chartKind:  "line",      // line | stacked
-    currentTab: "by-domain",
+    // Phase 2 (Apr 2026): leaderboard state
+    leaderboard: [],         // /api/competitors/leaderboard rows
+    lbSortKey:   "mentions_now",
+    lbSortDir:   "desc",     // "asc" | "desc"
+    currentTab: "leaderboard",
     searchTimer: null,
     expanded:   new Set(),   // set of currently expanded domain rows
     expandedDetail: {},      // { domain: detailPayload } — cache
@@ -32,7 +36,11 @@ const Competitors = (() => {
   // ─────────────────────────────────────────────────────────────
   async function init() {
     bindEvents();
-    await Promise.all([reloadData(), loadSparklines()]);
+    // Phase 2: load main competitor data + leaderboard in parallel.
+    // Leaderboard tab is now the default active pane, so its data must
+    // be ready by first paint (otherwise the user sees "Loading…" for
+    // ~500ms even though everything else has rendered).
+    await Promise.all([reloadData(), loadSparklines(), loadLeaderboard()]);
   }
 
   function bindEvents() {
@@ -42,6 +50,8 @@ const Competitors = (() => {
       state.searchTimer = setTimeout(() => {
         state.search = (e.target.value || "").trim();
         reloadData();
+        // Phase 2: leaderboard also honors the search filter — refresh.
+        loadLeaderboard();
       }, 300);
     });
 
@@ -52,6 +62,8 @@ const Competitors = (() => {
         state.days = parseInt(b.dataset.days, 10);
         reloadData();
         loadSparklines();
+        // Phase 2: period change → leaderboard window changes too.
+        loadLeaderboard();
       });
     });
 
@@ -81,6 +93,168 @@ const Competitors = (() => {
     $$(".fp-tabpane").forEach(p => p.classList.toggle("active", p.dataset.tabpane === name));
     // Lazy load by-query tab on first visit
     if (name === "by-query" && !state.byQuery.length) loadByQuery();
+    // Phase 2: lazy-load leaderboard on first visit. Refresh on every
+    // visit otherwise feels stale when user toggles period upstream.
+    if (name === "leaderboard") loadLeaderboard();
+  }
+
+  // ─────────────────────────────────────────────────────────────
+  // Phase 2 (Apr 2026): Leaderboard
+  // ─────────────────────────────────────────────────────────────
+  async function loadLeaderboard() {
+    const tbody = document.getElementById("cmp-leaderboard-tbody");
+    if (!tbody) return;
+    tbody.innerHTML = `<tr><td colspan="8" class="dense-empty-cell">Loading…</td></tr>`;
+    try {
+      const days = state.days || 7;
+      const qs = new URLSearchParams({
+        days:      String(days),
+        prev_days: String(days),
+        top:       "100",
+      });
+      if (state.search) qs.set("q", state.search);
+      const payload = await api(`/api/competitors/leaderboard?${qs}`);
+      state.leaderboard = payload.rows || [];
+      const asOf = document.getElementById("cmp-lb-as-of");
+      if (asOf) {
+        asOf.textContent = `${state.leaderboard.length} competitor(s)`;
+      }
+      const hint = document.getElementById("cmp-lb-hint");
+      if (hint) {
+        hint.textContent =
+          `current ${days}d vs previous ${days}d`;
+      }
+      const badge = document.getElementById("cmp-tab-leaderboard-badge");
+      if (badge) badge.textContent = state.leaderboard.length;
+      renderLeaderboard();
+      bindLeaderboardSortHandlers();
+    } catch (e) {
+      console.error("[leaderboard] fetch failed:", e);
+      tbody.innerHTML = `<tr><td colspan="8" class="dense-empty-cell">
+        Failed: ${escapeHtml(e.message)}
+      </td></tr>`;
+    }
+  }
+
+  function renderLeaderboard() {
+    const tbody = document.getElementById("cmp-leaderboard-tbody");
+    if (!tbody) return;
+    if (!state.leaderboard.length) {
+      tbody.innerHTML = `<tr><td colspan="8" class="dense-empty-cell">
+        No competitors in the selected period.
+      </td></tr>`;
+      _refreshSortHeaders();
+      return;
+    }
+
+    // Sort. Stable: ties resolve by domain alphabetically.
+    const sorted = [...state.leaderboard].sort((a, b) => {
+      const ka = a[state.lbSortKey];
+      const kb = b[state.lbSortKey];
+      // null/undefined go last regardless of direction
+      if (ka == null && kb == null) return a.domain.localeCompare(b.domain);
+      if (ka == null) return 1;
+      if (kb == null) return -1;
+      let cmp;
+      if (typeof ka === "number" && typeof kb === "number") cmp = ka - kb;
+      else cmp = String(ka).localeCompare(String(kb));
+      if (cmp === 0) return a.domain.localeCompare(b.domain);
+      return state.lbSortDir === "asc" ? cmp : -cmp;
+    });
+
+    tbody.innerHTML = sorted.map((r, i) => _renderLeaderboardRow(r, i + 1)).join("");
+    _refreshSortHeaders();
+  }
+
+  function _renderLeaderboardRow(r, rank) {
+    const domain = r.domain || "";
+    const trendCls = `cmp-trend-${r.trend || "flat"}`;
+    let trendArrow, trendText;
+    switch (r.trend) {
+      case "up":   trendArrow = "▲"; trendText = `+${r.delta_pct}%`; break;
+      case "down": trendArrow = "▼"; trendText = `${r.delta_pct}%`;  break;
+      case "new":  trendArrow = "✦"; trendText = "new";              break;
+      case "lost": trendArrow = "○"; trendText = "lost";             break;
+      default:     trendArrow = "—"; trendText = "flat";
+    }
+
+    const lastSeen = r.last_seen
+      ? r.last_seen.replace("T", " ").slice(0, 16)
+      : "—";
+
+    // Click count gets a soft highlight when > 0 (the tool's actual
+    // success metric — a domain you've clicked is a domain you've
+    // engaged with, regardless of mentions).
+    const clickCell = (r.actions_ran > 0)
+      ? `<span style="color: var(--healthy);">${r.actions_ran}</span>`
+      : `<span class="muted">${r.actions_ran || 0}</span>`;
+
+    return `
+      <tr class="cmp-lb-row">
+        <td class="num cmp-lb-rank">${rank}</td>
+        <td class="cmp-lb-domain">
+          <a href="javascript:void(0)" class="cmp-lb-domain-link"
+             onclick="Competitors.openDomain && Competitors.openDomain('${escapeHtml(domain)}')">
+            ${escapeHtml(domain)}
+          </a>
+        </td>
+        <td class="num">
+          <strong>${r.mentions_now}</strong>
+          <span class="muted" style="font-size:10px;"> · ${r.mentions_prev} prev</span>
+        </td>
+        <td class="cmp-lb-trend ${trendCls}">
+          <span class="cmp-lb-trend-arrow">${trendArrow}</span>
+          <span class="cmp-lb-trend-text">${escapeHtml(trendText)}</span>
+        </td>
+        <td class="num">${r.queries_count || 0}</td>
+        <td class="num">${clickCell}</td>
+        <td class="cmp-lb-when">${escapeHtml(lastSeen)}</td>
+        <td class="cmp-lb-actions">
+          <button class="btn btn-secondary btn-tiny"
+                  onclick="Competitors.addToList('${escapeHtml(domain)}', 'target')"
+                  title="Track as target — runs will engage with this domain">
+            Target
+          </button>
+          <button class="btn btn-secondary btn-tiny"
+                  onclick="Competitors.addToList('${escapeHtml(domain)}', 'block')"
+                  title="Block — runs will never click this domain">
+            Block
+          </button>
+        </td>
+      </tr>`;
+  }
+
+  function bindLeaderboardSortHandlers() {
+    const table = document.getElementById("cmp-leaderboard-table");
+    if (!table || table.dataset._sortWired === "1") return;
+    table.dataset._sortWired = "1";
+    table.querySelectorAll("th[data-sort]").forEach(th => {
+      th.style.cursor = "pointer";
+      th.addEventListener("click", () => {
+        const key = th.dataset.sort;
+        if (state.lbSortKey === key) {
+          state.lbSortDir = state.lbSortDir === "asc" ? "desc" : "asc";
+        } else {
+          state.lbSortKey = key;
+          // First-click default is desc for numbers (most-relevant
+          // first), asc for strings (alphabetical).
+          state.lbSortDir = key === "domain" || key === "last_seen"
+            ? "asc" : "desc";
+        }
+        renderLeaderboard();
+      });
+    });
+  }
+
+  function _refreshSortHeaders() {
+    const table = document.getElementById("cmp-leaderboard-table");
+    if (!table) return;
+    table.querySelectorAll("th[data-sort]").forEach(th => {
+      th.classList.remove("is-sorted-asc", "is-sorted-desc");
+      if (th.dataset.sort === state.lbSortKey) {
+        th.classList.add(`is-sorted-${state.lbSortDir}`);
+      }
+    });
   }
 
   // ─────────────────────────────────────────────────────────────
@@ -523,5 +697,19 @@ const Competitors = (() => {
     if (state.chart) { state.chart.destroy(); state.chart = null; }
   }
 
-  return { init, teardown };
+  // Phase 2: openDomain delegates to existing expand-row handler if
+  // available, else simply scrolls + flashes the leaderboard row.
+  // Defensive — addToList exposed for inline onclick handlers that
+  // were already in the by-domain table; the leaderboard reuses them.
+  function openDomain(domain) {
+    // For now, just dispatch to the existing add-to-list flow's
+    // detail panel by switching the by-domain tab + filtering.
+    if (typeof switchTab === "function") switchTab("by-domain");
+    state.search = domain;
+    const input = document.getElementById("cmp-filter-search");
+    if (input) input.value = domain;
+    reloadData();
+  }
+
+  return { init, teardown, addToList, openDomain };
 })();

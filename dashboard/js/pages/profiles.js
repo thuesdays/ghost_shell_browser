@@ -30,6 +30,11 @@ const Profiles = {
   searchFilter:  "",
   tagFilter:     null,     // if set, only rows containing this tag show
   selectedNames: new Set(),   // multi-selection for bulk actions
+  // Phase 1 (Apr 2026): view-mode preference. "table" stays the default
+  // so existing users see no surprise; "cards" is one click away.
+  // Persisted in localStorage("profiles.view_mode") so the choice
+  // survives reloads.
+  viewMode: "table",
 
   async init() {
     // Load visible columns preference from localStorage. The "select"
@@ -62,6 +67,25 @@ const Profiles = {
         );
       } catch {}
     }
+
+    // Phase 1 audit fix: clear selection on init so re-entering the
+    // page doesn't carry over checkboxes from a previous visit
+    // (selectedNames is a module-level Set; without this the bulk-bar
+    // would think 5 profiles are still selected after navigation).
+    this.selectedNames.clear();
+
+    // Phase 1: load view-mode preference from localStorage.
+    try {
+      const v = localStorage.getItem("profiles.view_mode");
+      if (v === "cards" || v === "table") this.viewMode = v;
+    } catch {}
+
+    // Wire view-toggle buttons (idempotent — querySelectorAll handles
+    // both buttons in one pass).
+    document.querySelectorAll(".profiles-view-btn").forEach(btn => {
+      btn.addEventListener("click", () => this.setViewMode(btn.dataset.viewMode));
+    });
+    this._reflectViewMode();   // sync UI with stored pref before first render
 
     $("#reload-profiles-btn").addEventListener("click", () => this.reload());
     $("#btn-create-profile").addEventListener("click", () => CreateProfileModal.open());
@@ -350,7 +374,44 @@ const Profiles = {
     });
   },
 
+  /**
+   * Phase 1 (Apr 2026): switch view mode (cards / table) and re-render.
+   * Persists to localStorage so the choice survives reloads + cross-page
+   * nav. Reflects toggle button visual state (.is-active) and toggles
+   * which container is visible.
+   */
+  setViewMode(mode) {
+    if (mode !== "cards" && mode !== "table") return;
+    if (this.viewMode === mode) return;
+    this.viewMode = mode;
+    try { localStorage.setItem("profiles.view_mode", mode); } catch {}
+    this._reflectViewMode();
+    this.renderTable();
+  },
+
+  /** Sync DOM (toggle buttons + container display) to current viewMode.
+   *  Called from init() before the first render and from setViewMode().
+   *  Defensive — works whether or not the DOM elements exist yet. */
+  _reflectViewMode() {
+    document.querySelectorAll(".profiles-view-btn").forEach(btn => {
+      btn.classList.toggle("is-active",
+        btn.dataset.viewMode === this.viewMode);
+    });
+    const tw = document.getElementById("profiles-table-wrap");
+    const cw = document.getElementById("profiles-cards-wrap");
+    if (tw) tw.style.display = this.viewMode === "table" ? "" : "none";
+    if (cw) cw.style.display = this.viewMode === "cards" ? "" : "none";
+  },
+
   renderTable() {
+    // Phase 1: dispatch on viewMode. Method name kept as renderTable()
+    // for backwards-compat with the ~11 call sites already in this
+    // file — easier than touching them all.
+    if (this.viewMode === "cards") {
+      this._renderCardsBody();
+      this._updateBulkBar();
+      return;
+    }
     const visibleCols = this.ALL_COLUMNS.filter(c => this.visibleColumns.includes(c.key));
 
     // Head — select column gets a "select all" checkbox instead of label
@@ -1042,6 +1103,251 @@ const Profiles = {
       toast("Error: " + e.message, true);
     }
   },
+
+  // ═══════════════════════════════════════════════════════════════
+  // Phase 1 (Apr 2026): Card-view rendering
+  // ═══════════════════════════════════════════════════════════════
+  // Renders the same allProfiles list as the table view, but as a
+  // visually-rich card grid. Reuses the search/tag filter, the
+  // selectedNames Set (cards have a checkbox in the corner), the
+  // quality-batch verdict cache, and the running-profiles set.
+  // Inline action buttons hit the SAME endpoints as the table's
+  // ⋮ menu so behavior is identical between views.
+
+  _renderCardsBody() {
+    const wrap = document.getElementById("profiles-cards-wrap");
+    if (!wrap) return;
+
+    // Same filter pipeline as renderTable. Keep them in sync — if you
+    // touch the table filter, mirror here.
+    const filtered = this.allProfiles.filter(p => {
+      if (this.searchFilter && !p.name.toLowerCase().includes(this.searchFilter)) {
+        return false;
+      }
+      if (this.tagFilter) {
+        const tags = Array.isArray(p.tags) ? p.tags : [];
+        if (!tags.map(t => t.toLowerCase()).includes(this.tagFilter.toLowerCase())) {
+          return false;
+        }
+      }
+      return true;
+    });
+
+    if (!filtered.length) {
+      wrap.innerHTML = `<div class="empty-state" style="padding:40px;text-align:center;">
+        No profiles match the current filters.
+      </div>`;
+      return;
+    }
+
+    wrap.innerHTML = `
+      <div class="profile-cards-grid">
+        ${filtered.map(p => this._renderProfileCard(p)).join("")}
+      </div>`;
+
+    // Wire interactive elements on each card.
+    wrap.querySelectorAll(".profile-card-cb").forEach(cb => {
+      cb.addEventListener("change", (e) => {
+        const name = e.target.dataset.name;
+        if (e.target.checked) this.selectedNames.add(name);
+        else                  this.selectedNames.delete(name);
+        // Reflect selected-state on the card too (highlight ring).
+        const card = e.target.closest(".profile-card");
+        if (card) card.classList.toggle("is-selected", e.target.checked);
+        this._updateBulkBar();
+      });
+    });
+    wrap.querySelectorAll(".profile-card-start-btn").forEach(btn => {
+      btn.addEventListener("click", (e) => {
+        e.stopPropagation();
+        const name = btn.dataset.name;
+        // startProfile is the canonical method name in this module
+        // (defined ~line 651). Same handler the table view uses.
+        if (typeof this.startProfile === "function") this.startProfile(name);
+      });
+    });
+    wrap.querySelectorAll(".profile-card-stop-btn").forEach(btn => {
+      btn.addEventListener("click", (e) => {
+        e.stopPropagation();
+        const name = btn.dataset.name;
+        // stopThis(name) is the per-profile-targeted stop. The
+        // legacy stopRun() targets "most recent" which is wrong
+        // when multiple profiles run concurrently.
+        if (typeof this.stopThis === "function") this.stopThis(name);
+      });
+    });
+    wrap.querySelectorAll(".profile-card").forEach(card => {
+      // Whole card → open profile detail (except clicks on buttons /
+      // checkbox / tag chips, which call stopPropagation).
+      card.addEventListener("click", () => {
+        const name = card.dataset.name;
+        if (name) location.hash = "#profile?name=" + encodeURIComponent(name);
+      });
+    });
+  },
+
+  _renderProfileCard(p) {
+    const checked = this.selectedNames.has(p.name) ? "checked" : "";
+    const running = this._runningProfiles?.has(p.name);
+    const q = (this._qualityByName || {})[p.name] || {};
+
+    // Status pill: prefer LIVE > quality verdict > database status
+    let statusClass = "muted";
+    let statusLabel = p.status || "—";
+    if (running) {
+      statusClass = "running";
+      statusLabel = "● running";
+    } else if (q.status === "burned") {
+      statusClass = "burned";
+      statusLabel = "✗ burned";
+    } else if (q.status === "warmup") {
+      statusClass = "warmup";
+      statusLabel = "↻ warmup";
+    } else if (q.status === "ready") {
+      statusClass = "ready";
+      statusLabel = "✓ ready";
+    }
+
+    // Country flag from fingerprint locale (best guess). UA-LA ↦ 🇺🇦, etc.
+    const lang = (p.fingerprint?.languages?.[0] || "").toLowerCase();
+    const flag = this._flagFromLang(lang);
+
+    // FP icon: pick by template prefix (gaming = NVIDIA stylized,
+    // mac = Apple, etc.). Cheap visual differentiator.
+    const tmpl = p.fingerprint?.template || "";
+    const fpIcon = this._templateIcon(tmpl);
+
+    // Tags (max 3 + "+N more")
+    const tags = Array.isArray(p.tags) ? p.tags : [];
+    const tagChips = tags.slice(0, 3).map(t =>
+      `<span class="profile-card-tag" onclick="event.stopPropagation(); Profiles.filterByTag('${escapeHtml(t)}')">${escapeHtml(t)}</span>`
+    ).join("");
+    const tagMore = tags.length > 3 ? `<span class="profile-card-tag-more">+${tags.length - 3}</span>` : "";
+
+    // Last run age — "12m ago" style
+    const lastRun = p.last_run_at
+      ? this._timeAgo(p.last_run_at)
+      : "never";
+
+    // 24h captcha sparkline approximation: simple count badge (we don't
+    // have a real timeseries here without fetching extra data; keep
+    // the sparkline for a future enhancement if requested).
+    const captchas = p.captchas_24h ?? 0;
+    const searches = p.searches_24h ?? 0;
+    const captchaPct = searches > 0
+      ? Math.round((captchas / Math.max(1, searches + captchas)) * 100)
+      : 0;
+
+    return `
+      <div class="profile-card profile-card-${statusClass} ${this.selectedNames.has(p.name) ? 'is-selected' : ''}"
+           data-name="${escapeHtml(p.name)}"
+           role="button" tabindex="0">
+        <label class="profile-card-checkbox" onclick="event.stopPropagation();">
+          <input type="checkbox" class="profile-card-cb"
+                 data-name="${escapeHtml(p.name)}" ${checked}>
+        </label>
+
+        <div class="profile-card-status profile-card-status-${statusClass}">
+          ${escapeHtml(statusLabel)}
+        </div>
+
+        <div class="profile-card-header">
+          <span class="profile-card-fp-icon" title="${escapeHtml(tmpl)}">
+            ${fpIcon}
+          </span>
+          <span class="profile-card-name">${escapeHtml(p.name)}</span>
+          <span class="profile-card-flag" title="${escapeHtml(lang)}">${flag}</span>
+        </div>
+
+        <div class="profile-card-meta">
+          <span class="profile-card-template" title="${escapeHtml(tmpl)}">
+            ${escapeHtml(tmpl || "—")}
+          </span>
+          <span class="profile-card-last-run">last: ${escapeHtml(lastRun)}</span>
+        </div>
+
+        ${tagChips || tagMore ? `
+          <div class="profile-card-tags" onclick="event.stopPropagation();">
+            ${tagChips}${tagMore}
+          </div>` : ''}
+
+        <div class="profile-card-stats">
+          <div class="profile-card-stat">
+            <span class="profile-card-stat-label">searches 24h</span>
+            <span class="profile-card-stat-value">${searches}</span>
+          </div>
+          <div class="profile-card-stat ${captchas > 0 ? 'critical' : ''}">
+            <span class="profile-card-stat-label">captchas 24h</span>
+            <span class="profile-card-stat-value">
+              ${captchas}${captchas > 0 ? `<span class="profile-card-stat-pct"> · ${captchaPct}%</span>` : ''}
+            </span>
+          </div>
+        </div>
+
+        <div class="profile-card-actions" onclick="event.stopPropagation();">
+          ${running
+            ? `<button class="btn btn-secondary btn-small profile-card-stop-btn"
+                       data-name="${escapeHtml(p.name)}">■ Stop</button>`
+            : `<button class="btn btn-primary btn-small profile-card-start-btn"
+                       data-name="${escapeHtml(p.name)}">▶ Start</button>`}
+          <a class="btn btn-secondary btn-small"
+             href="#profile?name=${encodeURIComponent(p.name)}"
+             onclick="event.stopPropagation();">Edit</a>
+        </div>
+      </div>`;
+  },
+
+  /** Best-effort country flag from BCP-47 lang tag. Covers the common
+   *  set the antidetect product actually targets — extend as needed. */
+  _flagFromLang(lang) {
+    if (!lang) return "🌐";
+    const l = lang.toLowerCase();
+    const map = {
+      "uk-ua": "🇺🇦", "uk":   "🇺🇦",
+      "en-us": "🇺🇸", "en":   "🇺🇸",
+      "en-gb": "🇬🇧",
+      "de":    "🇩🇪", "de-de":"🇩🇪",
+      "nl":    "🇳🇱", "nl-nl":"🇳🇱",
+      "fr":    "🇫🇷",
+      "es":    "🇪🇸",
+      "it":    "🇮🇹",
+      "pl":    "🇵🇱",
+      "ru":    "🇷🇺",
+      "tr":    "🇹🇷",
+      "ro":    "🇷🇴",
+      "cs":    "🇨🇿",
+    };
+    return map[l] || "🌐";
+  },
+
+  /** Template-name → emoji icon. Gaming = 🎮, Mac = 🍎, Linux = 🐧,
+   *  Office/work = 💼, anything else = 💻. Pure visual, no logic. */
+  _templateIcon(tmpl) {
+    const t = (tmpl || "").toLowerCase();
+    if (t.includes("gaming") || t.includes("nvidia")) return "🎮";
+    if (t.includes("mac"))     return "🍎";
+    if (t.includes("linux"))   return "🐧";
+    if (t.includes("mobile") || t.includes("android") || t.includes("ios")) return "📱";
+    if (t.includes("office") || t.includes("work"))   return "💼";
+    return "💻";
+  },
+
+  /** Compact relative time. Doesn't import a date lib. */
+  _timeAgo(iso) {
+    try {
+      const d = new Date(iso);
+      const sec = Math.max(0, Math.round((Date.now() - d.getTime()) / 1000));
+      if (sec < 60) return `${sec}s ago`;
+      const m = Math.floor(sec / 60);
+      if (m < 60) return `${m}m ago`;
+      const h = Math.floor(m / 60);
+      if (h < 24) return `${h}h ago`;
+      const d2 = Math.floor(h / 24);
+      return `${d2}d ago`;
+    } catch {
+      return iso;
+    }
+  },
 };
 
 
@@ -1112,39 +1418,85 @@ const CreateProfileModal = {
       try {
         const templates = await api("/api/profile-templates");
         const sel = $("#np-template");
+
+        // Phase A (Apr 2026): group by form factor via <optgroup>.
+        // Native <select> doesn't support multi-level filters but
+        // optgroups visually segment Desktop / Mobile / Tablet so the
+        // user can scan options quickly. The auto+specific entries
+        // stay above the groups (already in HTML).
+        const byFf = { desktop: [], mobile: [], tablet: [] };
         for (const t of templates) {
+          const ff = t.form_factor || "desktop";
+          if (byFf[ff]) byFf[ff].push(t);
+          else byFf.desktop.push(t);
+        }
+
+        const renderOpt = (t) => {
           const opt = document.createElement("option");
           opt.value = t.name;
-
-          // Compose label: "gaming_nvidia_mid — 12c · 16GB · RTX 4060"
+          // Phase A: prefer human name for mobile/tablet entries
+          // ("Apple iPhone 15 Pro" reads better than "iphone_15_pro").
+          // Desktop templates keep the slug for backwards-compat with
+          // existing labels users learned.
+          const display = (t.form_factor && t.form_factor !== "desktop")
+                          ? (t.device_human_name || t.name)
+                          : t.name;
+          // Compose label suffix: "12c · 16GB · GPU · Resolution"
           const parts = [];
           if (t.cpu_cores) parts.push(`${t.cpu_cores}c`);
           if (t.ram_gb)    parts.push(`${Math.round(t.ram_gb)} GB`);
           if (t.gpu_model) parts.push(t.gpu_model);
           if (t.screen_w && t.screen_h) {
-            // Only show resolution if it's unusual (not the common 1920×1080)
+            // Only show resolution if it's unusual (not 1920×1080)
             if (!(t.screen_w === 1920 && t.screen_h === 1080)) {
-              parts.push(`${t.screen_w}×${t.screen_h}`);
+              const dprStr = (t.screen_dpr && t.screen_dpr !== 1)
+                             ? ` @${t.screen_dpr}x` : "";
+              parts.push(`${t.screen_w}×${t.screen_h}${dprStr}`);
             }
           }
-          if (t.is_laptop) parts.push("laptop");
+          if (t.form_factor === "mobile")  parts.push("📱 mobile");
+          else if (t.form_factor === "tablet") parts.push("📑 tablet");
+          else if (t.is_laptop) parts.push("laptop");
 
           opt.textContent = parts.length
-            ? `${t.name} — ${parts.join(" · ")}`
-            : t.name;
+            ? `${display} — ${parts.join(" · ")}`
+            : display;
 
-          // Full tooltip on hover (native <option> supports title)
+          // Tooltip with full detail
           opt.title = [
             `Template: ${t.name}`,
+            t.device_human_name && t.device_human_name !== t.name
+              ? `Device: ${t.device_human_name}` : "",
             t.cpu_cores ? `CPU: ${t.cpu_cores} threads` : "",
             t.ram_gb    ? `RAM: ${t.ram_gb} GB`         : "",
             t.gpu_model ? `GPU: ${t.gpu_model}`         : "",
-            (t.screen_w && t.screen_h) ? `Display: ${t.screen_w}×${t.screen_h}` : "",
-            t.is_laptop ? "Form factor: laptop (battery emulation on)"
-                        : "Form factor: desktop (plugged in)",
+            (t.screen_w && t.screen_h)
+              ? `Display: ${t.screen_w}×${t.screen_h}`
+                + (t.screen_dpr ? ` @${t.screen_dpr}x DPR` : "")
+              : "",
+            t.form_factor === "mobile"
+              ? "Form factor: mobile (touch + UA-CH Mobile=?1)"
+              : t.form_factor === "tablet"
+              ? "Form factor: tablet (touch + larger screen)"
+              : t.is_laptop ? "Form factor: laptop (battery emulation on)"
+                            : "Form factor: desktop (plugged in)",
           ].filter(Boolean).join("\n");
+          return opt;
+        };
 
-          sel.appendChild(opt);
+        // Append in order: desktop first (most users), then mobile,
+        // then tablet. Each group as <optgroup> for visual separation.
+        const groups = [
+          ["💻 Desktop / Laptop", byFf.desktop],
+          ["📱 Mobile",            byFf.mobile],
+          ["📑 Tablet",            byFf.tablet],
+        ];
+        for (const [label, items] of groups) {
+          if (!items.length) continue;
+          const og = document.createElement("optgroup");
+          og.label = label;
+          for (const t of items) og.appendChild(renderOpt(t));
+          sel.appendChild(og);
         }
       } catch (e) {
         console.warn("Could not load templates", e);

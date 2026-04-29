@@ -42,6 +42,14 @@
       <div class="sidebar-item" data-page="overview">
         <span class="sidebar-item-icon">📊</span><span>Overview</span>
       </div>
+      <!-- Phase 1 (Apr 2026): Live Ops — realtime active-runs view.
+           Sits right under Overview because it's the second-most-likely
+           "open this every morning" page. Active-run pulse-dot would be
+           nice here later (uses sidebar-badge slot). -->
+      <div class="sidebar-item" data-page="live-ops">
+        <span class="sidebar-item-icon">🟢</span><span>Live Ops</span>
+        <span class="sidebar-badge" id="badge-live-ops" style="display:none">0</span>
+      </div>
       <div class="sidebar-item" data-page="profiles">
         <span class="sidebar-item-icon">👤</span><span>Profiles</span>
       </div>
@@ -56,6 +64,10 @@
       </div>
       <div class="sidebar-item" data-page="session">
         <span class="sidebar-item-icon">🍪</span><span>Session/Cookies</span>
+      </div>
+      <!-- Phase D / FU-3 (Apr 2026): Cookie Pool Marketplace -->
+      <div class="sidebar-item" data-page="cookie-packs">
+        <span class="sidebar-item-icon">📦</span><span>Cookie Packs</span>
       </div>
       <div class="sidebar-item" data-page="behavior">
         <span class="sidebar-item-icon">⚙️</span><span>Behavior</span>
@@ -109,6 +121,19 @@
     </nav>
 
     <div class="sidebar-footer">
+      <!-- Phase 3 (Apr 2026): notifications bell — clicks open the
+           drawer with all attention items aggregated by /api/notifications.
+           Badge shows count when > 0; auto-hides on 0. The bell is
+           always visible in the sidebar footer so users can spot new
+           alerts without navigating to a specific page. -->
+      <button class="notifications-bell" id="notifications-bell"
+              aria-label="Notifications" title="Notifications">
+        <span class="notifications-bell-icon">🔔</span>
+        <span class="notifications-bell-label">Notifications</span>
+        <span class="notifications-bell-badge"
+              id="notifications-bell-badge" style="display:none;">0</span>
+      </button>
+
       <!-- "N running" counter appears when ≥1 slot is active. Clicking
            it expands a small panel showing each active run with its own
            stop button. -->
@@ -144,20 +169,60 @@
 
 <div class="toast" id="toast"></div>
 
+<!-- Phase 3 (Apr 2026): Global notifications drawer.
+     Slides in from the right when the bell is clicked. Lists all
+     attention-worthy events grouped by severity. Closing via:
+       • × button
+       • Click on backdrop
+       • Esc key (handled in notifications.js)
+     Items are clickable — clicking dispatches to the appropriate
+     page via data-action / data-action-arg. -->
+<div class="notifications-backdrop"
+     id="notifications-backdrop" style="display:none;"></div>
+<aside class="notifications-drawer"
+       id="notifications-drawer"
+       aria-hidden="true"
+       role="dialog">
+  <div class="notifications-drawer-header">
+    <div class="notifications-drawer-title">
+      🔔 Notifications
+      <span class="notifications-drawer-count"
+            id="notifications-drawer-count">0</span>
+    </div>
+    <div class="notifications-drawer-actions">
+      <button class="btn-icon" id="notifications-refresh-btn"
+              title="Refresh">↻</button>
+      <button class="btn-icon" id="notifications-close-btn"
+              title="Close (Esc)">×</button>
+    </div>
+  </div>
+  <div class="notifications-drawer-body" id="notifications-drawer-body">
+    <div class="empty-state" style="padding:40px 20px;text-align:center;">
+      Loading…
+    </div>
+  </div>
+</aside>
+
 <!-- Core shared modules -->
 <script src="/js/api.js"></script>
 <script src="/js/utils.js"></script>
 <script src="/js/config-form.js"></script>
 <script src="/js/runner.js"></script>
+<!-- Phase 3 (Apr 2026): global notifications drawer (bell + slide-out) -->
+<script src="/js/notifications.js"></script>
 
 <!-- Page modules -->
 <script src="/js/pages/overview.js"></script>
+<!-- Phase 1 (Apr 2026): Live Ops realtime active-runs view -->
+<script src="/js/pages/live-ops.js"></script>
 <script src="/js/pages/profiles.js"></script>
 <script src="/js/pages/groups.js"></script>
 <script src="/js/pages/proxy.js"></script>
 <script src="/js/pages/profile-detail.js"></script>
 <script src="/js/pages/fingerprint.js"></script>
 <script src="/js/pages/session.js"></script>
+<!-- Phase D / FU-3 (Apr 2026): Cookie Pool Marketplace -->
+<script src="/js/pages/cookie-packs.js"></script>
 <script src="/js/pages/accounts.js"></script>
 <script src="/js/pages/extensions.js"></script>
 <script src="/js/pages/competitors.js"></script>

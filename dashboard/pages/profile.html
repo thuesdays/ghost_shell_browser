@@ -71,6 +71,55 @@
     </div>
   </div>
 
+  <!-- Phase C / FU-2 (Apr 2026): Session Recorder card.
+       Record real browsing in the live browser, save as a script.
+       Only enabled when the profile has an active run (recorder
+       attaches to the live driver). The dashboard polls
+       /recorder/status every 2s while recording. -->
+  <div class="card profile-recorder-card">
+    <div class="card-title">
+      🎬 Session Recorder
+      <span class="muted">— record clicks/typing/scrolling in the live browser, save as a Script</span>
+    </div>
+    <div class="profile-recorder-state" id="pp-recorder-state"
+         style="display: flex; gap: 16px; align-items: center; flex-wrap: wrap;">
+      <div class="profile-recorder-status">
+        <span class="profile-recorder-dot" id="pp-recorder-dot"
+              style="display:inline-block;width:10px;height:10px;
+                     border-radius:50%;background:var(--text-muted);
+                     vertical-align:middle;margin-right:6px;"></span>
+        <span id="pp-recorder-status-label">idle</span>
+        <span class="muted" id="pp-recorder-events-label"
+              style="margin-left: 10px; font-size: 12px;"></span>
+      </div>
+      <div style="display: flex; gap: 8px; margin-left: auto;">
+        <button class="btn btn-primary btn-small"
+                id="pp-recorder-start-btn"
+                title="Start recording the live browser session.
+Profile must already be running.">
+          ● Record
+        </button>
+        <button class="btn btn-secondary btn-small"
+                id="pp-recorder-stop-btn"
+                style="display:none;"
+                title="Stop and save events; preview the generated script.">
+          ■ Stop &amp; Save
+        </button>
+      </div>
+    </div>
+    <div class="form-hint" style="margin-top: 8px;">
+      Click <strong>Record</strong>, perform the workflow manually in the
+      open browser window, then click <strong>Stop</strong>. The dashboard
+      will translate the captured events into a unified-flow script
+      you can save to the library and replay on other profiles.
+    </div>
+    <!-- Result panel — populated after Stop; shows step count + Save button -->
+    <div id="pp-recorder-result"
+         style="display:none; margin-top: 12px; padding: 10px;
+                background: rgba(255,255,255,0.03);
+                border-radius: 6px; font-size: 12px;"></div>
+  </div>
+
   <!-- ─── IDENTITY: tags, notes, language, session toggle ──────
        Per-profile metadata. Keep this near the top so the human-readable
        labels are the first thing the user sees on the edit page. -->

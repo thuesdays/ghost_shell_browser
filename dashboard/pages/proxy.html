@@ -133,6 +133,41 @@
       </div>
     </div>
   </details>
+
+  <!-- Phase 3 (Apr 2026): Proxy Health Timeline.
+       Horizontal 7-day timeline: rotation marks (◆), captcha hits (×),
+       burn events (🔥), first-seen (●). One swimlane per IP, newest
+       events on the right. Hover any marker for detail. Loaded once
+       on page mount; reload via the ↻ button. Lightweight SVG, no
+       external chart lib needed. -->
+  <div class="card" style="margin-top: 18px;">
+    <div class="card-title" style="display: flex; justify-content: space-between; align-items: center;">
+      <div>📅 Proxy health timeline
+        <span class="muted" style="font-weight: 400; font-size: 12px; margin-left: 8px;">
+          last 7 days · rotations / captchas / burn events
+        </span>
+      </div>
+      <div style="display: flex; gap: 8px; align-items: center;">
+        <span class="muted" id="proxy-timeline-as-of"
+              style="font-size: 11px;"></span>
+        <button class="btn btn-secondary btn-small"
+                id="proxy-timeline-reload-btn"
+                title="Refresh">↻</button>
+      </div>
+    </div>
+    <div class="proxy-timeline-legend"
+         style="display: flex; gap: 14px; font-size: 11px; color: var(--text-muted); margin-bottom: 12px;">
+      <span><span class="proxy-tl-marker proxy-tl-rotation">◆</span> rotation</span>
+      <span><span class="proxy-tl-marker proxy-tl-captcha">×</span> captcha</span>
+      <span><span class="proxy-tl-marker proxy-tl-burn">🔥</span> burned</span>
+      <span><span class="proxy-tl-marker proxy-tl-first">●</span> first seen</span>
+    </div>
+    <div class="proxy-timeline-container" id="proxy-timeline-container">
+      <div class="empty-state" style="padding: 30px; text-align: center;">
+        Loading…
+      </div>
+    </div>
+  </div>
 </section>
 
 <!-- ── Add/Edit proxy modal ──────────────────────────────────── -->

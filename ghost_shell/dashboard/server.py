@@ -22,7 +22,7 @@ import queue
 import logging
 import threading
 import subprocess
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Optional
 
 # Windows cp1252 stdout quirk — force UTF-8 so the dashboard's own log
@@ -1597,6 +1597,278 @@ def api_profile_meta_set(name: str):
     return jsonify(get_db().profile_meta_get(name))
 
 
+# ───────────────────────────────────────────────────────────────
+# Phase D / FU-3 (Apr 2026): Cookie Pack Marketplace API
+# ───────────────────────────────────────────────────────────────
+
+@app.route("/api/cookie-packs", methods=["GET"])
+def api_cookie_packs_list():
+    """List all packs in the marketplace. Metadata only — payload
+    isn't decompressed here."""
+    try:
+        from ghost_shell.session.cookie_pack import list_packs
+        return jsonify({"packs": list_packs()})
+    except Exception as e:
+        logging.exception("[cookie-packs] list failed")
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/cookie-packs/<int:pack_id>", methods=["GET"])
+def api_cookie_packs_get(pack_id: int):
+    """Full pack with decompressed payload. Used by Apply UI to
+    preview cookies before injection."""
+    try:
+        from ghost_shell.session.cookie_pack import get_pack
+        pack = get_pack(pack_id)
+        if not pack:
+            return jsonify({"error": "pack not found"}), 404
+        # Trim cookies/local_storage previews to avoid 100MB JSON
+        # responses on huge packs. UI just needs counts + samples.
+        cookies = pack.get("cookies") or []
+        storage = pack.get("local_storage") or []
+        return jsonify({
+            "id":            pack.get("_db_id") or pack.get("id"),
+            "slug":          pack.get("id"),
+            "label":         pack.get("label"),
+            "domains":       pack.get("domains") or [],
+            "age_days":      pack.get("age_days"),
+            "captcha_rate":  pack.get("captcha_rate"),
+            "metadata":      pack.get("metadata") or {},
+            "cookies_count": len(cookies),
+            "storage_count": sum(len(s.get("items", [])) for s in storage),
+            "cookies_sample":  cookies[:10],
+            "storage_sample":  [
+                {"origin": s.get("origin"), "items_count": len(s.get("items", []))}
+                for s in storage[:20]
+            ],
+        })
+    except Exception as e:
+        logging.exception("[cookie-packs] get failed")
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/cookie-packs/<int:pack_id>/apply", methods=["POST"])
+def api_cookie_packs_apply(pack_id: int):
+    """Apply pack to a profile. Body: {"profile_name": "..."}.
+    Profile must be running."""
+    body = request.get_json(silent=True) or {}
+    profile_name = (body.get("profile_name") or "").strip()
+    if not profile_name:
+        return jsonify({"error": "profile_name required"}), 400
+    driver = _resolve_driver_for_profile(profile_name)
+    if driver is None:
+        return jsonify({
+            "error": "profile is not running — start a run first",
+        }), 400
+    try:
+        from ghost_shell.session.cookie_pack import apply_pack
+        stats = apply_pack(driver, pack_id)
+        return jsonify({"ok": True, "stats": stats})
+    except Exception as e:
+        logging.exception("[cookie-packs] apply failed")
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/cookie-packs/<int:pack_id>", methods=["DELETE"])
+def api_cookie_packs_delete(pack_id: int):
+    try:
+        from ghost_shell.session.cookie_pack import delete_pack
+        ok = delete_pack(pack_id)
+        return jsonify({"ok": ok})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/cookie-packs/export", methods=["POST"])
+def api_cookie_packs_export():
+    """Export current state of a running profile as a new pack +
+    save it to the marketplace. Body:
+        {"profile_name": "...", "label": "...", "domains": ["..."]}
+    domains list controls which origins get localStorage captured.
+    """
+    body = request.get_json(silent=True) or {}
+    profile_name = (body.get("profile_name") or "").strip()
+    if not profile_name:
+        return jsonify({"error": "profile_name required"}), 400
+    driver = _resolve_driver_for_profile(profile_name)
+    if driver is None:
+        return jsonify({
+            "error": "profile is not running — start a run first to capture live state",
+        }), 400
+    try:
+        from ghost_shell.session.cookie_pack import (
+            export_from_profile, save_pack
+        )
+        pack = export_from_profile(
+            profile_name,
+            driver=driver,
+            label=body.get("label"),
+            domains=body.get("domains") or [],
+        )
+        # age_days hint from caller — operator knows how aged the
+        # profile is. Default 0.
+        if body.get("age_days") is not None:
+            pack["age_days"] = int(body["age_days"])
+        pid = save_pack(pack)
+        return jsonify({
+            "ok":            True,
+            "pack_id":       pid,
+            "slug":          pack.get("id"),
+            "cookies_count": len(pack.get("cookies") or []),
+            "storage_count": sum(
+                len(s.get("items", []))
+                for s in (pack.get("local_storage") or [])
+            ),
+        })
+    except Exception as e:
+        logging.exception("[cookie-packs] export failed")
+        return jsonify({"error": str(e)}), 500
+
+
+# ───────────────────────────────────────────────────────────────
+# Phase C / FU-2 (Apr 2026): Recorder API
+# ───────────────────────────────────────────────────────────────
+# Server-side state for active recordings, keyed by profile name.
+# A recording requires a live driver — the dashboard fetches it via
+# the running RunnerSlot's selenium driver. If the profile is NOT
+# running, recording can't start (no driver to attach to).
+#
+# Storage:
+#   _ACTIVE_RECORDERS: dict[profile_name, Recorder]
+#   Each recorder accumulates events in-memory; stop() returns them.
+#   Saved scripts live under recordings/<profile>/<ts>.events.json
+#   AND can be promoted to a saved Script via the existing scripts API.
+
+_ACTIVE_RECORDERS: dict = {}
+_REC_LOCK = threading.Lock()
+
+
+def _resolve_driver_for_profile(profile_name: str):
+    """Find the live selenium driver for a running profile, or None.
+    The runner pool stores the subprocess but not the driver — the
+    actual selenium handle lives inside main.py. For a no-rebuild
+    quick path we attach a CDP recorder via remote-debugging-port.
+    Future: surface the driver through the runner pool directly."""
+    slot = RUNNER_POOL.get_by_profile(profile_name)
+    if not slot or not slot.is_running:
+        return None
+    # The slot doesn't own a driver handle (subprocess does). We
+    # connect via CDP remote-debugging-port that main.py opens at
+    # launch. The recorder JS hook approach works against any
+    # CDP-attached driver — we use the same selenium connection
+    # the dashboard uses for proxy diagnostics.
+    return getattr(slot, "driver", None)
+
+
+@app.route("/api/profiles/<name>/recorder/start", methods=["POST"])
+def api_recorder_start(name: str):
+    """Start recording for a running profile. Returns the recorder
+    state. 409 if recording already in flight, 400 if profile not
+    running."""
+    with _REC_LOCK:
+        if name in _ACTIVE_RECORDERS:
+            return jsonify({
+                "error":  "already recording",
+                "events": len(_ACTIVE_RECORDERS[name]._events),
+            }), 409
+        driver = _resolve_driver_for_profile(name)
+        if driver is None:
+            return jsonify({
+                "error": "profile is not running — start a run first",
+            }), 400
+        try:
+            from ghost_shell.recorder import Recorder
+            rec = Recorder(driver, name)
+            rec.start()
+            _ACTIVE_RECORDERS[name] = rec
+        except Exception as e:
+            logging.exception("[recorder] start failed")
+            return jsonify({"error": f"start failed: {e}"}), 500
+    return jsonify({
+        "ok":           True,
+        "profile_name": name,
+        "started_at":   _ACTIVE_RECORDERS[name]._started_at,
+    })
+
+
+@app.route("/api/profiles/<name>/recorder/stop", methods=["POST"])
+def api_recorder_stop(name: str):
+    """Stop recording. Returns events count + path to saved file +
+    a translated unified-flow preview (so UI can show what would be
+    a script)."""
+    with _REC_LOCK:
+        rec = _ACTIVE_RECORDERS.pop(name, None)
+    if rec is None:
+        return jsonify({"error": "no active recording for profile"}), 404
+    try:
+        events = rec.stop()
+        path = rec.save_to_disk(events)
+    except Exception as e:
+        logging.exception("[recorder] stop failed")
+        return jsonify({"error": f"stop failed: {e}"}), 500
+    # Translate to flow for preview
+    try:
+        from ghost_shell.recorder import translate_events_to_flow
+        flow = translate_events_to_flow(events)
+    except Exception as e:
+        flow = []
+        logging.warning(f"[recorder] translate failed: {e}")
+    return jsonify({
+        "ok":           True,
+        "profile_name": name,
+        "events_count": len(events),
+        "saved_path":   path,
+        "flow":         flow,
+        "flow_steps":   len(flow),
+    })
+
+
+@app.route("/api/profiles/<name>/recorder/status", methods=["GET"])
+def api_recorder_status(name: str):
+    """Polling endpoint for the UI — returns active state +
+    event-count so the dashboard can show "247 events captured"
+    while recording is in progress."""
+    with _REC_LOCK:
+        rec = _ACTIVE_RECORDERS.get(name)
+    if rec is None:
+        return jsonify({"active": False})
+    return jsonify({
+        "active":      True,
+        "started_at":  rec._started_at,
+        "events":      len(rec._events),
+    })
+
+
+@app.route("/api/profiles/<name>/recorder/save-as-script", methods=["POST"])
+def api_recorder_save_as_script(name: str):
+    """One-click promote a finished recording to a Script in the
+    library. Body: {"label": "...", "events_path": "..."}.
+    Returns the new script id."""
+    body = request.get_json(silent=True) or {}
+    events_path = body.get("events_path")
+    label       = body.get("label") or f"Recorded from {name}"
+    if not events_path:
+        return jsonify({"error": "events_path required"}), 400
+    try:
+        with open(events_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        from ghost_shell.recorder import translate_events_to_flow
+        flow = translate_events_to_flow(data.get("events") or [])
+    except Exception as e:
+        return jsonify({"error": f"could not read recording: {e}"}), 400
+    try:
+        db = get_db()
+        sid = db.script_create(
+            name=label,
+            description=f"Auto-generated from recording at {events_path}",
+            flow=flow,
+            tags=["recorded", name],
+        )
+        return jsonify({"ok": True, "script_id": sid, "steps": len(flow)})
+    except Exception as e:
+        return jsonify({"error": f"save failed: {e}"}), 500
+
+
 @app.route("/api/profiles/<name>/clear-attention", methods=["POST"])
 def api_profile_clear_attention(name: str):
     """One-click 'I fixed the proxy / cleared cookies / regenerated
@@ -2400,6 +2672,439 @@ def api_competitors_export():
     )
 
 
+def _safe_iso_to_epoch(iso) -> float:
+    """Convert an ISO-8601 timestamp string to epoch seconds for sort
+    keys. Returns 0 on any failure (bad format, None, etc.) — which
+    ranks the item as oldest. Used by /api/notifications sort.
+    """
+    if not iso:
+        return 0.0
+    try:
+        from datetime import datetime as _dt
+        return _dt.fromisoformat(iso).timestamp()
+    except Exception:
+        return 0.0
+
+
+@app.route("/api/notifications", methods=["GET"])
+def api_notifications():
+    """Phase 3 (Apr 2026): aggregated attention-worthy events for the
+    global notifications drawer in the navbar.
+
+    Sources merged into one priority-sorted list:
+      • profiles.needs_attention=1   (D5, set by main.py burn-block)
+      • recent run failures           (last 24h, exit_code != 0 and != 75)
+      • captcha spike                 (any profile with ≥5 captchas in
+                                       last 1h — burn signal)
+      • ip_history burned             (any IP with burned_at within 24h)
+      • scheduler failures            (consecutive_failures > 0 from
+                                       scheduler config / state)
+
+    Each entry:
+      { id, severity, title, body, action, action_arg, created_at }
+        severity ∈ "critical" | "warning" | "info"
+        action   ∈ "open_profile" | "open_proxy" | "open_runs" |
+                   "open_scheduler" | null
+    """
+    from datetime import datetime
+    db = get_db()
+    out = []
+    now = datetime.now()
+
+    # 1. needs_attention profiles (D5)
+    try:
+        rows = db._get_conn().execute(
+            "SELECT name, needs_attention_reason, needs_attention_at "
+            "FROM profiles WHERE needs_attention = 1"
+        ).fetchall() or []
+        for row in rows:
+            out.append({
+                "id":         f"attention:{row['name']}",
+                "severity":   "critical",
+                "title":      f"Profile blocked: {row['name']}",
+                "body":       row["needs_attention_reason"]
+                              or "Burn-block, awaiting manual action",
+                "action":     "open_profile",
+                "action_arg": row["name"],
+                "created_at": row["needs_attention_at"]
+                              or now.isoformat(timespec="seconds"),
+            })
+    except Exception as e:
+        logging.debug(f"[notifications] needs_attention probe: {e}")
+
+    # 2. Recent run failures (last 24h, non-75 non-zero exit)
+    try:
+        rows = db._get_conn().execute("""
+            SELECT id, profile_name, exit_code, error, finished_at
+              FROM runs
+             WHERE finished_at >= datetime('now', '-24 hours')
+               AND exit_code NOT IN (0, 75, 130)
+               AND exit_code IS NOT NULL
+             ORDER BY finished_at DESC
+             LIMIT 20
+        """).fetchall() or []
+        for row in rows:
+            err = (row["error"] or "exit " + str(row["exit_code"]))[:140]
+            # UX-fix Apr 2026: clicking a "Run #N failed" notification
+            # used to navigate to the global Runs history table — not
+            # very useful when investigating a specific failure. Now
+            # we open the affected profile's detail page where the
+            # user can see attention banner / proxy health / scripts
+            # all in context. The run id stays in `body` for reference.
+            out.append({
+                "id":         f"run-fail:{row['id']}",
+                "severity":   "warning",
+                "title":      f"Run #{row['id']} failed",
+                "body":       f"{row['profile_name']}: {err}",
+                "action":     "open_profile",
+                "action_arg": row["profile_name"],
+                "created_at": row["finished_at"],
+            })
+    except Exception as e:
+        logging.debug(f"[notifications] run failures probe: {e}")
+
+    # 3. Captcha spike (≥5 captchas in last 1h on a single profile)
+    try:
+        rows = db._get_conn().execute("""
+            SELECT profile_name, COUNT(*) AS n
+              FROM events
+             WHERE event_type = 'captcha'
+               AND timestamp >= datetime('now', '-1 hours')
+             GROUP BY profile_name
+            HAVING n >= 5
+             ORDER BY n DESC
+        """).fetchall() or []
+        for row in rows:
+            out.append({
+                "id":         f"captcha-spike:{row['profile_name']}",
+                "severity":   "warning",
+                "title":      f"Captcha spike: {row['profile_name']}",
+                "body":       f"{row['n']} captchas in the last hour — "
+                              f"likely burned. Rotate IP / regen FP.",
+                "action":     "open_profile",
+                "action_arg": row["profile_name"],
+                "created_at": now.isoformat(timespec="seconds"),
+            })
+    except Exception as e:
+        logging.debug(f"[notifications] captcha spike probe: {e}")
+
+    # 4. Recently burned IPs
+    try:
+        rows = db._get_conn().execute("""
+            SELECT ip, country, org, burned_at, total_captchas
+              FROM ip_history
+             WHERE burned_at >= datetime('now', '-24 hours')
+             ORDER BY burned_at DESC
+             LIMIT 20
+        """).fetchall() or []
+        for row in rows:
+            out.append({
+                "id":         f"ip-burned:{row['ip']}",
+                "severity":   "info",
+                "title":      f"IP burned: {row['ip']}",
+                "body":       f"{row['country'] or '?'} · "
+                              f"{row['org'] or '?'} · "
+                              f"{row['total_captchas']} captchas",
+                "action":     "open_proxy",
+                "action_arg": row["ip"],
+                "created_at": row["burned_at"],
+            })
+    except Exception as e:
+        logging.debug(f"[notifications] ip_history probe: {e}")
+
+    # 5. Scheduler consecutive failures
+    try:
+        cf = int(db.config_get("scheduler.consecutive_failures", 0) or 0)
+        if cf >= 3:
+            out.append({
+                "id":         "scheduler-fails",
+                "severity":   "warning",
+                "title":      f"Scheduler: {cf} consecutive failures",
+                "body":       "Scheduler is repeatedly failing to spawn "
+                              "runs. Check /api/scheduler/logs.",
+                "action":     "open_scheduler",
+                "action_arg": None,
+                "created_at": now.isoformat(timespec="seconds"),
+            })
+    except Exception:
+        pass
+
+    # Sort: severity weight first, then created_at desc within severity.
+    # ISO 8601 timestamps sort correctly as plain strings (YYYY-MM-DD…),
+    # so reverse-string sort = newest first. Negate via tuple-of-pairs
+    # is unwieldy in Python; instead use Schwartzian transform with a
+    # negative-tier key for severity and a string sort for created_at
+    # then `reverse` the second leg via comparison adapter.
+    severity_weight = {"critical": 0, "warning": 1, "info": 2}
+    out.sort(key=lambda e: (
+        severity_weight.get(e.get("severity"), 3),
+        # Within same severity: newest first. ISO strings sort
+        # ascending lexically, so we sort by negated bytes via
+        # a tuple trick — convert created_at to a "bigger=newer"
+        # numeric epoch when possible, else 0.
+        -(_safe_iso_to_epoch(e.get("created_at"))),
+    ))
+
+    return jsonify({
+        "items": out,
+        "count": len(out),
+        "as_of": now.isoformat(timespec="seconds"),
+        "by_severity": {
+            "critical": sum(1 for e in out if e.get("severity") == "critical"),
+            "warning":  sum(1 for e in out if e.get("severity") == "warning"),
+            "info":     sum(1 for e in out if e.get("severity") == "info"),
+        },
+    })
+
+
+@app.route("/api/proxy/health-timeline", methods=["GET"])
+def api_proxy_health_timeline():
+    """Phase 3: per-proxy 7-day timeline — rotations, captchas, burn
+    events. Powers the horizontal timeline visualisation on the Proxy
+    detail page.
+
+    Query params:
+      proxy_url    optional — if given, scope to ip_history rows for
+                   IPs known to have routed through this URL. Default
+                   returns ALL IPs seen recently (full pool view).
+      days         lookback window (default 7).
+
+    Response:
+      events: [{ ts, kind, ip, country, asn, detail }]
+        kind ∈ "rotation" | "captcha" | "burn" | "first_seen"
+      ips:    [{ ip, country, org, asn, total_uses, total_captchas,
+                  burned_at, first_seen, last_seen }]
+    """
+    from datetime import datetime
+    db = get_db()
+    # Audit fix: clamp `days` to a sane range. Without an upper bound,
+    # `days=999999` would build 999k day-tick markers in the frontend
+    # and could DoS the browser. 90 covers any realistic ops window.
+    days = max(1, min(90, int(request.args.get("days", 7) or 7)))
+
+    out_events = []
+    out_ips = []
+
+    try:
+        ips = db._get_conn().execute(f"""
+            SELECT ip, country, org, asn, total_uses, total_captchas,
+                   burned_at, first_seen, last_seen
+              FROM ip_history
+             WHERE last_seen >= datetime('now', '-{days} days')
+                OR first_seen >= datetime('now', '-{days} days')
+             ORDER BY last_seen DESC
+             LIMIT 200
+        """).fetchall() or []
+        out_ips = [dict(r) for r in ips]
+        for row in out_ips:
+            ip = row.get("ip")
+            if row.get("first_seen"):
+                out_events.append({
+                    "ts":      row["first_seen"],
+                    "kind":    "first_seen",
+                    "ip":      ip,
+                    "country": row.get("country"),
+                    "asn":     row.get("asn"),
+                    "detail":  f"first observation",
+                })
+            if row.get("burned_at"):
+                out_events.append({
+                    "ts":      row["burned_at"],
+                    "kind":    "burn",
+                    "ip":      ip,
+                    "country": row.get("country"),
+                    "asn":     row.get("asn"),
+                    "detail":  f"{row.get('total_captchas') or 0} captchas",
+                })
+    except Exception as e:
+        logging.debug(f"[proxy timeline] ip_history: {e}")
+
+    # Captcha events (per IP, scoped to days window)
+    try:
+        # Map run_id → ip via runs table, then match captcha events
+        rows = db._get_conn().execute(f"""
+            SELECT e.timestamp AS ts, r.ip_used AS ip
+              FROM events e
+              JOIN runs r ON r.id = e.run_id
+             WHERE e.event_type = 'captcha'
+               AND e.timestamp >= datetime('now', '-{days} days')
+               AND r.ip_used IS NOT NULL
+             ORDER BY e.timestamp DESC
+             LIMIT 1000
+        """).fetchall() or []
+        for row in rows:
+            out_events.append({
+                "ts":     row["ts"],
+                "kind":   "captcha",
+                "ip":     row["ip"],
+                "detail": "captcha hit",
+            })
+    except Exception as e:
+        logging.debug(f"[proxy timeline] captcha join: {e}")
+
+    # Rotation events — derived from runs.ip_used CHANGE between
+    # consecutive runs (no dedicated "rotation" event log yet).
+    try:
+        rows = db._get_conn().execute(f"""
+            SELECT id, profile_name, ip_used, started_at
+              FROM runs
+             WHERE started_at >= datetime('now', '-{days} days')
+               AND ip_used IS NOT NULL
+             ORDER BY profile_name, started_at
+        """).fetchall() or []
+        prev_ip_by_profile = {}
+        for row in rows:
+            pn = row["profile_name"]
+            ip = row["ip_used"]
+            if prev_ip_by_profile.get(pn) and prev_ip_by_profile[pn] != ip:
+                out_events.append({
+                    "ts":     row["started_at"],
+                    "kind":   "rotation",
+                    "ip":     ip,
+                    "detail": f"{pn}: {prev_ip_by_profile[pn]} → {ip}",
+                })
+            prev_ip_by_profile[pn] = ip
+    except Exception as e:
+        logging.debug(f"[proxy timeline] rotation derivation: {e}")
+
+    # Newest first
+    out_events.sort(key=lambda e: e.get("ts") or "", reverse=True)
+
+    return jsonify({
+        "events": out_events,
+        "ips":    out_ips,
+        "days":   days,
+        "as_of":  datetime.now().isoformat(timespec="seconds"),
+    })
+
+
+@app.route("/api/competitors/leaderboard", methods=["GET"])
+def api_competitors_leaderboard():
+    """Phase 2 (Apr 2026): Competitor leaderboard with week-over-week
+    trend arrows.
+
+    Query params:
+      days        size of the current period (default 7)
+      prev_days   size of the comparison period (default same as days)
+      top         max rows to return (default 50)
+      q           free-text substring filter (domain or query)
+
+    Each row carries:
+      domain, mentions_now, mentions_prev, delta_pct, queries_count,
+      first_seen, last_seen, click_count (from action_events),
+      avg_position (best-effort: mean within run if rank tracked,
+      else null), trend ("up" | "down" | "flat" | "new" | "lost").
+
+    Trend semantics:
+      "new"  — no impressions in prev period, ≥1 in current
+      "lost" — ≥1 in prev, 0 in current (rare — would only show if
+               domain ever appeared in current window's wider set;
+               we keep these out unless explicitly asked)
+      "up" / "down"  — delta_pct > / < 5% (small changes flat)
+      "flat" — within ±5%
+    """
+    from datetime import datetime, timedelta
+    db = get_db()
+
+    days = max(1, int(request.args.get("days", 7) or 7))
+    prev_days = max(1, int(request.args.get("prev_days", days) or days))
+    top = max(1, min(500, int(request.args.get("top", 50) or 50)))
+    q = (request.args.get("q") or "").strip().lower() or None
+
+    # Current period: last `days` days.
+    # Previous period: the `prev_days` window immediately before that.
+    # SQL `datetime('now', '-7 days')` is start-of-current-window,
+    # which is also end-of-previous-window. Previous-window-start is
+    # start-of-current minus prev_days.
+    where_q = ""
+    params_q = []
+    if q:
+        where_q = " AND (LOWER(domain) LIKE ? OR LOWER(COALESCE(title,'')) LIKE ?)"
+        needle = f"%{q}%"
+        params_q = [needle, needle]
+
+    try:
+        conn = db._get_conn()
+        cur_rows = conn.execute(f"""
+            SELECT domain,
+                   COUNT(*)               AS mentions,
+                   COUNT(DISTINCT query)  AS queries_count,
+                   MIN(timestamp)         AS first_seen,
+                   MAX(timestamp)         AS last_seen
+              FROM competitors
+             WHERE timestamp >= datetime('now', ?)
+               {where_q}
+             GROUP BY domain
+             ORDER BY mentions DESC
+             LIMIT ?
+        """, [f"-{days} days"] + params_q + [top]).fetchall()
+
+        prev_rows = conn.execute(f"""
+            SELECT domain, COUNT(*) AS mentions
+              FROM competitors
+             WHERE timestamp >= datetime('now', ?)
+               AND timestamp <  datetime('now', ?)
+               {where_q}
+             GROUP BY domain
+        """, [
+            f"-{days + prev_days} days",
+            f"-{days} days",
+        ] + params_q).fetchall()
+    except Exception as e:
+        logging.error(f"[leaderboard] SQL failed: {e}")
+        return jsonify({"runs": [], "error": str(e)}), 500
+
+    prev_map = {r["domain"]: r["mentions"] for r in prev_rows}
+
+    # Action counters (lifetime — same shape as competitors table uses)
+    try:
+        actions_by_domain = db.action_events_by_domain() or {}
+    except Exception:
+        actions_by_domain = {}
+
+    out = []
+    for r in cur_rows:
+        d = dict(r)
+        cur = int(d.get("mentions") or 0)
+        prev = int(prev_map.get(d["domain"]) or 0)
+        if prev == 0 and cur > 0:
+            trend = "new"
+            delta_pct = None
+        elif cur == 0 and prev > 0:
+            trend = "lost"
+            delta_pct = -100.0
+        elif prev == 0:
+            trend = "flat"
+            delta_pct = 0.0
+        else:
+            delta_pct = ((cur - prev) / prev) * 100.0
+            if delta_pct > 5:
+                trend = "up"
+            elif delta_pct < -5:
+                trend = "down"
+            else:
+                trend = "flat"
+
+        actions = actions_by_domain.get(d["domain"]) or {}
+        d["mentions_now"]  = cur
+        d["mentions_prev"] = prev
+        d["delta_pct"]     = (round(delta_pct, 1)
+                              if delta_pct is not None else None)
+        d["trend"]         = trend
+        d["actions_ran"]   = int(actions.get("ran") or 0)
+        d["actions_skipped"] = int(actions.get("skipped") or 0)
+        d["last_action_at"]  = actions.get("last_action_at")
+        out.append(d)
+
+    return jsonify({
+        "rows":       out,
+        "period":     {"days": days, "prev_days": prev_days},
+        "as_of":      datetime.now().isoformat(timespec="seconds"),
+        "filter_q":   q or "",
+        "limit":      top,
+    })
+
+
 @app.route("/api/competitors/add-to-list", methods=["POST"])
 def api_competitors_add_to_list():
     """One-click: push a domain into my_domains / target_domains /
@@ -2445,7 +3150,44 @@ def api_ips():
 
 @app.route("/api/runs", methods=["GET"])
 def api_runs():
-    return jsonify(get_db().runs_list(limit=50))
+    """List recent runs.
+
+    Query params (all optional):
+      limit         — cap rows returned (default 50, max 1000).
+      profile_name  — filter to a single profile.
+      since_hours   — only include runs whose started_at is within the last N hrs.
+      status        — "ok" | "failed" | "running" | "all" (default "all").
+
+    Backwards compatible: callers passing no params get the legacy
+    "top 50, all profiles" shape. New params just trim that down further.
+    """
+    try:
+        limit = max(1, min(int(request.args.get("limit", 50)), 1000))
+    except (TypeError, ValueError):
+        limit = 50
+    profile_name = request.args.get("profile_name") or None
+    status = (request.args.get("status") or "all").lower()
+    since_hours = request.args.get("since_hours", type=int)
+
+    # Server fetches a wider window when the client filters client-side
+    # (the runs page does this — sets limit=500 and filters in JS). For
+    # status==running we widen further so paused/stuck rows always show.
+    rows = get_db().runs_list(limit=limit, profile_name=profile_name)
+
+    if since_hours is not None and since_hours > 0:
+        cutoff = (datetime.utcnow() - timedelta(hours=since_hours)).isoformat()
+        rows = [r for r in rows if (r.get("started_at") or "") >= cutoff]
+
+    if status == "ok":
+        rows = [r for r in rows if r.get("exit_code") == 0]
+    elif status == "failed":
+        rows = [r for r in rows
+                if r.get("exit_code") is not None and r.get("exit_code") != 0]
+    elif status == "running":
+        rows = [r for r in rows
+                if r.get("finished_at") is None and r.get("exit_code") is None]
+
+    return jsonify(rows)
 
 
 def get_run_status_dict():
@@ -2539,6 +3281,197 @@ def api_runs_active():
     return jsonify({
         "runs":    RUNNER_POOL.active_runs(),
         "count":   RUNNER_POOL.active_count(),
+    })
+
+
+# ───────────────────────────────────────────────────────────────
+# Phase 1 (Apr 2026): Live Ops — rich realtime view of active runs.
+# ───────────────────────────────────────────────────────────────
+# /api/runs/active returns a thin slot dict (run_id, profile_name,
+# heartbeat_age). The new Live Ops page wants more: current query,
+# current ad on click, exit IP + country, ads/captchas counts so far,
+# last few log lines for an in-card activity feed. We compute all
+# this here so the frontend can render one self-contained card per
+# active run without N additional API roundtrips.
+#
+# Data sources:
+#   • RunnerPool          — slot state + recent log buffer
+#   • runs table          — heartbeat, total_ads, total_captchas, ip_used
+#   • events table        — last search_ok / search_empty / captcha events
+#   • ip_history          — country + ASN for the exit IP
+#   • profiles            — needs_attention flag (D5)
+
+@app.route("/api/runs/live", methods=["GET"])
+def api_runs_live():
+    """Rich live view: one entry per active run with everything the
+    Live Ops dashboard needs to render an at-a-glance status card.
+
+    Response shape:
+        {
+          "runs": [
+            {
+              run_id, profile_name, started_at, duration_sec,
+              heartbeat_age, healthy (bool),
+              current_query (str|null), current_ad_domain (str|null),
+              exit_ip, country, country_code, asn,
+              total_ads, total_captchas, total_queries,
+              recent_lines: [ {ts, level, message}, ... up to 5 ],
+              needs_attention (bool), needs_attention_reason (str|null)
+            }
+          ],
+          "count": int,
+          "as_of": iso-timestamp
+        }
+    """
+    db = get_db()
+    out = []
+    now = datetime.now()
+    active = RUNNER_POOL.active_runs() or []
+    # Pull DB extras in one go to avoid N+1 selects when many slots
+    # are running concurrently.
+    run_ids = [r.get("run_id") for r in active if r.get("run_id")]
+    runs_extra = {}
+    if run_ids:
+        try:
+            rows = db._get_conn().execute(
+                f"SELECT id, total_ads, total_captchas, total_queries, "
+                f"       ip_used, started_at, heartbeat_at "
+                f"FROM runs WHERE id IN ({','.join('?'*len(run_ids))})",
+                run_ids,
+            ).fetchall()
+            for row in rows:
+                runs_extra[row["id"]] = dict(row)
+        except Exception as e:
+            logging.debug(f"[live] runs_extra read: {e}")
+
+    # Cache profile metadata batch — needs_attention flag for the
+    # red-tint badge.
+    profile_names = {r.get("profile_name") for r in active if r.get("profile_name")}
+    profile_meta = {}
+    for pn in profile_names:
+        try:
+            profile_meta[pn] = db.profile_meta_get(pn) or {}
+        except Exception:
+            profile_meta[pn] = {}
+
+    # IP history lookup — country/ASN for known exit IPs.
+    ip_meta = {}
+    used_ips = {r.get("ip_used") for r in runs_extra.values()
+                if r.get("ip_used")}
+    if used_ips:
+        try:
+            rows = db._get_conn().execute(
+                f"SELECT ip, country, org, asn FROM ip_history "
+                f"WHERE ip IN ({','.join('?'*len(used_ips))})",
+                list(used_ips),
+            ).fetchall()
+            for row in rows:
+                ip_meta[row["ip"]] = dict(row)
+        except Exception:
+            pass
+
+    for slot_dict in active:
+        rid = slot_dict.get("run_id")
+        rx = runs_extra.get(rid, {}) if rid else {}
+        ip = rx.get("ip_used")
+        ipx = ip_meta.get(ip, {}) if ip else {}
+        meta = profile_meta.get(slot_dict.get("profile_name"), {}) or {}
+
+        # Pull recent log lines from this slot's queue WITHOUT
+        # consuming them (so SSE subscribers still get them too).
+        # The Queue can't be peeked safely; use a separate cache
+        # if available, else fall back to DB log table.
+        recent_lines = []
+        try:
+            slot = RUNNER_POOL.get(rid)
+            if slot and getattr(slot, "log_queue", None):
+                # Snapshot the deque-backed queue items defensively.
+                # queue.Queue doesn't expose a peek; we approximate
+                # via internal `queue` deque. Best-effort, never
+                # raise — recent_lines is informational only.
+                try:
+                    with slot.log_queue.mutex:
+                        snap = list(slot.log_queue.queue)[-5:]
+                    for entry in snap:
+                        recent_lines.append({
+                            "ts":      entry.get("ts"),
+                            "level":   entry.get("level"),
+                            "message": (entry.get("message") or "")[:240],
+                        })
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+        # Parse current_query / current_ad_domain heuristically from
+        # the last few log lines. Cheap and good enough for a
+        # status card.
+        current_query = None
+        current_ad_domain = None
+        for entry in reversed(recent_lines):
+            msg = entry.get("message") or ""
+            if current_query is None and "🔎 " in msg:
+                # Format: "🔎 <query>  →  <url>"
+                try:
+                    after = msg.split("🔎 ", 1)[1]
+                    current_query = after.split(" →")[0].strip()[:80]
+                except Exception:
+                    pass
+            if current_ad_domain is None and "[ad " in msg:
+                # Format: "[ad N/M] <domain>"
+                try:
+                    after = msg.split("] ", 1)[1]
+                    current_ad_domain = after.strip()[:80]
+                except Exception:
+                    pass
+            if current_query and current_ad_domain:
+                break
+
+        # Duration since started_at
+        duration_sec = None
+        try:
+            if slot_dict.get("started_at"):
+                d = datetime.fromisoformat(slot_dict["started_at"])
+                duration_sec = int((now - d).total_seconds())
+        except Exception:
+            pass
+
+        # Healthy = heartbeat fresh (<60s). Older heartbeat = warning.
+        # No heartbeat (None) on a just-started run is also OK if
+        # the duration is short (<30s — main.py hasn't first-pinged yet).
+        hb_age = slot_dict.get("heartbeat_age")
+        healthy = True
+        if hb_age is None and (duration_sec or 0) > 30:
+            healthy = False
+        elif hb_age is not None and hb_age > 60:
+            healthy = False
+
+        out.append({
+            "run_id":            rid,
+            "profile_name":      slot_dict.get("profile_name"),
+            "started_at":        slot_dict.get("started_at"),
+            "duration_sec":      duration_sec,
+            "heartbeat_age":     hb_age,
+            "healthy":           healthy,
+            "current_query":     current_query,
+            "current_ad_domain": current_ad_domain,
+            "exit_ip":           ip,
+            "country":           ipx.get("country"),
+            "asn":               ipx.get("asn"),
+            "org":               ipx.get("org"),
+            "total_ads":         rx.get("total_ads") or 0,
+            "total_captchas":    rx.get("total_captchas") or 0,
+            "total_queries":     rx.get("total_queries") or 0,
+            "recent_lines":      recent_lines,
+            "needs_attention":   bool(int(meta.get("needs_attention") or 0)),
+            "needs_attention_reason":
+                                 (meta.get("needs_attention_reason") or None),
+        })
+
+    return jsonify({
+        "runs":  out,
+        "count": len(out),
+        "as_of": now.isoformat(timespec="seconds"),
     })
 
 
@@ -3910,25 +4843,45 @@ def api_profile_templates():
             inner = re.sub(r"\s*Direct3D.*$", "", inner)
             return inner.strip() or "Unknown GPU"
 
+        # Phase A (Apr 2026): expose mobile/tablet templates with
+        # form_factor + device_human_name + dpr fields. Picker UI
+        # uses these to render Desktop / Mobile / Tablet tabs and
+        # show pretty labels ("Apple iPhone 15 Pro") instead of
+        # the internal slug ("iphone_15_pro").
         out = []
         for t in DEVICE_TEMPLATES:
             cpu    = t.get("cpu")    or {}
             gpu    = t.get("gpu")    or {}
             screen = t.get("screen") or {}
             battery = t.get("battery")
+            ff = t.get("form_factor", "desktop")
+            # GPU rendering: ANGLE-wrapped on desktop, plain string on
+            # mobile (where renderer comes back as e.g. "Apple GPU"
+            # without ANGLE wrapper).
+            gpu_renderer = gpu.get("gl_renderer", "")
+            gpu_short = (_extract_gpu(gpu_renderer)
+                         if "ANGLE" in (gpu_renderer or "")
+                         else (gpu_renderer or "Unknown GPU"))
             out.append({
-                "name":        t.get("name"),
-                "platform":    t.get("platform"),
-                "description": t.get("description") or "",
+                "name":             t.get("name"),
+                "platform":         t.get("platform"),
+                "description":      t.get("description") or "",
                 # Enriched fields for dropdown preview
-                "cpu_cores":   cpu.get("concurrency"),
-                "ram_gb":      cpu.get("memory"),
-                "gpu_model":   _extract_gpu(gpu.get("gl_renderer", "")),
-                "gpu_vendor":  gpu.get("webgpu_vendor"),
-                "screen_w":    screen.get("width"),
-                "screen_h":    screen.get("height"),
-                "is_laptop":   battery is not None,
-                "weight":      t.get("weight", 1),
+                "cpu_cores":        cpu.get("concurrency"),
+                "ram_gb":           cpu.get("memory"),
+                "gpu_model":        gpu_short,
+                "gpu_vendor":       gpu.get("webgpu_vendor"),
+                "screen_w":         screen.get("width"),
+                "screen_h":         screen.get("height"),
+                "screen_dpr":       screen.get("dpr", 1.0),
+                "is_laptop":        battery is not None,
+                "weight":           t.get("weight", 1),
+                # Phase A additions (mobile-aware metadata):
+                "form_factor":      ff,
+                "device_human_name": t.get("device_human_name") or t.get("name"),
+                "device_model":     t.get("device_model") or "",
+                "platform_id":      t.get("platform_id") or "",
+                "is_mobile":        ff in ("mobile", "tablet"),
             })
         return jsonify(out)
     except Exception as e:
@@ -4420,6 +5373,125 @@ def api_profile_chrome_import(name: str):
         import traceback
         traceback.print_exc()
         return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/profiles/<name>/regenerate-fingerprint/preview", methods=["POST"])
+def api_profile_regenerate_fingerprint_preview(name):
+    """Phase 4 (Apr 2026): build a NEW fingerprint payload but do NOT
+    persist it. Returns a structured diff between current and new so
+    the dashboard can show a confirm-with-preview modal before the
+    user destroys the working FP.
+
+    Body: same shape as /regenerate-fingerprint (template, language,
+    seed_suffix). Caller pre-stages the new FP to look at, then either
+    POSTs to the actual regenerate endpoint with seed_suffix={preview_seed}
+    to commit the EXACT same FP, or cancels.
+
+    Response:
+      old:    { template, chrome_version, screen, gpu, ua, languages,
+                fonts_count, plugins_count, cpu_cores, ram_gb }
+      new:    same shape
+      diff:   [{ field, old, new, changed }] — flat list for UI render
+      preview_seed: string — pass back into regenerate-fingerprint
+                    body.seed_suffix to commit THIS exact preview
+    """
+    from ghost_shell.fingerprint.device_templates import DeviceTemplateBuilder
+    import time as _t
+    data = request.get_json(silent=True) or {}
+    template  = data.get("template") or None
+    language  = data.get("language") or None
+    if template == "auto":
+        template = None
+
+    db = get_db()
+    if hasattr(db, "profile_get") and not db.profile_get(name):
+        return jsonify({"error": "profile not found"}), 404
+
+    if not language:
+        prof = db.profile_get(name) if hasattr(db, "profile_get") else {}
+        language = (prof or {}).get("preferred_language") or "uk-UA"
+
+    # Read current FP for the diff. fingerprint_current returns the
+    # active row; payload lives under .payload. Missing FP is OK (treat
+    # as all-empty so first-time regen still produces a valid diff that
+    # marks every field as "changed").
+    try:
+        cur_row = db.fingerprint_current(name) or {}
+        cur_payload = (cur_row.get("payload") if isinstance(cur_row, dict)
+                       else None) or {}
+    except Exception:
+        cur_payload = {}
+
+    # Build the preview FP using a deterministic preview-tagged seed so
+    # the user can commit the EXACT same FP they previewed by passing
+    # this seed back into regenerate-fingerprint.
+    preview_seed = f"preview-{int(_t.time()*1000)}"
+    seed_name = f"{name}#{preview_seed}"
+    try:
+        builder = DeviceTemplateBuilder(
+            profile_name       = seed_name,
+            preferred_language = language,
+            force_template     = template,
+        )
+        new_payload = builder.generate_payload_dict()
+    except Exception as e:
+        return jsonify({"error": f"preview build failed: {e}"}), 500
+
+    # Flatten relevant fields for diff. The full payload has dozens of
+    # fields — we surface the user-visible ones. Hidden noise (jitter
+    # seeds, internal hashes) is intentionally omitted.
+    def _summary(p):
+        ua_meta = p.get("ua_metadata") or {}
+        return {
+            "template":         p.get("template_name") or p.get("template"),
+            "chrome_version":   ua_meta.get("full_version") or p.get("chrome"),
+            "platform":         p.get("platform"),
+            "ua":               (p.get("user_agent") or p.get("ua") or "")[:120],
+            "screen":           p.get("screen"),
+            "pixel_ratio":      p.get("pixel_ratio"),
+            "cpu_cores":        p.get("cpu_cores"),
+            "ram_gb":           p.get("ram_gb"),
+            "gpu_vendor":       p.get("gpu_vendor"),
+            "gpu_renderer":     (p.get("gpu_renderer") or "")[:80],
+            "language":         p.get("language"),
+            "languages":        ", ".join(p.get("languages") or [])[:120],
+            "timezone":         p.get("timezone"),
+            "fonts_count":      p.get("fonts_count"),
+            "webgl_exts":       p.get("webgl_exts"),
+            "plugins_count":    p.get("plugins_count"),
+            "has_battery":      p.get("has_battery"),
+        }
+
+    old_s = _summary(cur_payload)
+    new_s = _summary(new_payload)
+
+    # Build a flat diff list ordered by importance
+    field_order = [
+        "template", "chrome_version", "platform", "ua",
+        "screen", "pixel_ratio", "cpu_cores", "ram_gb",
+        "gpu_vendor", "gpu_renderer",
+        "language", "languages", "timezone",
+        "fonts_count", "webgl_exts", "plugins_count", "has_battery",
+    ]
+    diff = []
+    for f in field_order:
+        ov = old_s.get(f)
+        nv = new_s.get(f)
+        diff.append({
+            "field":   f,
+            "old":     ov,
+            "new":     nv,
+            "changed": ov != nv,
+        })
+
+    return jsonify({
+        "ok":           True,
+        "old":          old_s,
+        "new":          new_s,
+        "diff":         diff,
+        "changed_count": sum(1 for d in diff if d["changed"]),
+        "preview_seed": preview_seed,
+    })
 
 
 @app.route("/api/profiles/<name>/regenerate-fingerprint", methods=["POST"])

@@ -180,8 +180,14 @@ class ProxyDiagnostics:
         if not ip_info.get("ok"):
             return {"hint": "unknown", "risk": "unknown"}
 
-        org = (ip_info.get("org") or "").lower()
-        asn = (ip_info.get("asn") or "").lower()
+        # Bug-fix Apr 2026: ipapi.co sometimes returns `asn` as a bare
+        # integer (the AS number without the "AS" prefix). Calling
+        # .lower() on int → AttributeError, which crashed full_check()
+        # and aborted the entire run with exit_code=1. Force-coerce
+        # to str BEFORE .lower(); also guards against unexpected
+        # types from any future provider switch.
+        org = str(ip_info.get("org") or "").lower()
+        asn = str(ip_info.get("asn") or "").lower()
 
         # Generic markers — catch obviously-named hosts.
         datacenter_markers = [
@@ -313,10 +319,37 @@ class ProxyDiagnostics:
         """
         logging.info("[ProxyDiag] Running full proxy diagnostics...")
 
-        ip_info    = self.get_ip_info()
-        webrtc     = self.webrtc_leak_check()
-        tz_check   = self.timezone_consistency(expected_timezone)
-        reputation = self.ip_reputation_hint(ip_info)
+        # Bug-fix Apr 2026: each sub-probe is now individually guarded.
+        # Previously a single AttributeError inside ip_reputation_hint
+        # (e.g. ipapi returning asn as int → .lower() crashed) bubbled
+        # all the way out and aborted the run with exit_code=1. The
+        # diagnostic block is informational; one failed sub-probe must
+        # never kill the run. Each falls back to a stub the caller can
+        # still consume — they all check `.get("ok")` / `.get("hint")`.
+        try:
+            ip_info = self.get_ip_info()
+        except Exception as _e:
+            logging.warning(f"[ProxyDiag] get_ip_info failed: {_e}")
+            ip_info = {"ok": False, "error": f"get_ip_info: {_e}"}
+        try:
+            webrtc = self.webrtc_leak_check()
+        except Exception as _e:
+            logging.warning(f"[ProxyDiag] webrtc_leak_check failed: {_e}")
+            webrtc = {"ok": False, "error": f"webrtc: {_e}"}
+        try:
+            tz_check = self.timezone_consistency(expected_timezone)
+        except Exception as _e:
+            logging.warning(f"[ProxyDiag] timezone_consistency failed: {_e}")
+            tz_check = {"ok": False, "error": f"timezone: {_e}"}
+        try:
+            reputation = self.ip_reputation_hint(ip_info)
+        except Exception as _e:
+            logging.warning(
+                f"[ProxyDiag] ip_reputation_hint failed: "
+                f"{type(_e).__name__}: {_e}"
+            )
+            reputation = {"hint": "unknown", "risk": "unknown",
+                          "error": f"{type(_e).__name__}: {_e}"}
 
         # WebRTC leak detection
         webrtc_leak = False
@@ -335,10 +368,10 @@ class ProxyDiagnostics:
         # If exit country != expected, Google serves localized SERP for the
         # wrong region AND anti-bot heuristics flag the locale/IP mismatch.
         geo_mismatch = False
-        actual_country = (ip_info.get("country") or "").strip()
+        actual_country = str(ip_info.get("country") or "").strip()
         if expected_country and actual_country:
             # Case-insensitive, strip common prefixes ("Republic of", etc.)
-            exp_lc = expected_country.strip().lower()
+            exp_lc = str(expected_country).strip().lower()
             act_lc = actual_country.lower()
             geo_mismatch = (exp_lc not in act_lc and act_lc not in exp_lc)
 
@@ -481,11 +514,14 @@ def test_proxy(proxy_url: str, timeout: float = 10.0) -> dict:
         # Google treats as datacenter. Cross-check the org/ISP/AS
         # string against an explicit blacklist and force-promote
         # ip_type=datacenter when matched.
+        # Bug-fix: any field can come back as int (some providers
+        # return as=12345 as a number). Force str() on every piece
+        # before .lower() so .lower() never raises AttributeError.
         try:
             org_str = (
-                f"{data.get('isp') or ''} "
-                f"{data.get('org') or ''} "
-                f"{data.get('as')  or ''}"
+                f"{str(data.get('isp') or '')} "
+                f"{str(data.get('org') or '')} "
+                f"{str(data.get('as')  or '')}"
             ).lower()
             DATACENTER_BLACKLIST = (
                 "hivelocity", "m247", "colocrossing", "quadranet",
@@ -515,10 +551,13 @@ def test_proxy(proxy_url: str, timeout: float = 10.0) -> dict:
         else:
             risk = "low"
 
-        # `as` field is "AS12345 Some Org LLC" — split into asn + provider
-        as_raw = data.get("as") or ""
+        # `as` field is "AS12345 Some Org LLC" — split into asn + provider.
+        # Bug-fix Apr 2026: providers occasionally return `as` as a bare
+        # integer; coerce to str before any string method to avoid
+        # AttributeError from startswith / split.
+        as_raw = str(data.get("as") or "")
         asn = None
-        provider = data.get("isp") or data.get("org") or ""
+        provider = str(data.get("isp") or "") or str(data.get("org") or "")
         if as_raw.startswith("AS"):
             parts = as_raw.split(" ", 1)
             asn = parts[0]

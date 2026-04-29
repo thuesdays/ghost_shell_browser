@@ -27,6 +27,12 @@ const ProxyPage = {
     // Config bindings for global options — reuse the generic helper
     if (!configCache) await loadConfig();
     bindConfigInputs($("#content"));
+
+    // Phase 3 (Apr 2026): proxy health timeline.
+    // Loaded after the main proxy table so the page paints fast even
+    // if ip_history has thousands of rows.
+    this._wireTimelineReload();
+    this.loadHealthTimeline();
   },
 
   teardown() { /* no timers */ },
@@ -845,6 +851,176 @@ const ProxyPage = {
       return dt.toLocaleDateString(undefined,
         { month: "short", day: "numeric" });
     } catch { return ts; }
+  },
+
+  // ═════════════════════════════════════════════════════════════
+  // Phase 3 (Apr 2026): Proxy health timeline
+  // ═════════════════════════════════════════════════════════════
+  // Renders a horizontal 7-day timeline with one swimlane per IP
+  // (capped at 12 lanes — extra IPs roll into a "+N more" footer).
+  // Markers are positioned by absolute timestamp; SVG-based for crisp
+  // rendering at any zoom level. Hover shows event detail tooltip.
+
+  _wireTimelineReload() {
+    const btn = document.getElementById("proxy-timeline-reload-btn");
+    if (btn && btn.dataset._wired !== "1") {
+      btn.dataset._wired = "1";
+      btn.addEventListener("click", () => this.loadHealthTimeline());
+    }
+  },
+
+  async loadHealthTimeline() {
+    const container = document.getElementById("proxy-timeline-container");
+    if (!container) return;
+    container.innerHTML = `<div class="empty-state" style="padding: 30px; text-align: center;">Loading…</div>`;
+    try {
+      const data = await api("/api/proxy/health-timeline?days=7");
+      this._renderTimeline(data);
+      const asOf = document.getElementById("proxy-timeline-as-of");
+      if (asOf && data.as_of) {
+        asOf.textContent = `${(data.events || []).length} events`;
+      }
+    } catch (e) {
+      container.innerHTML = `<div class="empty-state" style="padding: 30px; text-align: center; color: var(--critical);">
+        Failed: ${escapeHtml(e.message)}
+      </div>`;
+    }
+  },
+
+  _renderTimeline(data) {
+    const container = document.getElementById("proxy-timeline-container");
+    if (!container) return;
+    const ips = (data.ips || []);
+    const events = (data.events || []);
+
+    if (!ips.length) {
+      container.innerHTML = `<div class="empty-state" style="padding: 30px; text-align: center;">
+        No proxy activity in the last 7 days.
+      </div>`;
+      return;
+    }
+
+    // Time domain: full requested window (default 7 days), end = now.
+    const days = data.days || 7;
+    const tEnd = Date.now();
+    const tStart = tEnd - days * 86400 * 1000;
+
+    // Group events by IP for fast lookup.
+    const byIp = {};
+    for (const e of events) {
+      const ip = e.ip || "(unknown)";
+      if (!byIp[ip]) byIp[ip] = [];
+      const ts = new Date(e.ts).getTime();
+      if (Number.isFinite(ts) && ts >= tStart && ts <= tEnd) {
+        byIp[ip].push({ ...e, _ts: ts });
+      }
+    }
+
+    // Cap at 12 lanes for readability. Sort: most recent activity first.
+    const ipsSorted = ips.slice()
+      .sort((a, b) => (b.last_seen || "").localeCompare(a.last_seen || ""));
+    const MAX_LANES = 12;
+    const visibleIps = ipsSorted.slice(0, MAX_LANES);
+    const overflow = ipsSorted.length - visibleIps.length;
+
+    // Lane height + padding; computed once so the SVG height matches.
+    // Audit-fix Apr 2026: bumped from 28 → 44 because the label has
+    // TWO lines (IP + "country · N runs · M captchas") plus line-height.
+    // 28px = ~one line, so labels visibly overlapped at 28. 44 leaves
+    // ~6px breathing room between adjacent lanes.
+    const LANE_H = 44;
+    const HEADER_H = 28;
+    const FOOTER_H = overflow > 0 ? 24 : 0;
+    const totalH = HEADER_H + visibleIps.length * LANE_H + FOOTER_H;
+
+    // Build day-grid ticks (every day boundary)
+    const dayTicks = [];
+    const startDay = new Date(tStart);
+    startDay.setHours(0, 0, 0, 0);
+    for (let d = startDay.getTime(); d <= tEnd; d += 86400 * 1000) {
+      dayTicks.push(d);
+    }
+
+    // X-position helper: 0..1 fraction of timeline width.
+    const xFrac = (ts) => Math.max(0, Math.min(1, (ts - tStart) / (tEnd - tStart)));
+
+    const lanesHtml = visibleIps.map((ipRow, laneIdx) => {
+      // Audit-fix: lanes live INSIDE .proxy-tl-lanes which already
+      // sits below the header — no need to add HEADER_H here.
+      // Previous formula y = HEADER_H + laneIdx*LANE_H + LANE_H/2
+      // pushed lane 0 down by 28px, leaving an empty band between
+      // header and first lane.
+      const y = laneIdx * LANE_H + LANE_H / 2;
+      const ip = ipRow.ip;
+      const country = ipRow.country || "?";
+      const status = ipRow.burned_at ? "burned" :
+                     (ipRow.total_captchas > 0 ? "warn" : "ok");
+
+      const evts = (byIp[ip] || []).map(e => {
+        const x = xFrac(e._ts) * 100;
+        // Audit-fix: "first_seen" → CSS class "proxy-tl-first" (legend
+        // and CSS expect this short form). Without the rename every
+        // first_seen marker rendered with no color (default white) so
+        // legend + chart looked broken.
+        const kindCls =
+          e.kind === "first_seen" ? "first" : (e.kind || "unknown");
+        const cls = `proxy-tl-marker proxy-tl-${kindCls}`;
+        const symbol =
+          e.kind === "rotation"   ? "◆" :
+          e.kind === "captcha"    ? "×" :
+          e.kind === "burn"       ? "🔥" :
+          e.kind === "first_seen" ? "●" : "•";
+        const tip = `${e.kind}: ${escapeHtml(e.detail || "")} (${escapeHtml(e.ts || "")})`;
+        return `<div class="${cls}"
+                     style="left: ${x.toFixed(2)}%;"
+                     title="${tip}">${symbol}</div>`;
+      }).join("");
+
+      return `
+        <div class="proxy-tl-lane proxy-tl-lane-${status}"
+             style="top: ${y - LANE_H/2}px; height: ${LANE_H}px;">
+          <div class="proxy-tl-lane-label">
+            <span class="proxy-tl-ip">${escapeHtml(ip)}</span>
+            <span class="proxy-tl-meta muted">
+              ${escapeHtml(country)} · ${ipRow.total_uses || 0} runs · ${ipRow.total_captchas || 0} captchas
+            </span>
+          </div>
+          <div class="proxy-tl-track">
+            ${evts}
+          </div>
+        </div>`;
+    }).join("");
+
+    // Day grid (vertical lines at midnight markers)
+    const grid = dayTicks.map(ts => {
+      const x = xFrac(ts) * 100;
+      const label = new Date(ts).toLocaleDateString(undefined, {
+        month: "short", day: "numeric"
+      });
+      return `
+        <div class="proxy-tl-day-line" style="left: ${x.toFixed(2)}%;"></div>
+        <div class="proxy-tl-day-label" style="left: ${x.toFixed(2)}%;">${label}</div>`;
+    }).join("");
+
+    // Audit-fix: give .proxy-tl-lanes an explicit height equal to the
+    // total height of all absolutely-positioned children. Without this,
+    // .proxy-tl-lanes would be 0px tall and the day-grid lines (which
+    // hang down from the header) would be the only thing visible past
+    // the header in some browsers.
+    const lanesH = visibleIps.length * LANE_H;
+    container.innerHTML = `
+      <div class="proxy-tl-wrap" style="position: relative; height: ${totalH}px;">
+        <div class="proxy-tl-header" style="height: ${HEADER_H}px; position: relative;">
+          ${grid}
+        </div>
+        <div class="proxy-tl-lanes" style="position: relative; height: ${lanesH}px;">
+          ${lanesHtml}
+        </div>
+        ${overflow > 0 ? `
+          <div class="proxy-tl-overflow muted">
+            +${overflow} more IP${overflow === 1 ? "" : "s"} not shown
+          </div>` : ""}
+      </div>`;
   },
 };
 

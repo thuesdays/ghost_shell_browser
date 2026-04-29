@@ -11,7 +11,7 @@
     </div>
   </div>
 
-  <!-- Inline stats bar + clear-scope on one row — tight IDE look -->
+  <!-- TOP BAR: stats on the left, "Clear:" group pinned right -->
   <div class="runs-toolbar">
     <div class="runs-toolbar-stats">
       <span class="runs-stat">
@@ -28,19 +28,78 @@
         <strong id="runs-failed" class="stat-err">—</strong>
         <span class="runs-stat-label">failed</span>
       </span>
+      <span class="runs-stat-sep">·</span>
+      <span class="runs-stat">
+        <strong id="runs-running" class="stat-warn">—</strong>
+        <span class="runs-stat-label">running</span>
+      </span>
+      <span class="runs-stat-sep">·</span>
+      <span class="runs-stat">
+        <strong id="runs-shown">—</strong>
+        <span class="runs-stat-label">after filter</span>
+      </span>
     </div>
     <div class="runs-toolbar-actions">
-      <label class="runs-clear-label">Clear:</label>
-      <select id="clear-runs-scope" class="select">
+      <label class="runs-clear-label" for="clear-runs-scope">Clear:</label>
+      <select id="clear-runs-scope" class="select runs-clear-scope">
         <option value="30">Older than 30 days</option>
         <option value="7">Older than 7 days</option>
         <option value="1">Older than 1 day</option>
         <option value="all">All runs</option>
       </select>
-      <button class="btn btn-secondary btn-danger" id="btn-clear-runs">
-        🗑 Clear
+      <button class="btn-runs-clear" id="btn-clear-runs"
+              title="Permanently delete runs in the selected window">
+        <span class="btn-runs-clear-icon">🗑</span>
+        <span class="btn-runs-clear-label">Clear</span>
       </button>
     </div>
+  </div>
+
+  <!-- FILTER BAR: status, profile, time-range, search, page-size -->
+  <div class="runs-filters">
+    <div class="runs-filter">
+      <label for="runs-filter-status">Status</label>
+      <select id="runs-filter-status" class="select">
+        <option value="all">All</option>
+        <option value="ok">Successful</option>
+        <option value="failed">Failed</option>
+        <option value="running">Running</option>
+      </select>
+    </div>
+    <div class="runs-filter">
+      <label for="runs-filter-profile">Profile</label>
+      <select id="runs-filter-profile" class="select">
+        <option value="">All profiles</option>
+      </select>
+    </div>
+    <div class="runs-filter">
+      <label for="runs-filter-range">Time range</label>
+      <select id="runs-filter-range" class="select">
+        <option value="0">All time</option>
+        <option value="1">Last 1 hour</option>
+        <option value="6">Last 6 hours</option>
+        <option value="24">Last 24 hours</option>
+        <option value="72">Last 3 days</option>
+        <option value="168">Last 7 days</option>
+        <option value="720">Last 30 days</option>
+      </select>
+    </div>
+    <div class="runs-filter runs-filter-search">
+      <label for="runs-filter-search">Search</label>
+      <input type="search" id="runs-filter-search" class="select"
+             placeholder="run #, profile name…" />
+    </div>
+    <div class="runs-filter">
+      <label for="runs-filter-pagesize">Page size</label>
+      <select id="runs-filter-pagesize" class="select">
+        <option value="25">25</option>
+        <option value="50" selected>50</option>
+        <option value="100">100</option>
+        <option value="200">200</option>
+      </select>
+    </div>
+    <button class="btn-filter-reset" id="btn-filter-reset" type="button"
+            title="Reset all filters">Reset</button>
   </div>
 
   <!-- Main table -->
@@ -63,5 +122,21 @@
         <tr><td colspan="9" class="runs-empty-cell">Loading…</td></tr>
       </tbody>
     </table>
+  </div>
+
+  <!-- Pagination footer -->
+  <div class="runs-pager" id="runs-pager">
+    <div class="runs-pager-info" id="runs-pager-info">—</div>
+    <div class="runs-pager-controls">
+      <button class="btn-page" id="btn-page-first"
+              title="First page">«</button>
+      <button class="btn-page" id="btn-page-prev"
+              title="Previous page">‹</button>
+      <span class="runs-pager-curr" id="runs-pager-curr">1 / 1</span>
+      <button class="btn-page" id="btn-page-next"
+              title="Next page">›</button>
+      <button class="btn-page" id="btn-page-last"
+              title="Last page">»</button>
+    </div>
   </div>
 </section>

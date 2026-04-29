@@ -100,8 +100,33 @@ def pick_chrome_version(rnd, bounds: tuple = None):
             return v
     return pool[0]
 
+# ──────────────────────────────────────────────────────────────
+# PLATFORMS — OS / device-class profiles
+# ──────────────────────────────────────────────────────────────
+# Phase A (Apr 2026): mobile expansion. Each entry now carries:
+#   id          stable key — referenced by templates via platform_id
+#   form_factor "desktop" | "mobile" | "tablet" — picker-aware
+#   os_family   "windows" | "macos" | "linux" | "android" | "ios"
+#               (used by the builder to choose the right UA template
+#               and Sec-CH-UA-* headers)
+#
+# UA / UA-CH semantics by family:
+#   Windows / macOS / Linux  → standard desktop Chrome UA on Chromium
+#   Android                  → "Mobile Safari/537.36" suffix + UA-CH
+#                              with Mobile=?1, model=device_model from
+#                              the template
+#   iOS                      → CriOS variant (iOS Chrome is a WebKit
+#                              wrapper of CriOS; the engine here is
+#                              still Chromium so this is UA-LEVEL
+#                              spoofing only — engine detection by
+#                              creepjs-class probes will see Chromium
+#                              under the iPhone UA. Useful for SERPs
+#                              that don't deep-fingerprint the engine).
 PLATFORMS = [
     {
+        "id":                  "win32_x64",
+        "form_factor":         "desktop",
+        "os_family":           "windows",
         "navigator_platform":  "Win32",
         "ch_platform":         "Windows",
         "ch_platform_version": "15.0.0",
@@ -111,7 +136,76 @@ PLATFORMS = [
         "ch_wow64":            False,
         "ch_model":            "",
     },
+    {
+        "id":                  "android_arm64",
+        "form_factor":         "mobile",
+        "os_family":           "android",
+        "navigator_platform":  "Linux armv81",
+        "ch_platform":         "Android",
+        "ch_platform_version": "14.0.0",
+        # ua_os_portion has a {model} placeholder filled by the
+        # builder from the template's device_model field. Real Chrome
+        # on Android always includes the device model in this string.
+        "ua_os_portion":       "Linux; Android 14; {model}",
+        "ch_arch":             "arm",
+        "ch_bitness":          "64",
+        "ch_wow64":            False,
+        "ch_model":            "",   # filled per-template
+    },
+    {
+        "id":                  "android_arm64_a13",
+        "form_factor":         "mobile",
+        "os_family":           "android",
+        "navigator_platform":  "Linux armv81",
+        "ch_platform":         "Android",
+        "ch_platform_version": "13.0.0",
+        "ua_os_portion":       "Linux; Android 13; {model}",
+        "ch_arch":             "arm",
+        "ch_bitness":          "64",
+        "ch_wow64":            False,
+        "ch_model":            "",
+    },
+    {
+        "id":                  "ios_iphone_17",
+        "form_factor":         "mobile",
+        "os_family":           "ios",
+        "navigator_platform":  "iPhone",
+        "ch_platform":         "iOS",
+        "ch_platform_version": "17.5.1",
+        "ua_os_portion":       "iPhone; CPU iPhone OS 17_5_1 like Mac OS X",
+        "ch_arch":             "",
+        "ch_bitness":          "",
+        "ch_wow64":            False,
+        "ch_model":            "iPhone",
+    },
+    {
+        "id":                  "ios_iphone_18",
+        "form_factor":         "mobile",
+        "os_family":           "ios",
+        "navigator_platform":  "iPhone",
+        "ch_platform":         "iOS",
+        "ch_platform_version": "18.0.1",
+        "ua_os_portion":       "iPhone; CPU iPhone OS 18_0_1 like Mac OS X",
+        "ch_arch":             "",
+        "ch_bitness":          "",
+        "ch_wow64":            False,
+        "ch_model":            "iPhone",
+    },
 ]
+
+
+def _platforms_by_id() -> Dict[str, dict]:
+    """Lookup table for platform_id → PLATFORMS entry. Cached at
+    import-time after PLATFORMS is finalised."""
+    return {p["id"]: p for p in PLATFORMS}
+
+
+def _platforms_for_form_factor(form_factor: str) -> list:
+    """All PLATFORMS entries matching a form factor (default 'desktop').
+    Used when a template doesn't pin a specific platform_id and the
+    builder picks one at random — without this filter, a mobile
+    template could draw a Win32 platform and produce a corrupt FP."""
+    return [p for p in PLATFORMS if p.get("form_factor", "desktop") == form_factor]
 
 LANGUAGE_PROFILES = [
     {
@@ -350,6 +444,267 @@ DEVICE_TEMPLATES = [
         "battery": None,
         "weight":  1,
     },
+
+    # ═════════════════════════════════════════════════════════════
+    # Phase A (Apr 2026): MOBILE templates
+    # ═════════════════════════════════════════════════════════════
+    # Each mobile template carries:
+    #   form_factor   "mobile" | "tablet"   (drives builder's UA
+    #                 path + max_touch_points + battery presence)
+    #   platform_id   pin to specific PLATFORMS entry — without this
+    #                 the builder would pick a random platform from
+    #                 _platforms_for_form_factor("mobile") which is
+    #                 fine for diversity but loses the pairing
+    #                 (Pixel 8 should always speak Android, not iOS).
+    #   device_model  used to fill {model} in ua_os_portion AND
+    #                 surface in Sec-CH-UA-Model header.
+    #   device_human_name  shown in the dashboard template picker.
+    #
+    # Important: the rendering engine is still Chromium (this is a
+    # patched Chromium). UA-level spoofing of "iPhone" works against
+    # most SERPs and ad networks but a deep engine probe (creepjs,
+    # pixelscan) will detect Chromium under iOS UA. Phase A delivers
+    # the templates + UA infrastructure; the C++ side that fully
+    # mimics WebKit/Mobile Safari is out of scope here.
+
+    # ─── Apple iPhone (iOS Chrome / CriOS spoof) ────────────────
+    {
+        "name":              "iphone_15_pro",
+        "form_factor":       "mobile",
+        "platform_id":       "ios_iphone_17",
+        "device_model":      "iPhone15,3",
+        "device_human_name": "Apple iPhone 15 Pro",
+        "cpu":     {"concurrency": 6, "memory": 8.0},
+        "gpu": {
+            # iOS Safari typically returns "Apple GPU" (single string).
+            # Under Chromium-on-Mac WebGL gives "ANGLE Metal Renderer";
+            # we fudge to the Safari-style string for UA consistency.
+            "gl_vendor":     "Apple Inc.",
+            "gl_renderer":   "Apple GPU",
+            "webgpu_vendor": "apple",
+            "webgpu_arch":   "apple-7",
+            "tier":          "discrete_mid",
+        },
+        # CSS pixels (logical). Real device pixels = w*dpr, h*dpr.
+        "screen":  {"width": 393, "height": 852, "taskbar": 0, "dpr": 3.0},
+        # Always-true on mobile — battery API exposed without prompt.
+        "battery": {"charging": False, "level": 0.78},
+        "weight":  4,
+    },
+    {
+        "name":              "iphone_16_pro_max",
+        "form_factor":       "mobile",
+        "platform_id":       "ios_iphone_18",
+        "device_model":      "iPhone17,2",
+        "device_human_name": "Apple iPhone 16 Pro Max",
+        "cpu":     {"concurrency": 6, "memory": 8.0},
+        "gpu": {
+            "gl_vendor":     "Apple Inc.",
+            "gl_renderer":   "Apple GPU",
+            "webgpu_vendor": "apple",
+            "webgpu_arch":   "apple-9",
+            "tier":          "discrete_high",
+        },
+        "screen":  {"width": 440, "height": 956, "taskbar": 0, "dpr": 3.0},
+        "battery": {"charging": True, "level": 0.92},
+        "weight":  3,
+    },
+    {
+        "name":              "iphone_14",
+        "form_factor":       "mobile",
+        "platform_id":       "ios_iphone_17",
+        "device_model":      "iPhone14,7",
+        "device_human_name": "Apple iPhone 14",
+        "cpu":     {"concurrency": 6, "memory": 6.0},
+        "gpu": {
+            "gl_vendor":     "Apple Inc.",
+            "gl_renderer":   "Apple GPU",
+            "webgpu_vendor": "apple",
+            "webgpu_arch":   "apple-6",
+            "tier":          "integrated_modern",
+        },
+        "screen":  {"width": 390, "height": 844, "taskbar": 0, "dpr": 3.0},
+        "battery": {"charging": False, "level": 0.45},
+        "weight":  3,
+    },
+
+    # ─── Google Pixel (Android Chrome) ──────────────────────────
+    {
+        "name":              "pixel_8_pro",
+        "form_factor":       "mobile",
+        "platform_id":       "android_arm64",
+        "device_model":      "Pixel 8 Pro",
+        "device_human_name": "Google Pixel 8 Pro",
+        # Tensor G3: 1×Cortex-X3 + 4×A715 + 4×A510 — 9 logical cores
+        "cpu":     {"concurrency": 9, "memory": 12.0},
+        "gpu": {
+            # Android Chrome returns the GPU vendor in WebGL UNMASKED
+            # extensions. ARM Mali on Tensor SoCs.
+            "gl_vendor":     "ARM",
+            "gl_renderer":   "Mali-G715-Immortalis MC10",
+            "webgpu_vendor": "arm",
+            "webgpu_arch":   "mali",
+            "tier":          "discrete_mid",
+        },
+        # 412 CSS-px is the canonical Android Chrome viewport.
+        "screen":  {"width": 412, "height": 915, "taskbar": 0, "dpr": 2.625},
+        "battery": {"charging": True, "level": 0.65},
+        "weight":  5,
+    },
+    {
+        "name":              "pixel_9",
+        "form_factor":       "mobile",
+        "platform_id":       "android_arm64",
+        "device_model":      "Pixel 9",
+        "device_human_name": "Google Pixel 9",
+        "cpu":     {"concurrency": 8, "memory": 12.0},
+        "gpu": {
+            "gl_vendor":     "ARM",
+            "gl_renderer":   "Mali-G715 MC7",
+            "webgpu_vendor": "arm",
+            "webgpu_arch":   "mali",
+            "tier":          "discrete_mid",
+        },
+        "screen":  {"width": 412, "height": 915, "taskbar": 0, "dpr": 2.625},
+        "battery": {"charging": False, "level": 0.71},
+        "weight":  4,
+    },
+    {
+        "name":              "pixel_7a",
+        "form_factor":       "mobile",
+        "platform_id":       "android_arm64_a13",
+        "device_model":      "Pixel 7a",
+        "device_human_name": "Google Pixel 7a",
+        "cpu":     {"concurrency": 8, "memory": 8.0},
+        "gpu": {
+            "gl_vendor":     "ARM",
+            "gl_renderer":   "Mali-G710 MC10",
+            "webgpu_vendor": "arm",
+            "webgpu_arch":   "mali",
+            "tier":          "integrated_modern",
+        },
+        "screen":  {"width": 412, "height": 915, "taskbar": 0, "dpr": 2.625},
+        "battery": {"charging": True, "level": 0.40},
+        "weight":  3,
+    },
+
+    # ─── Samsung Galaxy (Android Chrome on Snapdragon) ─────────
+    {
+        "name":              "galaxy_s24_ultra",
+        "form_factor":       "mobile",
+        "platform_id":       "android_arm64",
+        "device_model":      "SM-S928B",
+        "device_human_name": "Samsung Galaxy S24 Ultra",
+        # Snapdragon 8 Gen 3: 1×X4 + 5×A720 + 2×A520 = 8 cores
+        "cpu":     {"concurrency": 8, "memory": 12.0},
+        "gpu": {
+            # Adreno 750 on Snapdragon 8 Gen 3
+            "gl_vendor":     "Qualcomm",
+            "gl_renderer":   "Adreno (TM) 750",
+            "webgpu_vendor": "qualcomm",
+            "webgpu_arch":   "adreno",
+            "tier":          "discrete_high",
+        },
+        "screen":  {"width": 384, "height": 824, "taskbar": 0, "dpr": 3.5},
+        "battery": {"charging": False, "level": 0.55},
+        "weight":  5,
+    },
+    {
+        "name":              "galaxy_s23",
+        "form_factor":       "mobile",
+        "platform_id":       "android_arm64",
+        "device_model":      "SM-S911B",
+        "device_human_name": "Samsung Galaxy S23",
+        "cpu":     {"concurrency": 8, "memory": 8.0},
+        "gpu": {
+            "gl_vendor":     "Qualcomm",
+            "gl_renderer":   "Adreno (TM) 740",
+            "webgpu_vendor": "qualcomm",
+            "webgpu_arch":   "adreno",
+            "tier":          "discrete_mid",
+        },
+        "screen":  {"width": 360, "height": 780, "taskbar": 0, "dpr": 3.0},
+        "battery": {"charging": True, "level": 0.83},
+        "weight":  4,
+    },
+    {
+        "name":              "galaxy_a54",
+        "form_factor":       "mobile",
+        "platform_id":       "android_arm64_a13",
+        "device_model":      "SM-A546B",
+        "device_human_name": "Samsung Galaxy A54",
+        # Mid-tier — Exynos 1380, 8 cores, 6GB RAM
+        "cpu":     {"concurrency": 8, "memory": 6.0},
+        "gpu": {
+            # Mali-G68 on Exynos 1380
+            "gl_vendor":     "ARM",
+            "gl_renderer":   "Mali-G68 MP5",
+            "webgpu_vendor": "arm",
+            "webgpu_arch":   "mali",
+            "tier":          "integrated_modern",
+        },
+        "screen":  {"width": 360, "height": 800, "taskbar": 0, "dpr": 3.0},
+        "battery": {"charging": False, "level": 0.62},
+        "weight":  3,
+    },
+
+    # ─── Xiaomi (Android Chrome) ────────────────────────────────
+    {
+        "name":              "xiaomi_14",
+        "form_factor":       "mobile",
+        "platform_id":       "android_arm64",
+        "device_model":      "23116PN5BG",
+        "device_human_name": "Xiaomi 14",
+        "cpu":     {"concurrency": 8, "memory": 12.0},
+        "gpu": {
+            "gl_vendor":     "Qualcomm",
+            "gl_renderer":   "Adreno (TM) 750",
+            "webgpu_vendor": "qualcomm",
+            "webgpu_arch":   "adreno",
+            "tier":          "discrete_high",
+        },
+        "screen":  {"width": 393, "height": 873, "taskbar": 0, "dpr": 2.75},
+        "battery": {"charging": True, "level": 0.50},
+        "weight":  3,
+    },
+    {
+        "name":              "redmi_note_13",
+        "form_factor":       "mobile",
+        "platform_id":       "android_arm64_a13",
+        "device_model":      "23117RA68G",
+        "device_human_name": "Xiaomi Redmi Note 13",
+        "cpu":     {"concurrency": 8, "memory": 8.0},
+        "gpu": {
+            "gl_vendor":     "ARM",
+            "gl_renderer":   "Mali-G57 MC2",
+            "webgpu_vendor": "arm",
+            "webgpu_arch":   "mali",
+            "tier":          "integrated_old",
+        },
+        "screen":  {"width": 393, "height": 873, "taskbar": 0, "dpr": 2.75},
+        "battery": {"charging": False, "level": 0.30},
+        "weight":  2,
+    },
+
+    # ─── Tablet (iPad — iOS) ─────────────────────────────────────
+    {
+        "name":              "ipad_air_m2",
+        "form_factor":       "tablet",
+        "platform_id":       "ios_iphone_17",   # iPadOS shares iOS PLATFORMS
+        "device_model":      "iPad14,8",
+        "device_human_name": "Apple iPad Air (M2)",
+        "cpu":     {"concurrency": 8, "memory": 8.0},
+        "gpu": {
+            "gl_vendor":     "Apple Inc.",
+            "gl_renderer":   "Apple GPU",
+            "webgpu_vendor": "apple",
+            "webgpu_arch":   "apple-9",
+            "tier":          "discrete_high",
+        },
+        "screen":  {"width": 820, "height": 1180, "taskbar": 0, "dpr": 2.0},
+        "battery": {"charging": True, "level": 0.88},
+        "weight":  2,
+    },
 ]
 
 # ──────────────────────────────────────────────────────────────
@@ -510,7 +865,32 @@ class DeviceTemplateBuilder:
         else:
             self.template = _weighted_choice(self.rnd, DEVICE_TEMPLATES)
 
-        self.platform = self.rnd.choice(PLATFORMS)
+        # Phase A (Apr 2026): platform selection respects template's
+        # form_factor + optional pinned platform_id. Without this, a
+        # mobile template could pair with the desktop Win32 platform,
+        # producing a Sec-CH-UA-Platform=Windows + Mobile=?1 mismatch
+        # that creepjs flags as inconsistent.
+        ff = self.template.get("form_factor", "desktop")
+        pinned_platform_id = self.template.get("platform_id")
+        if pinned_platform_id:
+            by_id = _platforms_by_id()
+            self.platform = by_id.get(pinned_platform_id) or PLATFORMS[0]
+        else:
+            candidates = _platforms_for_form_factor(ff)
+            if not candidates:
+                # Defensive fallback — this only fires if PLATFORMS is
+                # mis-edited (no entries for the requested form factor).
+                candidates = PLATFORMS
+            self.platform = self.rnd.choice(candidates)
+        # Resolve {model} placeholder in ua_os_portion using the
+        # template's device_model (if any). Stored as a derived field
+        # rather than mutating self.platform so PLATFORMS stays a
+        # read-only catalog.
+        device_model = self.template.get("device_model") or ""
+        self._ua_os_portion = self.platform["ua_os_portion"].replace(
+            "{model}", device_model
+        )
+        self._ch_model = self.platform.get("ch_model") or device_model
 
         # Chrome version: respect user-configured min/max bounds from
         # Settings → UA spoof range. Falls through gracefully if DB is
@@ -545,10 +925,38 @@ class DeviceTemplateBuilder:
         return hashlib.sha256(raw.encode('utf-8')).hexdigest()
 
     def _build_user_agent(self) -> str:
+        # Phase A (Apr 2026): mobile-aware UA generation.
+        # Three families produce three distinct strings:
+        #   desktop  → "Mozilla/5.0 (Windows NT 10.0; Win64; x64) ..."
+        #   android  → adds "Mobile Safari/537.36" suffix
+        #   ios      → CriOS variant; iOS Chrome is technically a
+        #              WebKit shell on iOS but Google ships the
+        #              "CriOS" UA token. Engine is still Chromium
+        #              under our patches so this is UA-LEVEL spoofing.
+        os_family = self.platform.get("os_family", "windows")
+        chrome_full = self.chrome_v["full"]
+        os_part = self._ua_os_portion
+
+        if os_family == "android":
+            return (
+                f"Mozilla/5.0 ({os_part}) "
+                f"AppleWebKit/537.36 (KHTML, like Gecko) "
+                f"Chrome/{chrome_full} Mobile Safari/537.36"
+            )
+        if os_family == "ios":
+            # iOS Chrome (CriOS) format — note WebKit version differs
+            # from desktop. Build number 15E148 ≈ iOS 17.5.1 era
+            # default; bump if you target newer iOS.
+            return (
+                f"Mozilla/5.0 ({os_part}) "
+                f"AppleWebKit/605.1.15 (KHTML, like Gecko) "
+                f"CriOS/{chrome_full} Mobile/15E148 Safari/604.1"
+            )
+        # Default: desktop Chrome
         return (
-            f"Mozilla/5.0 ({self.platform['ua_os_portion']}) "
+            f"Mozilla/5.0 ({os_part}) "
             f"AppleWebKit/537.36 (KHTML, like Gecko) "
-            f"Chrome/{self.chrome_v['full']} Safari/537.36"
+            f"Chrome/{chrome_full} Safari/537.36"
         )
 
     # ──────────────────────────────────────────────────────────
@@ -566,13 +974,26 @@ class DeviceTemplateBuilder:
         elif raw_mem >= 0.5: clamped_mem = 0.5
         else:                clamped_mem = 0.25
 
+        # Phase A: max_touch_points by form factor.
+        #   desktop = 0    (no touch on Win32 / mac / linux laptops in
+        #                   the template catalog)
+        #   mobile  = 5    (typical iOS Safari / Android Chrome value)
+        #   tablet  = 10   (iPad Pro reports 10; Galaxy Tab S also)
+        ff = self.template.get("form_factor", "desktop")
+        if ff == "mobile":
+            max_touch = 5
+        elif ff == "tablet":
+            max_touch = 10
+        else:
+            max_touch = 0
+
         return {
             "user_agent":           self._build_user_agent(),
             "platform":             self.platform["navigator_platform"],
             "hardware_concurrency": self.template["cpu"]["concurrency"],
             "device_memory":        clamped_mem,
             "device_memory_raw":    raw_mem,   # for display / other logic
-            "max_touch_points":     0,
+            "max_touch_points":     max_touch,
             "do_not_track":         None,
             "pdf_viewer_enabled":   True,
         }
@@ -810,6 +1231,11 @@ class DeviceTemplateBuilder:
             {"brand": "Chromium",       "version": full},
             {"brand": "Google Chrome",  "version": full},
         ]
+        # Phase A: mobile flag derived from form factor. Mobile must
+        # report Sec-CH-UA-Mobile: ?1 along with the platform string —
+        # mismatch (e.g. Android UA + Mobile=?0) is a strong bot signal.
+        ff = self.template.get("form_factor", "desktop")
+        is_mobile = ff in ("mobile", "tablet")
         return {
             "brands":            brands,
             "full_version_list": full_brands,
@@ -819,9 +1245,16 @@ class DeviceTemplateBuilder:
             "platform_version":  self.platform["ch_platform_version"],
             "architecture":      self.platform["ch_arch"],
             "bitness":           self.platform["ch_bitness"],
-            "model":             self.platform["ch_model"],
+            # Phase A: model from template's device_model (resolved
+            # in __init__ as self._ch_model). Falls back to platform's
+            # ch_model for legacy desktop templates that don't set one.
+            "model":             self._ch_model,
             "wow64":             self.platform["ch_wow64"],
-            "mobile":             False,
+            "mobile":             is_mobile,
+            # Phase A meta — surfaced for downstream consumers (UI,
+            # logs, validators) without expanding the public spec.
+            "form_factor":       ff,
+            "os_family":         self.platform.get("os_family", "windows"),
         }
 
     def _build_permissions(self) -> Dict[str, str]:

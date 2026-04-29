@@ -1,0 +1,51 @@
+<!--
+  pages/live-ops.html — Realtime view of every active run.
+  Loaded by router.js when location.hash is #live-ops.
+  All wiring lives in dashboard/js/pages/live-ops.js.
+
+  The page polls /api/runs/live every 2s. When there are 0 active runs
+  the empty state explains how to start one. When ≥1 — each run gets
+  its own card with current query, current ad on click, exit IP +
+  country flag, ads/captchas counters, and a 5-line activity feed.
+
+  Cards self-tint via CSS variables — green for healthy heartbeat,
+  amber for stale (>60s), red for dead (>180s or needs_attention).
+-->
+<section class="live-ops-page">
+  <div class="page-header">
+    <div class="page-header-left">
+      <div>
+        <div class="page-title">Live Ops</div>
+        <div class="page-subtitle">
+          Every active run, in real time. Refreshes every 2 seconds.
+        </div>
+      </div>
+    </div>
+    <div class="page-header-right">
+      <span class="muted" id="live-ops-as-of" style="font-size: 12px;">
+        <!-- "updated 2s ago" -->
+      </span>
+      <span class="muted" id="live-ops-count-pill"
+            style="margin-left: 12px; font-size: 12px;">
+        0 running
+      </span>
+    </div>
+  </div>
+
+  <div class="live-ops-grid" id="live-ops-grid">
+    <!-- Cards rendered by live-ops.js. Empty state below shows when 0. -->
+  </div>
+
+  <div class="empty-state" id="live-ops-empty"
+       style="display: none; text-align: center; padding: 60px 20px;">
+    <div style="font-size: 48px; opacity: 0.3; margin-bottom: 16px;">⏸</div>
+    <div style="font-size: 16px; margin-bottom: 8px;">No active runs</div>
+    <div class="muted" style="font-size: 13px;">
+      Start a run from the
+      <a href="#profiles" data-nav="profiles" style="color: var(--accent);">Profiles</a>
+      page or wait for the
+      <a href="#scheduler" data-nav="scheduler" style="color: var(--accent);">Scheduler</a>
+      to fire next.
+    </div>
+  </div>
+</section>

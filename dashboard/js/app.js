@@ -4,18 +4,24 @@
 
 const PAGES = {
   overview:    { html: "/pages/overview.html",    init: () => Overview.init(),    teardown: () => Overview.teardown?.() },
+  // Phase 1 (Apr 2026): Live Ops dashboard — realtime active-runs view.
+  // Lightweight teardown clears the polling interval so leaving the page
+  // doesn't leave an orphan setInterval pinging /api/runs/live forever.
+  "live-ops":  { html: "/pages/live-ops.html",    init: () => LiveOps.init(),     teardown: () => LiveOps.teardown?.() },
   profiles:    { html: "/pages/profiles.html",    init: () => Profiles.init(),    teardown: () => Profiles.teardown?.() },
   groups:      { html: "/pages/groups.html",      init: () => Groups.init(),      teardown: () => Groups.teardown?.() },
   // "Domains" page (was "Search") — queries + my-domains + target-domains
   domains:     { html: "/pages/domains.html",     init: () => Domains.init() },
   proxy:       { html: "/pages/proxy.html",       init: () => ProxyPage.init() },
-  profile:     { html: "/pages/profile.html",     init: () => ProfileDetail.init() },
+  profile:     { html: "/pages/profile.html",     init: () => ProfileDetail.init(), teardown: () => ProfileDetail.teardown?.() },
   // Fingerprint coherence editor (Phase 2). Standalone page; usually
   // reached from the profile detail page or Overview > Fingerprint health
   // row clicks rather than a sidebar slot. Hash may include ?profile=foo
   // to preselect a profile.
   fingerprint: { html: "/pages/fingerprint.html", init: () => FingerprintPage.init() },
   session:     { html: "/pages/session.html",     init: () => SessionPage.init(),     teardown: () => SessionPage.teardown?.() },
+  // Phase D / FU-3 (Apr 2026): Cookie Pool Marketplace
+  "cookie-packs": { html: "/pages/cookie-packs.html", init: () => CookiePacks.init() },
   accounts:    { html: "/pages/accounts.html",    init: () => VaultPage.init() },
   // Extensions pool — Phase 3 Extensions feature.
   // Pool of CRX/folder unpacks shared across profiles. Each profile

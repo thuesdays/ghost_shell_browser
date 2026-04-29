@@ -7,6 +7,21 @@
       </div>
     </div>
     <div class="profiles-header-actions">
+      <!-- Phase 1 (Apr 2026): view-toggle Cards/Table.
+           Pref persisted in localStorage('profiles.view_mode'). Default
+           is Table for backwards-compat with existing users; Cards is
+           the recommended mode for ≤50 profiles where visual scanning
+           beats column density. -->
+      <div class="profiles-view-toggle" role="group" aria-label="View mode">
+        <button class="profiles-view-btn" data-view-mode="cards"
+                id="profiles-view-cards-btn" title="Card view">
+          ▦ Cards
+        </button>
+        <button class="profiles-view-btn" data-view-mode="table"
+                id="profiles-view-table-btn" title="Table view">
+          ☰ Table
+        </button>
+      </div>
       <div class="column-picker">
         <button class="btn btn-secondary" id="column-picker-btn">Columns ▾</button>
         <div class="column-picker-dropdown" id="column-picker-dropdown" style="display:none;"></div>
@@ -167,14 +182,29 @@
     </div>
   </div>
 
-  <!-- Main table -->
-  <div class="profiles-table-wrap">
+  <!-- Main table — visible when viewMode=table.
+       The view toggle in the header swaps display between this block
+       and the cards grid below. Selection state, search filter, tag
+       filter and bulk-bar are shared (same selectedNames Set drives
+       both views). -->
+  <div class="profiles-table-wrap" id="profiles-table-wrap">
     <table class="profiles-table">
       <thead id="profiles-thead"></thead>
       <tbody id="profiles-tbody">
         <tr><td colspan="10" class="dense-empty-cell">Loading…</td></tr>
       </tbody>
     </table>
+  </div>
+
+  <!-- Phase 1 (Apr 2026): card view — one card per profile.
+       Hidden by default; toggled by the Cards view button. Each card
+       shows: name + status pill, tags, fingerprint template + country
+       flag + browser/GPU mini-icons, captcha sparkline, last-run age,
+       quality verdict, and inline Start / Edit buttons. -->
+  <div class="profiles-cards-wrap"
+       id="profiles-cards-wrap"
+       style="display: none;">
+    <!-- populated by Profiles._renderCardsBody() -->
   </div>
 </section>
 
